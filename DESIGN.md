@@ -1,6 +1,13 @@
 # Canalis — design doc
 
-Status: design only, not implemented. No code written yet.
+Status: first real slice built and verified — health check, a real
+Valkey connection, and `POST /register` (an instance reports its port,
+the caller's real address comes from the connection itself). Verified
+end-to-end via a real Dagger integration test in aqueduct-runner: real
+Aquifer, Canalis, and Valkey containers, Aquifer's registration ping
+actually reaching Canalis and landing a real TTL'd key in Valkey.
+Everything past registration (assignment, the waiting room, the
+account-queue port, idempotency storage) is still design only.
 
 ## What it is
 
