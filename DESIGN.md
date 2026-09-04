@@ -1,13 +1,30 @@
 # Canalis — design doc
 
-Status: first real slice built and verified — health check, a real
-Valkey connection, and `POST /register` (an instance reports its port,
-the caller's real address comes from the connection itself). Verified
-end-to-end via a real Dagger integration test in aqueduct-runner: real
-Aquifer, Canalis, and Valkey containers, Aquifer's registration ping
-actually reaching Canalis and landing a real TTL'd key in Valkey.
-Everything past registration (assignment, the waiting room, the
-account-queue port, idempotency storage) is still design only.
+Status: registration and assignment (community pool only) are built and
+verified end-to-end against a real Valkey. `POST /proxy` and `POST
+/jobs` exist as real public endpoints, matching Aquifer's own request
+shape exactly, but currently do only the assignment step — no
+forwarding to the assigned instance yet, no SSE relay. Pool exhaustion
+returns a TODO stub (501), not the waiting room. The reconciliation
+sweep, Reserved-pool overrides, the account-queue port, and idempotency
+storage are all still design only.
+
+**Real deviation from an earlier plan, found by actually running this,
+not decided in the abstract:** the free pool (`canalis:pool:free`) is a
+Valkey **Set**, not the List originally planned — registration pings
+every ~15s, and a plain List would let an already-in-the-pool,
+still-unassigned instance get pushed again on every heartbeat,
+creating duplicate entries that could then be claimed twice (the exact
+double-assignment bug this whole design exists to prevent). `SADD` is a
+no-op on an already-present member, closing that for free. Cost: gave
+up FIFO fairness (first-free-wins is now closer to random-free-wins) —
+not something this slice needed, per the original scoping, but worth
+knowing if fairness becomes a real requirement later.
+
+Assignment itself is race-safe against concurrent requests for the
+*same* tenant via `SET ... NX` (see Assignment section below) — not a
+Lua script, which was the original plan; `NX` alone turned out to be
+sufficient and simpler.
 
 ## What it is
 
@@ -69,9 +86,25 @@ client -> Canalis -> assigned Aquifer instance
 
 ## Assignment
 
-Canalis assigns each tenant (user) to a specific Aquifer instance and keeps
-that assignment sticky — the client never sees or chooses the instance, so
-it can't manipulate placement. Two pools:
+**Built (community pool only).** Canalis assigns each tenant (user_id) to
+a specific Aquifer instance and keeps that assignment sticky — the client
+never sees or chooses the instance, so it can't manipulate placement.
+`canalis:assignment:<user_id>` (a plain string key, no TTL) holds the
+mapping. `canalis:pool:free` (a Set — see the deviation noted at the top
+of this doc) holds unclaimed instances; `canalis:assigned` (a Set) holds
+claimed ones, checked by the registration handler so a repeatedly-
+heartbeating already-assigned instance never leaks back into the free
+pool. Race-safety against two concurrent requests for the *same* tenant
+is `SET ... NX`: whoever's write loses returns their needlessly-claimed
+instance to the pool and reads back whoever actually won, rather than
+silently overwriting. Pool exhaustion currently returns a 501 TODO stub —
+the waiting room isn't built. Verified end-to-end: two real instances
+registered, sticky repeat-assignment confirmed, the second tenant getting
+the *other* instance confirmed, exhaustion on a third tenant confirmed,
+and the re-registration-doesn't-leak fix confirmed directly against raw
+Valkey state, not just the HTTP response.
+
+Two pools, though only Community is built:
 
 - **Reserved instances** — pre-committed capacity, a tenant can be pinned
   to specific machine(s) via an API that registers an instance against a

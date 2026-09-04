@@ -1,11 +1,15 @@
+mod assign;
+
 use axum::{
     extract::{ConnectInfo, State},
     http::StatusCode,
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use redis::AsyncCommands;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 
 // ConnectionManager derives Clone (it wraps an Arc internally), so it's
@@ -13,7 +17,7 @@ use std::net::SocketAddr;
 // wrapper of our own -- unlike URLWorker's plain struct fields in Aquifer,
 // which do need an external mutex because they aren't safe to share on
 // their own.
-type AppState = redis::aio::ConnectionManager;
+pub type AppState = redis::aio::ConnectionManager;
 
 #[tokio::main]
 async fn main() {
@@ -35,6 +39,8 @@ async fn main() {
         .route("/health", get(health))
         .route("/valkey-check", get(valkey_check))
         .route("/register", post(register))
+        .route("/proxy", post(proxy))
+        .route("/jobs", post(jobs))
         .with_state(valkey);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
@@ -102,14 +108,78 @@ async fn register(
         .set_ex(&key, &payload.reported_at, REGISTRATION_TTL_SECONDS)
         .await;
 
-    match result {
-        Ok(()) => {
-            tracing::info!("registered instance {address}");
-            StatusCode::OK
-        }
+    if let Err(err) = result {
+        tracing::error!("failed to register instance {address}: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    // Every heartbeat, not just the first -- but a no-op if addr is
+    // already claimed or already in the pool (see register_if_free's own
+    // docs for why that idempotency matters).
+    if let Err(err) = assign::register_if_free(&mut valkey, &address).await {
+        tracing::error!("failed to add {address} to the free pool: {err}");
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    tracing::info!("registered instance {address}");
+    StatusCode::OK
+}
+
+// Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
+// so a caller already speaking Aquifer's API can point at Canalis with no
+// translation layer -- the whole point of the assignment-then-passthrough
+// design (see DESIGN.md).
+#[derive(Deserialize)]
+struct JobRequest {
+    user_id: String,
+    #[allow(dead_code)] // not read yet -- forwarding (the next slice) will need this
+    idempotent_key: String,
+    #[allow(dead_code)]
+    url: String,
+    #[allow(dead_code)]
+    method: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    body: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    webhook_url: Option<String>,
+}
+
+async fn proxy(State(valkey): State<AppState>, Json(job): Json<JobRequest>) -> impl IntoResponse {
+    assignment_only_response(valkey, job).await
+}
+
+async fn jobs(State(valkey): State<AppState>, Json(job): Json<JobRequest>) -> impl IntoResponse {
+    assignment_only_response(valkey, job).await
+}
+
+// /proxy and /jobs are identical right now, on purpose: neither actually
+// forwards anything to the assigned instance yet (that's the next slice,
+// which is also where /proxy's direct-attempt-first behavior and /jobs'
+// straight-to-queue behavior will actually start to diverge). This only
+// proves assignment resolves correctly through the real public API shape.
+async fn assignment_only_response(mut valkey: AppState, job: JobRequest) -> impl IntoResponse {
+    match assign::assign(&mut valkey, &job.user_id).await {
+        Ok(assign::AssignOutcome::Assigned(addr)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "assigned_instance": addr })),
+        ),
+        Ok(assign::AssignOutcome::PoolExhausted) => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "todo": "pool exhaustion / waiting room not yet implemented"
+            })),
+        ),
         Err(err) => {
-            tracing::error!("failed to register instance {address}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            tracing::error!("assign failed: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal error" })),
+            )
         }
     }
 }
