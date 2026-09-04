@@ -1,18 +1,20 @@
 # Canalis — design doc
 
-Status: registration, assignment (community pool only), and buffered
-request forwarding are built and verified end-to-end. `POST /proxy` and
-`POST /jobs` resolve the assignment, forward the same job body to the
-assigned instance's own `/proxy` or `/jobs`, and relay a plain response
-back verbatim (status, content-type, body) — proven against a real mock
-instance, not just unit-tested. An SSE response from the assigned
-instance (Aquifer's fallback-to-queue path, and always the case for
-`/jobs`) is correctly *detected* and returns a TODO stub (501) rather
-than silently buffering a live stream as if it were a normal body —
-actual streaming relay is a deliberately separate next slice. Pool
-exhaustion also returns a TODO stub, not the waiting room. The
-reconciliation sweep, Reserved-pool overrides, the account-queue port,
-and idempotency storage are all still design only.
+Status: registration, assignment (community pool only), and request
+forwarding — both buffered and live-streamed — are built and verified
+end-to-end. `POST /proxy` and `POST /jobs` resolve the assignment,
+forward the same job body to the assigned instance's own `/proxy` or
+`/jobs`, and relay the response: a plain response is buffered and
+relayed verbatim (status, content-type, body); an SSE response
+(Aquifer's fallback-to-queue path, and always the case for `/jobs`) is
+relayed live via `reqwest`'s `bytes_stream()` feeding directly into
+Axum's `Body::from_stream` — genuinely proven, not assumed: a mock
+sending two chunks 2 seconds apart showed the client receiving them
+2.007s apart too, ruling out Canalis secretly buffering the whole
+response before relaying it. Pool exhaustion still returns a TODO stub,
+not the waiting room. The reconciliation sweep, Reserved-pool
+overrides, the account-queue port, and idempotency storage are all
+still design only.
 
 **Real deviation from an earlier plan, found by actually running this,
 not decided in the abstract:** the free pool (`canalis:pool:free`) is a

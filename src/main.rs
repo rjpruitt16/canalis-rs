@@ -213,14 +213,34 @@ async fn forward(mut state: AppState, job: JobRequest, target_path: &str) -> Res
         .unwrap_or("")
         .to_string();
 
-    if content_type.starts_with("text/event-stream") {
-        return json_response(
-            StatusCode::NOT_IMPLEMENTED,
-            serde_json::json!({ "todo": "SSE stream relay not yet implemented" }),
-        );
-    }
-
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    if content_type.starts_with("text/event-stream") {
+        // Live relay, not buffered: bytes_stream() yields chunks as they
+        // arrive from the assigned instance, and Body::from_stream feeds
+        // them to our own caller as they arrive too -- reqwest and axum
+        // share the same Stream/Bytes abstractions, so this is close to
+        // handing one stream directly to the other, not a rewrite.
+        //
+        // Once this starts, the response status/headers are already
+        // committed to our caller -- if the upstream connection drops
+        // mid-stream, there's no changing course to an error response
+        // anymore. The stream just ends, which is exactly how SSE
+        // clients (EventSource) are already built to handle an
+        // unexpected close: reconnect, not treat it as a different kind
+        // of failure needing special handling here.
+        let stream = upstream.bytes_stream();
+        return Response::builder()
+            .status(status)
+            .header(axum::http::header::CONTENT_TYPE, content_type)
+            .body(Body::from_stream(stream))
+            .unwrap_or_else(|_| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::empty())
+                    .expect("a hardcoded empty error response should always build")
+            });
+    }
 
     let body = match upstream.bytes().await {
         Ok(b) => b,
