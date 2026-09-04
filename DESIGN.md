@@ -11,10 +11,53 @@ relayed live via `reqwest`'s `bytes_stream()` feeding directly into
 Axum's `Body::from_stream` — genuinely proven, not assumed: a mock
 sending two chunks 2 seconds apart showed the client receiving them
 2.007s apart too, ruling out Canalis secretly buffering the whole
-response before relaying it. Pool exhaustion still returns a TODO stub,
-not the waiting room. The reconciliation sweep, Reserved-pool
-overrides, the account-queue port, and idempotency storage are all
-still design only.
+response before relaying it.
+
+**Pool exhaustion now queues by holding the connection and retrying, not
+a stub.** No separate waiting-list data structure or wake-up channel
+turned out to be needed — the original account-queue-inside-Canalis plan
+was more machinery than the actual requirement (FIFO promotion ordering
+was explicitly dropped: "the number of Aquifer machines is the only
+mechanism for serving N customers," so whoever's retry happens to
+succeed first is fine). Instead: `forward()` loops on `assign()` itself
+until either a new registration frees something up (`CANALIS_POOL_WAIT_TIMEOUT_MS`,
+default 30s) or it gives up with a clean 503 — proven end-to-end with a
+real curl request that held for ~1.25s against an empty pool and
+succeeded the instant a real instance registered mid-flight, not just in
+isolated tests. Multiple Canalis processes retrying concurrently for the
+same tenant is already safe with zero extra coordination, because
+`assign()`'s existing `SET ... NX` protection means whichever one
+succeeds first wins and the others just see the resulting sticky
+assignment on their own next retry.
+
+Separately, a **dead assigned instance does not retry the same way** —
+assignment is sticky, so re-running `assign()` would return the exact
+same (dead) address forever. That case gets a few quick retries against
+the instance itself (a momentary blip — mirrors Aquifer's own
+`account_queue.go` retry pattern), then a clean 502. Looping further
+would hold the connection open with zero chance of ever resolving,
+since that genuinely needs the not-yet-built release mechanism (see
+below) to change the outcome at all.
+
+**Known, accepted gap, not solved today:** nothing currently releases an
+instance back to the pool once assigned — `canalis:assigned` only grows.
+If an assigned instance dies permanently (not a restart on the same
+address), that tenant's assignment points at a dead address forever,
+and no amount of retrying fixes it. This is the same release-mechanism
+gap noted in the Assignment section below; the queuing behavior above
+only ever resolves *new* tenant requests against *new* capacity, not
+requests stuck on an instance that's gone for good.
+
+**Also explicitly deferred:** streaming job-state transitions (not just
+terminal webhooks) from Aquifer/ezthrottle-local, to reduce how much
+in-flight work is lost if a machine goes offline *permanently* rather
+than just restarting — filed as
+[aquifer#12](https://github.com/rjpruitt16/aquifer/issues/12) /
+[ezthrottle-local#8](https://github.com/rjpruitt16/ezthrottle-local/issues/8),
+not designed or scoped for implementation.
+
+The reconciliation sweep, Reserved-pool overrides, and idempotency
+storage are all still design only.
 
 **Real deviation from an earlier plan, found by actually running this,
 not decided in the abstract:** the free pool (`canalis:pool:free`) is a
@@ -224,17 +267,22 @@ instance's own local check — this is the actual mechanism that closes the
 at-least-once gap described above, not just a store that happens to also
 hold idempotency data.
 
-## Account queue inside Canalis
+## Account queue inside Canalis (superseded)
 
-Waiting-queue entries need the same per-tenant isolation and ordering
-Aquifer's own account-queue already provides — otherwise one tenant's
-backlog could starve another's turn at a freed instance. This needs a real
-port, not a reinvention: the underlying pattern (one isolated, ordered
-queue per key) maps directly onto Tokio's task-per-key idiom (a spawned
-task holding its own `mpsc` channel per account), which is architecturally
-the same shape as a BEAM process per account — different runtime, same
-actor-per-key structure, so this should carry over cleanly rather than
-needing to be redesigned from scratch.
+Superseded by the simpler pool-exhaustion retry loop in "Request handling
+and adaptive routing" above — kept here for the record, not because it's
+still the plan. The original idea was a real port of Aquifer's
+account-queue pattern (a Tokio task-per-tenant holding its own `mpsc`
+channel, mirroring a BEAM process per account) to give waiting tenants
+FIFO ordering and per-tenant isolation. That turned out to be more
+machinery than the actual requirement: FIFO promotion ordering was
+explicitly dropped ("the number of Aquifer machines is the only
+mechanism for serving N customers," not who's been waiting longest), and
+without needing ordering, a plain retry loop calling the already-proven,
+already-`NX`-safe `assign()` is sufficient — no new data structure, no
+channels, no separate task per waiting tenant. If per-tenant fairness
+ordering becomes a real requirement later, this is the design to revisit,
+not reach for by default.
 
 ## Testing
 
