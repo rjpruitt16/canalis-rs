@@ -13,22 +13,60 @@ sending two chunks 2 seconds apart showed the client receiving them
 2.007s apart too, ruling out Canalis secretly buffering the whole
 response before relaying it.
 
-**Pool exhaustion now queues by holding the connection and retrying, not
-a stub.** No separate waiting-list data structure or wake-up channel
-turned out to be needed — the original account-queue-inside-Canalis plan
-was more machinery than the actual requirement (FIFO promotion ordering
-was explicitly dropped: "the number of Aquifer machines is the only
-mechanism for serving N customers," so whoever's retry happens to
-succeed first is fine). Instead: `forward()` loops on `assign()` itself
-until either a new registration frees something up (`CANALIS_POOL_WAIT_TIMEOUT_MS`,
-default 30s) or it gives up with a clean 503 — proven end-to-end with a
-real curl request that held for ~1.25s against an empty pool and
-succeeded the instant a real instance registered mid-flight, not just in
-isolated tests. Multiple Canalis processes retrying concurrently for the
-same tenant is already safe with zero extra coordination, because
-`assign()`'s existing `SET ... NX` protection means whichever one
-succeeds first wins and the others just see the resulting sticky
-assignment on their own next retry.
+**Pool exhaustion now queues durably (`account_queue.rs`), not via an
+in-memory retry loop.** The retry-loop version (an earlier iteration of
+this same session) genuinely worked, but had a real durability gap: if
+Canalis's own process crashed while a request sat in that loop, the
+pending work vanished without a trace — a lower durability bar than the
+rest of this system holds itself to. Replaced with: pool exhaustion
+durably pushes the job onto `canalis:account_queue:<user_id>` (survives
+a Canalis crash) and adds `user_id` to `canalis:pending_tenants` (so
+draining doesn't need to scan every possible tenant to find work). The
+waiting connection polls for a *cached result*
+(`canalis:result:<idempotent_key>`, short TTL) rather than retrying
+`assign()` itself — delivery is driven by a separate trigger, not by the
+polling.
+
+**Draining is triggered by registration, not a background sweep.** Every
+`register_if_free` call that actually adds a genuinely new free instance
+(not a no-op heartbeat) spawns `try_drain_one`: pop one pending tenant
+(`SPOP canalis:pending_tenants` — no fairness ordering across *which*
+tenant, matching the already-dropped FIFO-promotion requirement, but
+FIFO *within* one tenant's own queue), assign them the freed instance,
+and dispatch headlessly to that instance's own `/jobs` (not `/proxy` —
+this job was already queued once, no reason to attempt a synchronous
+direct attempt again). `/jobs` always resolves to a full SSE lifecycle;
+reading the response with `.bytes()` waits for that stream to close and
+hands back the complete event history, which becomes the cached result
+verbatim — no manual SSE parsing needed, and no information is lost,
+only the incremental delivery is (an honest simplification for a result
+that's already history by the time anyone's asking).
+
+**A caller with no `webhook_url` whose connection drops before the
+result is ready has no way to learn the outcome today** — an accepted,
+documented gap, not silently glossed over, matching the same "note the
+tradeoff, don't force an answer that isn't needed yet" pattern already
+used elsewhere in this project. The `GET /jobs/<idempotent_key>` polling
+endpoint that would close this gap is deferred to the next slice
+(alongside a longer-lived idempotency dedup marker, separate from the
+short-lived result cache).
+
+Proven end-to-end, not just in isolated tests: a real curl request held
+for 1.24s against a genuinely empty pool and returned the exact response
+a real (mock) instance produced once registration triggered a real
+drain — confirmed by inspecting raw Valkey state afterward too
+(`canalis:account_queue:*` and `canalis:pending_tenants` both correctly
+empty, `canalis:result:*` holding the cached outcome).
+
+Real bug found and fixed while building this, worth remembering: a test
+asserting before its own cleanup ran meant a failing run left genuine,
+undrained jobs sitting in `canalis:pending_tenants` forever (Valkey
+persists across separate `cargo test` invocations, unlike the test
+process itself) — a *later*, unrelated test's `SPOP` would then have a
+real chance of picking up that stale entry instead of its own, timing
+out for a reason that had nothing to do with its own logic. All tests
+in this file now run cleanup unconditionally, before any assertion that
+could panic.
 
 Separately, a **dead assigned instance does not retry the same way** —
 assignment is sticky, so re-running `assign()` would return the exact
@@ -329,6 +367,21 @@ picked on your behalf:
 
 ## Open questions
 
+- `try_drain_one` pops exactly one pending job per freed instance.
+  Raised as a real question worth answering later: if the *same* tenant
+  has several requests queued and their newly-assigned instance can
+  actually handle more than one concurrently (its own `max_concurrent`),
+  draining just their oldest one leaves real throughput on the table.
+  This doesn't mean assigning one freed instance to *multiple tenants*
+  at once — that would break the 1:1 assignment model — only draining
+  more of *one* tenant's own backlog once they're assigned. Blocked on
+  something Canalis doesn't currently have any way to learn: the
+  assigned instance's own concurrency capacity. Aquifer's
+  `X-Aqueduct-Max-Concurrent` header flows the other direction (a
+  backend telling Aquifer to slow down), not something an instance
+  reports about itself to a caller like Canalis. The likely fix, not
+  yet built: instances report their own configured capacity as part of
+  registration.
 - During a reserved-instance override (rolling update), is the old
   machine still a valid routing target for in-flight work during the
   overlap window, or does cutover happen immediately? See Assignment

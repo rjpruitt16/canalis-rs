@@ -1,4 +1,5 @@
 mod assign;
+mod account_queue;
 
 use axum::{
     body::Body,
@@ -130,14 +131,104 @@ async fn register(
 
     // Every heartbeat, not just the first -- but a no-op if addr is
     // already claimed or already in the pool (see register_if_free's own
-    // docs for why that idempotency matters).
-    if let Err(err) = assign::register_if_free(&mut state.valkey, &address).await {
-        tracing::error!("failed to add {address} to the free pool: {err}");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
+    // docs for why that idempotency matters). The returned bool is what
+    // it actually added something new, not just "the call succeeded" --
+    // that's what tells us whether it's worth attempting to drain a
+    // pending job, rather than checking on every single heartbeat.
+    let newly_freed = match assign::register_if_free(&mut state.valkey, &address).await {
+        Ok(added) => added,
+        Err(err) => {
+            tracing::error!("failed to add {address} to the free pool: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR;
+        }
+    };
 
     tracing::info!("registered instance {address}");
+
+    if newly_freed {
+        // Spawned, not awaited: registration shouldn't block on a full
+        // job dispatch completing. If nothing's pending, pop_one just
+        // returns None immediately and this does nothing.
+        tokio::spawn(async move {
+            if let Err(err) = try_drain_one(state).await {
+                tracing::error!("failed while attempting to drain a pending job: {err}");
+            }
+        });
+    }
+
     StatusCode::OK
+}
+
+// Pops one pending job (if any) and dispatches it for real, now that a
+// slot has freed up -- headless, no live connection to relay to, so the
+// outcome gets cached for whichever still-open request (or future
+// polling endpoint) is waiting on it. Always dispatches to the assigned
+// instance's own /jobs, not /proxy: this job was already queued once, so
+// there's no reason to attempt a synchronous direct attempt again --
+// /jobs already gives a uniform "wait for the full SSE lifecycle to
+// finish, then read whatever it settled on" shape, which is exactly
+// what's needed here (no live connection to stream to, only a final
+// result worth keeping).
+async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
+    let Some(job) = account_queue::pop_one(&mut state.valkey).await? else {
+        return Ok(());
+    };
+
+    let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
+        Ok(assign::AssignOutcome::Assigned(addr)) => addr,
+        Ok(assign::AssignOutcome::PoolExhausted) => {
+            // Someone else's request claimed the freed instance in the
+            // gap between register() and this task running. Put the job
+            // back for the next registration to try.
+            return account_queue::enqueue(&mut state.valkey, &job).await;
+        }
+        Err(err) => return Err(err),
+    };
+
+    let target_url = format!("http://{addr}/jobs");
+    let response = state.http.post(&target_url).json(&job).send().await;
+
+    let cached = match response {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            // .bytes() on a streamed response waits for the stream to
+            // finish (Aquifer's /jobs SSE stream closes once the job
+            // reaches a terminal state), then hands back everything that
+            // was ever sent -- the full event history, not just the
+            // final line. No manual SSE parsing needed: the cached
+            // result is the same text a live viewer would have seen.
+            let body = resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned());
+            match body {
+                Ok(body) => account_queue::CachedResult { status, content_type, body },
+                Err(err) => {
+                    tracing::error!("failed to read drained response body from {addr}: {err}");
+                    account_queue::CachedResult {
+                        status: 502,
+                        content_type: "application/json".into(),
+                        body: serde_json::json!({ "error": "failed to read upstream response" })
+                            .to_string(),
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::error!("failed to dispatch drained job to {addr}: {err}");
+            account_queue::CachedResult {
+                status: 502,
+                content_type: "application/json".into(),
+                body: serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") })
+                    .to_string(),
+            }
+        }
+    };
+
+    account_queue::store_result(&mut state.valkey, &job.idempotent_key, &cached).await
 }
 
 // Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
@@ -146,17 +237,17 @@ async fn register(
 // design (see DESIGN.md). Serialize too: this struct gets forwarded
 // as-is to whichever instance Canalis assigns, not rebuilt field by field.
 #[derive(Deserialize, Serialize)]
-struct JobRequest {
-    user_id: String,
-    idempotent_key: String,
-    url: String,
-    method: String,
+pub(crate) struct JobRequest {
+    pub(crate) user_id: String,
+    pub(crate) idempotent_key: String,
+    pub(crate) url: String,
+    pub(crate) method: String,
     #[serde(default)]
-    headers: HashMap<String, String>,
+    pub(crate) headers: HashMap<String, String>,
     #[serde(default)]
-    body: Option<String>,
+    pub(crate) body: Option<String>,
     #[serde(default)]
-    webhook_url: Option<String>,
+    pub(crate) webhook_url: Option<String>,
 }
 
 async fn proxy(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
@@ -230,50 +321,71 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Respons
 // content-type, and body relayed verbatim. An SSE response (Aquifer's
 // fallback-to-queue path, and always the case for /jobs) is relayed live.
 //
-// Two distinct retry behaviors, not one: pool exhaustion retries the
-// whole assign()+forward() flow, since a new registration can hand back
-// a genuinely different, free address next time. A dead *assigned*
-// instance does not retry that way -- assignment is sticky, so retrying
-// assign() would just return the same address forever. That case only
+// Two distinct fallback behaviors, not one: a dead *assigned* instance
 // gets a few quick retries against the instance itself (a momentary
-// blip), then a clean error -- looping further would hold the
-// connection open with zero chance of ever resolving without the
-// not-yet-built release mechanism.
+// blip), then a clean error -- assignment is sticky, so there's no point
+// waiting further; nothing changes without the not-yet-built release
+// mechanism. Pool exhaustion is different: durably enqueue the job (see
+// pending.rs -- survives a Canalis crash, unlike the in-memory retry
+// loop this replaced) and poll for a cached result, since a *new*
+// registration genuinely can resolve this one. try_drain_one (triggered
+// from register()) is what actually dispatches a queued job once a slot
+// frees up; this function only waits for that result to show up.
 async fn forward_with_config(
     mut state: AppState,
     job: JobRequest,
     target_path: &str,
     config: &RetryConfig,
 ) -> Response {
-    let wait_deadline = Instant::now() + config.pool_wait_timeout;
-
-    let addr = loop {
-        match assign::assign(&mut state.valkey, &job.user_id).await {
-            Ok(assign::AssignOutcome::Assigned(addr)) => break addr,
-            Ok(assign::AssignOutcome::PoolExhausted) => {
-                // Retrying makes sense here specifically because a new
-                // registration can hand assign() a genuinely different,
-                // free address next time -- unlike a dead assigned
-                // instance below, where sticky assignment means retrying
-                // would just return the same address forever.
-                if Instant::now() >= wait_deadline {
-                    return json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        serde_json::json!({
-                            "error": "no Aquifer instance became available in time"
-                        }),
-                    );
-                }
-                tokio::time::sleep(config.pool_wait_retry_interval).await;
-                continue;
-            }
-            Err(err) => {
-                tracing::error!("assign failed: {err}");
+    let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
+        Ok(assign::AssignOutcome::Assigned(addr)) => addr,
+        Ok(assign::AssignOutcome::PoolExhausted) => {
+            if let Err(err) = account_queue::enqueue(&mut state.valkey, &job).await {
+                tracing::error!("failed to durably enqueue job for {}: {err}", job.user_id);
                 return json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     serde_json::json!({ "error": "internal error" }),
                 );
             }
+
+            let wait_deadline = Instant::now() + config.pool_wait_timeout;
+            loop {
+                match account_queue::get_result(&mut state.valkey, &job.idempotent_key).await {
+                    Ok(Some(cached)) => return cached_result_response(cached),
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::error!("failed to poll for queued result: {err}");
+                        return json_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            serde_json::json!({ "error": "internal error" }),
+                        );
+                    }
+                }
+                if Instant::now() >= wait_deadline {
+                    // The job stays durably queued -- this only gives up
+                    // on *this* connection, not the work itself. A caller
+                    // with a webhook_url still gets notified once it's
+                    // eventually drained; one without has no way to learn
+                    // the outcome once this connection closes, an
+                    // accepted, documented gap until the polling endpoint
+                    // (the next slice) exists.
+                    return json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        serde_json::json!({
+                            "error": "no Aquifer instance became available in time",
+                            "note": "the job remains queued and will still be attempted"
+                        }),
+                    );
+                }
+                tokio::time::sleep(config.pool_wait_retry_interval).await;
+            }
+        }
+        Err(err) => {
+            tracing::error!("assign failed: {err}");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal error" }),
+            );
         }
     };
 
@@ -376,6 +488,26 @@ async fn forward_with_config(
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
+}
+
+// A drained job's cached outcome is the *complete* text a live viewer
+// would have seen (the full SSE event history, or a plain body) -- it's
+// replayed back all at once here rather than live, since the job already
+// finished by the time anyone's asking. No information is lost, only the
+// incremental delivery is, which is an honest, deliberate simplification
+// for a result that's already history.
+fn cached_result_response(cached: account_queue::CachedResult) -> Response {
+    let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut builder = Response::builder().status(status);
+    if !cached.content_type.is_empty() {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, cached.content_type);
+    }
+    builder.body(Body::from(cached.body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .expect("a hardcoded empty error response should always build")
+    })
 }
 
 #[cfg(test)]
@@ -501,10 +633,30 @@ mod tests {
         }
     }
 
+    // A separate, more generous config for the "eventually succeeds"
+    // test specifically -- that one needs real headroom for a background
+    // task to register, drain, and complete an actual HTTP round-trip
+    // before the deadline, which found to be genuinely flaky at 500ms
+    // under real test-parallelism load (not a logic bug: the failure was
+    // always a timeout, never a wrong result). short_retry_config's tight
+    // bound stays as-is for the *timeout* test, which specifically wants
+    // to prove giving-up-quickly, not the other way around.
+    fn generous_wait_retry_config() -> RetryConfig {
+        RetryConfig {
+            pool_wait_timeout: Duration::from_secs(3),
+            pool_wait_retry_interval: Duration::from_millis(50),
+            instance_retry_attempts: 3,
+            instance_retry_base_delay: Duration::from_millis(20),
+        }
+    }
+
     fn job_for(user_id: &str) -> JobRequest {
         JobRequest {
             user_id: user_id.to_string(),
-            idempotent_key: "k".into(),
+            // Unique, not a fixed literal -- canalis:result:<idempotent_key>
+            // is keyed by this alone, not scoped by user_id, so a shared
+            // literal here would collide across every test using job_for.
+            idempotent_key: unique("k"),
             url: "https://example.com".into(),
             method: "GET".into(),
             headers: HashMap::new(),
@@ -539,51 +691,103 @@ mod tests {
         let user_id = unique("user-pool-wait");
 
         // Deliberately nothing seeded in the pool yet -- forward() has to
-        // sit in its retry loop with nothing to claim.
+        // durably enqueue and wait, with nothing to claim at first.
         let mock_addr = start_plain_ok_mock().await;
         let mock_addr_for_task = mock_addr.clone();
-        let mut valkey_for_task = test_valkey().await;
+        let state_for_task = AppState {
+            valkey: test_valkey().await,
+            http: reqwest::Client::new(),
+        };
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            assign::register_if_free(&mut valkey_for_task, &mock_addr_for_task)
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // register_if_free alone only adds to the pool -- it does not
+            // trigger a drain by itself. The real HTTP register() handler
+            // calls try_drain_one right after a genuinely new add; mirror
+            // that here rather than calling register_if_free in
+            // isolation, which was the actual bug this test caught the
+            // first time it was written (it passed a stale positive
+            // before this fix, since nothing ever drove the drain).
+            let mut state_for_task = state_for_task;
+            let added = assign::register_if_free(&mut state_for_task.valkey, &mock_addr_for_task)
                 .await
                 .unwrap();
+            assert!(added, "test setup bug: expected this to be a genuinely new pool add");
+            try_drain_one(state_for_task).await.unwrap();
         });
 
+        let job = job_for(&user_id);
+        let idempotent_key = job.idempotent_key.clone();
         let state = AppState {
             valkey: valkey.clone(),
             http: reqwest::Client::new(),
         };
+        // Generous deadline, not the tight one: this test needs real
+        // headroom for a background task to register, drain, and
+        // complete an actual HTTP round-trip before giving up -- see
+        // generous_wait_retry_config's own doc comment for why 500ms
+        // turned out to be genuinely flaky under real test-parallelism
+        // load, not a logic bug.
         let response =
-            forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
+            forward_with_config(state, job, "/proxy", &generous_wait_retry_config()).await;
+        let status = response.status();
 
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "expected the delayed registration to eventually satisfy the waiting request"
-        );
-
+        // Cleanup runs *before* the assert on purpose, unconditionally --
+        // an assert! panic aborts the test function immediately, and any
+        // cleanup written after it would silently never run on failure.
+        // That's exactly what caused a real, confusing bug here: an
+        // earlier failed run left an undrained job sitting in
+        // canalis:pending_tenants forever, which a *later*, unrelated
+        // test run's SPOP could then pick up instead of its own real
+        // job, timing out for a reason that had nothing to do with its
+        // own logic. Defensive cleanup of pending_tenants/account_queue
+        // below covers the case where the drain never actually happened.
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
         let _: redis::RedisResult<()> = valkey
             .del(format!("canalis:assignment:{user_id}"))
             .await;
+        let _: redis::RedisResult<()> =
+            valkey.del(format!("canalis:result:{idempotent_key}")).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
+        let _: redis::RedisResult<()> = valkey
+            .del(format!("canalis:account_queue:{user_id}"))
+            .await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "expected the delayed registration to eventually satisfy the waiting request"
+        );
     }
 
     #[tokio::test]
     async fn pool_exhaustion_gives_up_after_the_configured_wait() {
         let _guard = assign::TEST_LOCK.lock().await;
-        let valkey = test_valkey().await;
+        let mut valkey = test_valkey().await;
         let user_id = unique("user-pool-timeout");
 
         // Nothing seeded, nothing ever registered -- this should hit
-        // pool_wait_timeout and give up, not hang.
+        // pool_wait_timeout and give up, not hang. The job still gets
+        // durably enqueued regardless (giving up only ends this
+        // connection's wait, not the queued work itself) -- cleaned up
+        // below since nothing will ever drain it in this test.
+        let job = job_for(&user_id);
+        let idempotent_key = job.idempotent_key.clone();
         let state = AppState {
-            valkey,
+            valkey: valkey.clone(),
             http: reqwest::Client::new(),
         };
         let start = Instant::now();
-        let response =
-            forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
+        let response = forward_with_config(state, job, "/proxy", &short_retry_config()).await;
         let elapsed = start.elapsed();
+
+        let _: redis::RedisResult<()> =
+            valkey.srem("canalis:pending_tenants", &user_id).await;
+        let _: redis::RedisResult<()> = valkey
+            .del(format!("canalis:account_queue:{user_id}"))
+            .await;
+        let _: redis::RedisResult<()> =
+            valkey.del(format!("canalis:result:{idempotent_key}")).await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
@@ -613,15 +817,20 @@ mod tests {
             forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
         let elapsed = start.elapsed();
 
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "expected the instance retries to give up quickly, took {elapsed:?}"
-        );
+        let status = response.status();
 
+        // Cleanup before the asserts, same reasoning as the other tests
+        // in this file -- a panic here shouldn't leave canalis:assigned
+        // permanently holding a dead address.
         let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &dead_addr).await;
         let _: redis::RedisResult<()> = valkey
             .del(format!("canalis:assignment:{user_id}"))
             .await;
+
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the instance retries to give up quickly, took {elapsed:?}"
+        );
     }
 }

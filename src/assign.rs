@@ -70,12 +70,17 @@ pub async fn assign(valkey: &mut Valkey, user_id: &str) -> redis::RedisResult<As
 /// to a Set specifically for this idempotency property; trades away FIFO
 /// fairness, which this slice never required (first-free-wins, per the
 /// original scoping).
-pub async fn register_if_free(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<()> {
+/// Returns whether this call actually added a genuinely new free instance
+/// (as opposed to a no-op on an already-claimed or already-pooled one) --
+/// callers use this to decide whether it's worth attempting to drain a
+/// pending job, rather than checking on every single heartbeat.
+pub async fn register_if_free(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<bool> {
     let already_assigned: bool = valkey.sismember(ASSIGNED_KEY, addr).await?;
     if already_assigned {
-        return Ok(());
+        return Ok(false);
     }
-    valkey.sadd(FREE_POOL_KEY, addr).await
+    let added: i64 = valkey.sadd(FREE_POOL_KEY, addr).await?;
+    Ok(added > 0)
 }
 
 #[cfg(test)]
