@@ -268,3 +268,118 @@ async fn forward(mut state: AppState, job: JobRequest, target_path: &str) -> Res
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::extract::State as AxumState;
+    use axum::routing::post;
+    use http_body_util::BodyExt;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    async fn test_valkey() -> Valkey {
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("valid Valkey URL");
+        redis::aio::ConnectionManager::new(client)
+            .await
+            .expect("connect to a real local Valkey on 127.0.0.1:6379 -- required for this test")
+    }
+
+    fn unique(prefix: &str) -> String {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    // A real mock server (not Canalis), answering POST /proxy with a real
+    // SSE stream: one chunk immediately, a second after `delay`. This is
+    // the automated version of the manual proof already done with a
+    // Python mock + timestamped client -- same claim under test: if
+    // forward() secretly buffered the whole upstream response before
+    // relaying it, both chunks would arrive at our test client together,
+    // near t=delay, not one near t=0 and the other near t=delay.
+    async fn start_delayed_sse_mock(delay: Duration) -> String {
+        async fn handler(AxumState(delay): AxumState<Duration>) -> Response {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(2);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(Bytes::from_static(b"event: queued\ndata: {}\n\n")))
+                    .await;
+                tokio::time::sleep(delay).await;
+                let _ = tx
+                    .send(Ok(Bytes::from_static(b"event: completed\ndata: {}\n\n")))
+                    .await;
+            });
+            Response::builder()
+                .status(200)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(ReceiverStream::new(rx)))
+                .expect("a hardcoded streaming response should always build")
+        }
+
+        let app = Router::new().route("/proxy", post(handler)).with_state(delay);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn sse_response_is_relayed_live_not_buffered() {
+        // Shared with assign.rs's own tests -- canalis:pool:free is a
+        // global key, and this test seeds+pops it, so it needs the same
+        // serialization those tests already use against each other. See
+        // TEST_LOCK's own doc comment in assign.rs for why this caused a
+        // real, confusing failure before it was shared across modules.
+        let _guard = assign::TEST_LOCK.lock().await;
+
+        let delay = Duration::from_millis(400);
+        let mock_addr = start_delayed_sse_mock(delay).await;
+
+        let mut valkey = test_valkey().await;
+        let user_id = unique("user-sse-timing");
+        let _: () = valkey.sadd("canalis:pool:free", &mock_addr).await.unwrap();
+
+        let state = AppState {
+            valkey,
+            http: reqwest::Client::new(),
+        };
+        let job = JobRequest {
+            user_id: user_id.clone(),
+            idempotent_key: "k".into(),
+            url: "https://example.com".into(),
+            method: "GET".into(),
+            headers: HashMap::new(),
+            body: None,
+            webhook_url: None,
+        };
+
+        let response = forward(state, job, "/proxy").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let start = Instant::now();
+        let mut arrivals = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("streamed frame should not error");
+            if frame.is_data() {
+                arrivals.push(start.elapsed());
+            }
+        }
+
+        assert_eq!(arrivals.len(), 2, "expected exactly two data chunks");
+        let gap = arrivals[1] - arrivals[0];
+
+        // Loose bound on purpose: "roughly delay, not roughly zero" is
+        // the actual claim under test. A live relay should show a gap
+        // close to `delay`; a secretly-buffered one would show both
+        // chunks arriving together, gap near zero.
+        assert!(
+            gap > delay / 2,
+            "expected a gap close to {delay:?} between chunks (proving live relay, not buffering), got {gap:?}"
+        );
+    }
+}

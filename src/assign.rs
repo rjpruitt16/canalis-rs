@@ -1,6 +1,19 @@
 use crate::Valkey;
 use redis::AsyncCommands;
 
+// canalis:pool:free and canalis:assigned are global keys, not scoped
+// per-test the way canalis:assignment:<user_id> is -- so any test
+// touching them (in this module's own tests, or main.rs's forwarding
+// tests) can't safely run concurrently against another one without pool
+// state bleeding across tests. Shared here, at crate visibility, rather
+// than defined separately in each test module -- a lock in assign.rs's
+// own tests wouldn't serialize against a *different* lock in main.rs's
+// tests, and this exact gap caused a real, confusing test failure before
+// it was fixed (main.rs's SSE relay test lost a race against this
+// module's own tests popping the same seeded pool entry).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const ASSIGNMENT_KEY_PREFIX: &str = "canalis:assignment:";
 const FREE_POOL_KEY: &str = "canalis:pool:free";
 const ASSIGNED_KEY: &str = "canalis:assigned";
@@ -70,21 +83,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::Mutex;
-
-    // canalis:pool:free and canalis:assigned are global keys, not scoped
-    // per-test the way canalis:assignment:<user_id> is -- so these tests
-    // can't safely run concurrently against each other (Rust's default)
-    // without one test's pool state bleeding into another's. tokio::sync::Mutex
-    // rather than std::sync::Mutex specifically because the guard is held
-    // across .await points below -- clippy's await_holding_lock lint flags
-    // that for std's Mutex (a real deadlock risk in general async code,
-    // even though this specific per-test-isolated-runtime setup happens
-    // not to hit it). tokio's Mutex is built for exactly this, and as a
-    // bonus has no poisoning semantics -- one test failing while holding
-    // the guard just unlocks normally, no PoisonError cascading into every
-    // later test the way a poisoned std::sync::Mutex would.
-    static TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     // Nanosecond timestamps alone aren't guaranteed unique -- two calls a
     // few CPU cycles apart can return the identical value on real
