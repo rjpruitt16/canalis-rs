@@ -1,23 +1,30 @@
 mod assign;
 
 use axum::{
+    body::Body,
     extract::{ConnectInfo, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use redis::AsyncCommands;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-// ConnectionManager derives Clone (it wraps an Arc internally), so it's
-// safe to hand a copy to every request handler without an Arc<Mutex<>>
-// wrapper of our own -- unlike URLWorker's plain struct fields in Aquifer,
-// which do need an external mutex because they aren't safe to share on
-// their own.
-pub type AppState = redis::aio::ConnectionManager;
+// ConnectionManager and reqwest::Client both derive Clone (each wraps an
+// Arc internally), so it's safe to hand a copy of the whole state to
+// every request handler without an Arc<Mutex<>> wrapper of our own --
+// unlike URLWorker's plain struct fields in Aquifer, which do need an
+// external mutex because they aren't safe to share on their own.
+pub type Valkey = redis::aio::ConnectionManager;
+
+#[derive(Clone)]
+pub struct AppState {
+    valkey: Valkey,
+    http: reqwest::Client,
+}
 
 #[tokio::main]
 async fn main() {
@@ -31,9 +38,14 @@ async fn main() {
     let valkey_url =
         std::env::var("CANALIS_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let client = redis::Client::open(valkey_url).expect("invalid Valkey connection URL");
-    let valkey: AppState = redis::aio::ConnectionManager::new(client)
+    let valkey: Valkey = redis::aio::ConnectionManager::new(client)
         .await
         .expect("failed to connect to Valkey");
+
+    let state = AppState {
+        valkey,
+        http: reqwest::Client::new(),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -41,7 +53,7 @@ async fn main() {
         .route("/register", post(register))
         .route("/proxy", post(proxy))
         .route("/jobs", post(jobs))
-        .with_state(valkey);
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await
@@ -68,13 +80,14 @@ async fn health() -> &'static str {
 // Real round trip against Valkey: SET a key, then GET it back, so this
 // actually proves connectivity rather than just proving the client
 // constructed without erroring.
-async fn valkey_check(State(mut valkey): State<AppState>) -> String {
-    let _: () = valkey
+async fn valkey_check(State(mut state): State<AppState>) -> String {
+    let _: () = state
+        .valkey
         .set("canalis:check", "hello from canalis-rs")
         .await
         .expect("SET failed");
 
-    let value: String = valkey.get("canalis:check").await.expect("GET failed");
+    let value: String = state.valkey.get("canalis:check").await.expect("GET failed");
 
     value
 }
@@ -97,14 +110,15 @@ struct RegisterRequest {
 const REGISTRATION_TTL_SECONDS: u64 = 45;
 
 async fn register(
-    State(mut valkey): State<AppState>,
+    State(mut state): State<AppState>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Json(payload): Json<RegisterRequest>,
 ) -> StatusCode {
     let address = format!("{}:{}", remote.ip(), payload.port);
     let key = format!("canalis:instance:{address}");
 
-    let result: redis::RedisResult<()> = valkey
+    let result: redis::RedisResult<()> = state
+        .valkey
         .set_ex(&key, &payload.reported_at, REGISTRATION_TTL_SECONDS)
         .await;
 
@@ -116,7 +130,7 @@ async fn register(
     // Every heartbeat, not just the first -- but a no-op if addr is
     // already claimed or already in the pool (see register_if_free's own
     // docs for why that idempotency matters).
-    if let Err(err) = assign::register_if_free(&mut valkey, &address).await {
+    if let Err(err) = assign::register_if_free(&mut state.valkey, &address).await {
         tracing::error!("failed to add {address} to the free pool: {err}");
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
@@ -128,58 +142,109 @@ async fn register(
 // Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
 // so a caller already speaking Aquifer's API can point at Canalis with no
 // translation layer -- the whole point of the assignment-then-passthrough
-// design (see DESIGN.md).
-#[derive(Deserialize)]
+// design (see DESIGN.md). Serialize too: this struct gets forwarded
+// as-is to whichever instance Canalis assigns, not rebuilt field by field.
+#[derive(Deserialize, Serialize)]
 struct JobRequest {
     user_id: String,
-    #[allow(dead_code)] // not read yet -- forwarding (the next slice) will need this
     idempotent_key: String,
-    #[allow(dead_code)]
     url: String,
-    #[allow(dead_code)]
     method: String,
-    #[allow(dead_code)]
     #[serde(default)]
     headers: HashMap<String, String>,
-    #[allow(dead_code)]
     #[serde(default)]
     body: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     webhook_url: Option<String>,
 }
 
-async fn proxy(State(valkey): State<AppState>, Json(job): Json<JobRequest>) -> impl IntoResponse {
-    assignment_only_response(valkey, job).await
+async fn proxy(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+    forward(state, job, "/proxy").await
 }
 
-async fn jobs(State(valkey): State<AppState>, Json(job): Json<JobRequest>) -> impl IntoResponse {
-    assignment_only_response(valkey, job).await
+async fn jobs(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+    forward(state, job, "/jobs").await
 }
 
-// /proxy and /jobs are identical right now, on purpose: neither actually
-// forwards anything to the assigned instance yet (that's the next slice,
-// which is also where /proxy's direct-attempt-first behavior and /jobs'
-// straight-to-queue behavior will actually start to diverge). This only
-// proves assignment resolves correctly through the real public API shape.
-async fn assignment_only_response(mut valkey: AppState, job: JobRequest) -> impl IntoResponse {
-    match assign::assign(&mut valkey, &job.user_id).await {
-        Ok(assign::AssignOutcome::Assigned(addr)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "assigned_instance": addr })),
-        ),
-        Ok(assign::AssignOutcome::PoolExhausted) => (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(serde_json::json!({
-                "todo": "pool exhaustion / waiting room not yet implemented"
-            })),
-        ),
+// Resolves the assignment, then forwards the same job body to the
+// assigned instance's own target_path ("/proxy" or "/jobs" -- this is
+// where those two finally diverge, now that there's real forwarding to
+// diverge in). Buffered relay only: a plain response gets its status,
+// content-type, and body relayed verbatim. An SSE response (Aquifer's
+// fallback-to-queue path, and always the case for /jobs) is detected but
+// not yet relayed -- that's the deliberately separate next slice, so it
+// gets the same TODO-stub treatment pool exhaustion already does, not a
+// silent wrong behavior like buffering a live stream as if it were a
+// normal body.
+async fn forward(mut state: AppState, job: JobRequest, target_path: &str) -> Response {
+    let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
+        Ok(assign::AssignOutcome::Assigned(addr)) => addr,
+        Ok(assign::AssignOutcome::PoolExhausted) => {
+            return json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                serde_json::json!({ "todo": "pool exhaustion / waiting room not yet implemented" }),
+            );
+        }
         Err(err) => {
             tracing::error!("assign failed: {err}");
-            (
+            return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "internal error" })),
-            )
+                serde_json::json!({ "error": "internal error" }),
+            );
         }
+    };
+
+    let target_url = format!("http://{addr}{target_path}");
+    let upstream = match state.http.post(&target_url).json(&job).send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!("failed to reach assigned instance {addr}: {err}");
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") }),
+            );
+        }
+    };
+
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if content_type.starts_with("text/event-stream") {
+        return json_response(
+            StatusCode::NOT_IMPLEMENTED,
+            serde_json::json!({ "todo": "SSE stream relay not yet implemented" }),
+        );
     }
+
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    let body = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::error!("failed to read {addr}'s response body: {err}");
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": "failed to read upstream response" }),
+            );
+        }
+    };
+
+    let mut builder = Response::builder().status(status);
+    if !content_type.is_empty() {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::empty())
+            .expect("a hardcoded empty error response should always build")
+    })
+}
+
+fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
+    (status, Json(body)).into_response()
 }

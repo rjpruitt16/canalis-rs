@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::Valkey;
 use redis::AsyncCommands;
 
 const ASSIGNMENT_KEY_PREFIX: &str = "canalis:assignment:";
@@ -17,7 +17,7 @@ pub enum AssignOutcome {
 /// instead. Does not handle a Canalis process crashing mid-operation (a
 /// real, separate gap; see DESIGN.md's reconciliation-sweep section, not
 /// yet built).
-pub async fn assign(valkey: &mut AppState, user_id: &str) -> redis::RedisResult<AssignOutcome> {
+pub async fn assign(valkey: &mut Valkey, user_id: &str) -> redis::RedisResult<AssignOutcome> {
     let assignment_key = format!("{ASSIGNMENT_KEY_PREFIX}{user_id}");
 
     if let Some(existing) = valkey.get::<_, Option<String>>(&assignment_key).await? {
@@ -57,7 +57,7 @@ pub async fn assign(valkey: &mut AppState, user_id: &str) -> redis::RedisResult<
 /// to a Set specifically for this idempotency property; trades away FIFO
 /// fairness, which this slice never required (first-free-wins, per the
 /// original scoping).
-pub async fn register_if_free(valkey: &mut AppState, addr: &str) -> redis::RedisResult<()> {
+pub async fn register_if_free(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<()> {
     let already_assigned: bool = valkey.sismember(ASSIGNED_KEY, addr).await?;
     if already_assigned {
         return Ok(());
@@ -103,7 +103,7 @@ mod tests {
         format!("{prefix}-{nanos}-{n}")
     }
 
-    async fn test_valkey() -> AppState {
+    async fn test_valkey() -> Valkey {
         let client = redis::Client::open("redis://127.0.0.1:6379")
             .expect("valid Valkey URL");
         redis::aio::ConnectionManager::new(client)
@@ -111,7 +111,7 @@ mod tests {
             .expect("connect to a real local Valkey on 127.0.0.1:6379 -- required for these tests")
     }
 
-    async fn cleanup(valkey: &mut AppState, addrs: &[&str], user_ids: &[&str]) {
+    async fn cleanup(valkey: &mut Valkey, addrs: &[&str], user_ids: &[&str]) {
         for addr in addrs {
             let _: redis::RedisResult<()> = valkey.srem(FREE_POOL_KEY, *addr).await;
             let _: redis::RedisResult<()> = valkey.srem(ASSIGNED_KEY, *addr).await;

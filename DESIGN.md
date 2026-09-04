@@ -1,13 +1,18 @@
 # Canalis — design doc
 
-Status: registration and assignment (community pool only) are built and
-verified end-to-end against a real Valkey. `POST /proxy` and `POST
-/jobs` exist as real public endpoints, matching Aquifer's own request
-shape exactly, but currently do only the assignment step — no
-forwarding to the assigned instance yet, no SSE relay. Pool exhaustion
-returns a TODO stub (501), not the waiting room. The reconciliation
-sweep, Reserved-pool overrides, the account-queue port, and idempotency
-storage are all still design only.
+Status: registration, assignment (community pool only), and buffered
+request forwarding are built and verified end-to-end. `POST /proxy` and
+`POST /jobs` resolve the assignment, forward the same job body to the
+assigned instance's own `/proxy` or `/jobs`, and relay a plain response
+back verbatim (status, content-type, body) — proven against a real mock
+instance, not just unit-tested. An SSE response from the assigned
+instance (Aquifer's fallback-to-queue path, and always the case for
+`/jobs`) is correctly *detected* and returns a TODO stub (501) rather
+than silently buffering a live stream as if it were a normal body —
+actual streaming relay is a deliberately separate next slice. Pool
+exhaustion also returns a TODO stub, not the waiting room. The
+reconciliation sweep, Reserved-pool overrides, the account-queue port,
+and idempotency storage are all still design only.
 
 **Real deviation from an earlier plan, found by actually running this,
 not decided in the abstract:** the free pool (`canalis:pool:free`) is a
