@@ -6,6 +6,8 @@ One Aquifer (or ezthrottle-local) instance paces and durably queues requests to 
 
 It's not a generic reverse proxy with rate-limiting bolted on — it's built to sit in front of instances that already speak a pacing dialect (`X-Aqueduct-*`) and keep that dialect meaningful across more than one instance.
 
+Sibling projects, either of which can be a fleet member: [Aquifer](https://github.com/rjpruitt16/aquifer) (Go) and [ezthrottle-local](https://github.com/rjpruitt16/ezthrottle-local) (Elixir).
+
 ---
 
 ## Why not Envoy or nginx?
