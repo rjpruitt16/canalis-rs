@@ -42,6 +42,84 @@ verbatim — no manual SSE parsing needed, and no information is lost,
 only the incremental delivery is (an honest simplification for a result
 that's already history by the time anyone's asking).
 
+**One freed instance drains a tenant's *whole* backlog, not just their
+oldest job.** The account-queue exists specifically as a durable,
+Valkey-backed fallback for periods where fleet capacity genuinely lags
+demand — a tenant could plausibly have several jobs piled up by the time
+an instance frees up for them, and since assignment is sticky per
+`user_id`, the address resolved for their first job stays valid for
+every job after it. `try_drain_one` pops their first job via `pop_one`
+(the tenant-selection step), then loops on `account_queue::pop_for`
+(pops directly from that tenant's own list, no tenant reselection)
+until their queue is empty, caching a result for each job dispatched.
+This is also what makes the fallback genuinely horizontally scalable,
+not just durable: because the queue itself lives in Valkey rather than
+in any one Canalis process's memory, multiple Canalis processes each
+independently triggering drains off their own registration events —
+exactly what happens naturally when several instances register in quick
+succession during a scale-up — coordinate safely through the same
+atomic Valkey operations already proven for `assign()`, with no
+additional coordination layer needed. Verified with a real test:
+`one_registration_drains_a_tenants_whole_backlog_not_just_one_job`
+queues three jobs for one tenant, triggers a single drain, and confirms
+all three (not just the first) got dispatched and cached.
+
+**The drain loop dispatches concurrently and adjusts its own pacing
+live, mirroring Aquifer's `account_queue.go` `run()` loop directly** —
+this closes the gap the Open Questions section below used to flag, via
+a new header pair: `X-Canalis-Max-Concurrent` / `X-Canalis-Rps`, read
+off every dispatched job's own response
+(`PacingSignal::from_headers` in `main.rs`). These are a deliberate
+mirror of Aquifer's existing `X-Aqueduct-*`/`X-Aquifer-*`
+`pacingHeader()` convention, but one layer further out: those headers
+are the *backend* telling an Aquifer instance how hard it'll tolerate
+being hit; `X-Canalis-*` is the *instance* telling Canalis the same
+thing about itself. `pacing_header()` checks `X-Canalis-<name>` first,
+then falls back to `X-Aqueduct-<name>` and `X-Aquifer-<name>` — Aquifer's
+own existing pacing-header names — in case an instance's simplest path
+to supporting this is mirroring its already-computed internal
+`rps`/`maxConc` back out under headers it already produces, rather than
+adding Canalis-specific ones. `drain_tenant_backlog` starts at Aquifer's
+own conservative defaults (`DEFAULT_DRAIN_RPS = 2.0`,
+`DEFAULT_DRAIN_MAX_CONCURRENT = 1` — i.e. fully sequential, matching
+`RateConfig{RPS: 2.0, MaxConcurrent: 1}`), dispatches up to the current
+concurrency ceiling via a `tokio::task::JoinSet`, paces each dispatch
+*start* at `1/rps` (no jitter — Aquifer's jitter exists to desynchronize
+many *different* domains' queues sharing a backend; one tenant's own
+drain has no sibling queue to desynchronize from), and adjusts both
+values from whichever job's response comes back next, same as Aquifer's
+`msg.maxConcurrent`/`msg.rps` handling in its own `done`-channel branch.
+A hardcoded ceiling (`MAX_DRAIN_CONCURRENCY_CEILING = 50`) caps how far
+an instance's own claimed max-concurrent value can push things,
+independent of what it advertises.
+
+**Not yet emitted by Aquifer or ezthrottle-local under any of these
+names** — until an instance actually sends one, every drain stays at
+the conservative sequential default, which is still strictly correct,
+just not yet taking advantage of instance-reported capacity. Proposed
+as [aquifer#13](https://github.com/rjpruitt16/aquifer/issues/13) and
+[ezthrottle-local#9](https://github.com/rjpruitt16/ezthrottle-local/issues/9)
+rather than built directly into those repos in this pass, matching how
+the earlier reconciliation-adjacent ideas this project produced were
+handled.
+
+Verified with a real timing test, not just that headers get parsed:
+`x_canalis_headers_raise_concurrency_and_pacing_mid_drain` seeds a
+tenant with 4 queued jobs, each dispatched job answered by a mock that
+takes 300ms and advertises `X-Canalis-Max-Concurrent: 4` /
+`X-Canalis-Rps: 100`. Job 1 always goes out alone against the
+conservative default (300ms by itself); jobs 2–4 then go out together
+once the ceiling's been learned. A regression back to fully-sequential
+dispatch would take ~4×300ms≈1200ms; the real run lands around ~600ms
+(job 1's wave, then one concurrent wave for the rest) — asserted as
+`< 900ms` (rules out sequential) and `>= 300ms` (rules out skipping the
+delay entirely), the same "loose bound, real claim" style already used
+by `sse_response_is_relayed_live_not_buffered`.
+`x_aqueduct_headers_are_accepted_as_a_fallback_pacing_signal` runs the
+exact same proof again with the response advertising under
+`X-Aqueduct-*` instead, with no `X-Canalis-*` present at all, confirming
+the fallback chain itself actually works and isn't just dead code.
+
 **A caller with no `webhook_url` whose connection drops before the
 result is ready has no way to learn the outcome today** — an accepted,
 documented gap, not silently glossed over, matching the same "note the
@@ -367,21 +445,19 @@ picked on your behalf:
 
 ## Open questions
 
-- `try_drain_one` pops exactly one pending job per freed instance.
-  Raised as a real question worth answering later: if the *same* tenant
-  has several requests queued and their newly-assigned instance can
-  actually handle more than one concurrently (its own `max_concurrent`),
-  draining just their oldest one leaves real throughput on the table.
-  This doesn't mean assigning one freed instance to *multiple tenants*
-  at once — that would break the 1:1 assignment model — only draining
-  more of *one* tenant's own backlog once they're assigned. Blocked on
-  something Canalis doesn't currently have any way to learn: the
-  assigned instance's own concurrency capacity. Aquifer's
-  `X-Aqueduct-Max-Concurrent` header flows the other direction (a
-  backend telling Aquifer to slow down), not something an instance
-  reports about itself to a caller like Canalis. The likely fix, not
-  yet built: instances report their own configured capacity as part of
-  registration.
+- `drain_tenant_backlog` now dispatches a tenant's backlog concurrently
+  and adjusts its own pacing live from `X-Canalis-*`/`X-Aqueduct-*`/
+  `X-Aquifer-*` response headers (see the account-queue section above)
+  — the concurrency mechanism itself is built and tested. What's still
+  genuinely open: no instance actually emits any of these headers yet,
+  so every drain runs at the conservative sequential default in
+  practice until Aquifer/ezthrottle-local ship one (aquifer#13,
+  ezthrottle-local#9). Also unresolved: is
+  registration-time capacity reporting (the fix this section originally
+  proposed) still worth building *in addition* to response-header
+  pacing, e.g. as a better starting point than the fixed default before
+  a tenant's first job has even gone out, or does response-header
+  pacing alone cover it well enough once it's actually emitted?
 - During a reserved-instance override (rolling update), is the old
   machine still a valid routing target for in-flight work during the
   overlap window, or does cutover happen immediately? See Assignment

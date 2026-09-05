@@ -159,16 +159,75 @@ async fn register(
     StatusCode::OK
 }
 
-// Pops one pending job (if any) and dispatches it for real, now that a
-// slot has freed up -- headless, no live connection to relay to, so the
-// outcome gets cached for whichever still-open request (or future
-// polling endpoint) is waiting on it. Always dispatches to the assigned
-// instance's own /jobs, not /proxy: this job was already queued once, so
-// there's no reason to attempt a synchronous direct attempt again --
-// /jobs already gives a uniform "wait for the full SSE lifecycle to
-// finish, then read whatever it settled on" shape, which is exactly
-// what's needed here (no live connection to stream to, only a final
-// result worth keeping).
+// Default pacing before anything's been learned about the target
+// instance's own tolerance -- mirrors Aquifer's own account_queue.go
+// defaults (RateConfig{RPS: 2.0, MaxConcurrent: 1}) exactly: start
+// conservative (fully sequential), then adjust from whatever the
+// instance reports back on each dispatch.
+const DEFAULT_DRAIN_RPS: f64 = 2.0;
+const DEFAULT_DRAIN_MAX_CONCURRENT: usize = 1;
+const MIN_DRAIN_RPS: f64 = 0.5;
+// A misbehaving or malicious instance advertising an absurd concurrency
+// ceiling shouldn't be able to make Canalis fire an unbounded number of
+// requests at once -- this caps how far X-Canalis-Max-Concurrent can
+// push things up, independent of whatever the instance claims.
+const MAX_DRAIN_CONCURRENCY_CEILING: usize = 50;
+
+// Checked in this order: X-Canalis-<name> first (the purpose-built
+// instance-to-Canalis signal), falling back to X-Aqueduct-<name> then
+// X-Aquifer-<name> -- Aquifer's own existing pacing-header names, in
+// case an instance's simplest path to supporting this is mirroring its
+// already-computed internal rps/maxConc back out under the header names
+// it already produces, rather than adding a Canalis-specific one.
+// Mirrors Aquifer's own dual-namespace pacingHeader() lookup, extended
+// by one more fallback layer.
+const PACING_HEADER_PREFIXES: [&str; 3] = ["X-Canalis-", "X-Aqueduct-", "X-Aquifer-"];
+
+fn pacing_header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Option<&'a str> {
+    PACING_HEADER_PREFIXES.iter().find_map(|prefix| {
+        headers
+            .get(format!("{prefix}{name}").as_str())
+            .and_then(|v| v.to_str().ok())
+    })
+}
+
+// The instance-reported pacing signal for further drain dispatches,
+// read off each dispatched job's own response -- see
+// PACING_HEADER_PREFIXES for the header names checked. This closes the
+// gap DESIGN.md's Open Questions section flagged (Canalis had no way to
+// learn an instance's own concurrency capacity): X-Aqueduct-*/X-Aquifer-*
+// are the *backend* telling an Aquifer instance how hard it'll tolerate
+// being hit; X-Canalis-* is the *instance* telling Canalis the same
+// thing about itself, one layer further out. Not yet emitted by
+// Aquifer/ezthrottle-local under any of these names -- until an
+// instance actually sends one, every drain stays at the conservative
+// sequential default above.
+struct PacingSignal {
+    max_concurrent: Option<usize>,
+    rps: Option<f64>,
+}
+
+impl PacingSignal {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let max_concurrent = pacing_header(headers, "Max-Concurrent")
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0);
+        let rps = pacing_header(headers, "Rps")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|&v| v > 0.0);
+        PacingSignal { max_concurrent, rps }
+    }
+
+    fn none() -> Self {
+        PacingSignal { max_concurrent: None, rps: None }
+    }
+}
+
+// Pops a pending tenant's oldest job (if any), assigns them an instance,
+// and drains the rest of that same tenant's backlog against the same
+// sticky assignment. Assignment is sticky per user_id, so there's no
+// reason a single freed instance should only ever clear one of their
+// jobs before waiting for another registration to come along.
 async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
     let Some(job) = account_queue::pop_one(&mut state.valkey).await? else {
         return Ok(());
@@ -185,11 +244,114 @@ async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
         Err(err) => return Err(err),
     };
 
-    let target_url = format!("http://{addr}/jobs");
-    let response = state.http.post(&target_url).json(&job).send().await;
+    drain_tenant_backlog(state, job, addr).await
+}
 
-    let cached = match response {
+// Drains user_id's entire backlog against one sticky assignment,
+// dispatching concurrently up to a live concurrency ceiling that
+// adjusts as X-Canalis-Max-Concurrent/X-Canalis-Rps come back from each
+// dispatch -- a direct port of Aquifer's own account_queue.go run()
+// loop (pull work, dispatch up to maxConc concurrently, paced at 1/rps
+// between dispatch *starts*, adjust both from each completion's
+// response headers) with two differences: work comes from Valkey
+// instead of an in-memory channel, and there's no jitter (Aquifer's
+// jitter exists to keep many *different* domains' queues from
+// resonating against a shared backend; one tenant's own drain has no
+// sibling queue to desynchronize from, so the complexity isn't worth it
+// here).
+//
+// Headless throughout -- no live connection to relay to, so each job's
+// outcome gets cached for whichever still-open request (or future
+// polling endpoint) is waiting on it. Always dispatches to the assigned
+// instance's own /jobs, not /proxy: these jobs were already queued once,
+// so there's no reason to attempt a synchronous direct attempt again --
+// /jobs already gives a uniform "wait for the full SSE lifecycle to
+// finish, then read whatever it settled on" shape, which is exactly
+// what's needed here.
+async fn drain_tenant_backlog(
+    mut state: AppState,
+    first_job: JobRequest,
+    addr: String,
+) -> redis::RedisResult<()> {
+    let user_id = first_job.user_id.clone();
+    let mut pending = Some(first_job);
+    let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
+    let mut rps = DEFAULT_DRAIN_RPS;
+    let mut last_dispatch_at: Option<Instant> = None;
+    let mut in_flight: tokio::task::JoinSet<PacingSignal> = tokio::task::JoinSet::new();
+
+    loop {
+        while in_flight.len() < max_concurrent {
+            let job = match pending.take() {
+                Some(job) => job,
+                None => match account_queue::pop_for(&mut state.valkey, &user_id).await? {
+                    Some(job) => job,
+                    None => break,
+                },
+            };
+
+            if let Some(prev) = last_dispatch_at {
+                let interval = Duration::from_secs_f64(1.0 / rps.max(MIN_DRAIN_RPS));
+                let elapsed = prev.elapsed();
+                if elapsed < interval {
+                    tokio::time::sleep(interval - elapsed).await;
+                }
+            }
+            last_dispatch_at = Some(Instant::now());
+
+            in_flight.spawn(dispatch_drained_job(
+                state.valkey.clone(),
+                state.http.clone(),
+                addr.clone(),
+                job,
+            ));
+        }
+
+        let Some(joined) = in_flight.join_next().await else {
+            // Nothing in flight, and the top-up loop above just found
+            // nothing left to pop -- the backlog is genuinely empty.
+            break;
+        };
+
+        let signal = joined.map_err(|err| {
+            redis::RedisError::from((
+                redis::ErrorKind::Client,
+                "drain dispatch task panicked",
+                err.to_string(),
+            ))
+        })?;
+
+        if let Some(mc) = signal.max_concurrent {
+            max_concurrent = mc.min(MAX_DRAIN_CONCURRENCY_CEILING);
+        }
+        if let Some(new_rps) = signal.rps {
+            rps = new_rps.max(MIN_DRAIN_RPS);
+        }
+    }
+
+    Ok(())
+}
+
+// One job's worth of the drain, run as its own task so up to
+// max_concurrent of these can be in flight together. Caches its own
+// result directly rather than handing it back to drain_tenant_backlog's
+// loop -- Valkey and reqwest::Client are both cheap, Arc-backed clones,
+// so each task owns everything it needs to finish independently. A
+// caching failure here is only logged, not propagated: with several of
+// these in flight at once there's no single caller left to hand a
+// Result to.
+async fn dispatch_drained_job(
+    mut valkey: Valkey,
+    http: reqwest::Client,
+    addr: String,
+    job: JobRequest,
+) -> PacingSignal {
+    let target_url = format!("http://{addr}/jobs");
+    let response = http.post(&target_url).json(&job).send().await;
+
+    let (cached, pacing) = match response {
         Ok(resp) => {
+            let pacing = PacingSignal::from_headers(resp.headers());
             let status = resp.status().as_u16();
             let content_type = resp
                 .headers()
@@ -204,7 +366,7 @@ async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
             // final line. No manual SSE parsing needed: the cached
             // result is the same text a live viewer would have seen.
             let body = resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned());
-            match body {
+            let cached = match body {
                 Ok(body) => account_queue::CachedResult { status, content_type, body },
                 Err(err) => {
                     tracing::error!("failed to read drained response body from {addr}: {err}");
@@ -215,20 +377,26 @@ async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
                             .to_string(),
                     }
                 }
-            }
+            };
+            (cached, pacing)
         }
         Err(err) => {
             tracing::error!("failed to dispatch drained job to {addr}: {err}");
-            account_queue::CachedResult {
+            let cached = account_queue::CachedResult {
                 status: 502,
                 content_type: "application/json".into(),
                 body: serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") })
                     .to_string(),
-            }
+            };
+            (cached, PacingSignal::none())
         }
     };
 
-    account_queue::store_result(&mut state.valkey, &job.idempotent_key, &cached).await
+    if let Err(err) = account_queue::store_result(&mut valkey, &job.idempotent_key, &cached).await {
+        tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
+    }
+
+    pacing
 }
 
 // Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
@@ -832,5 +1000,176 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "expected the instance retries to give up quickly, took {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn one_registration_drains_a_tenants_whole_backlog_not_just_one_job() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let mut valkey = test_valkey().await;
+        let user_id = unique("user-deep-backlog");
+        let mock_addr = start_plain_ok_mock().await;
+
+        // Three jobs queued for the *same* tenant before anything is
+        // registered for them -- proving the fix directly: a single
+        // freed instance should clear all three, not just the first one
+        // popped off canalis:pending_tenants.
+        let jobs: Vec<JobRequest> = (0..3).map(|_| job_for(&user_id)).collect();
+        for job in &jobs {
+            account_queue::enqueue(&mut valkey, job).await.unwrap();
+        }
+
+        let mut state = AppState {
+            valkey: valkey.clone(),
+            http: reqwest::Client::new(),
+        };
+        let added = assign::register_if_free(&mut state.valkey, &mock_addr)
+            .await
+            .unwrap();
+        assert!(added, "test setup bug: expected this to be a genuinely new pool add");
+        try_drain_one(state).await.unwrap();
+
+        let mut results = Vec::new();
+        for job in &jobs {
+            results.push(
+                account_queue::get_result(&mut valkey, &job.idempotent_key)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Cleanup before the asserts, same reasoning as every other test
+        // in this file.
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:account_queue:{user_id}")).await;
+        for job in &jobs {
+            let _: redis::RedisResult<()> = valkey
+                .del(format!("canalis:result:{}", job.idempotent_key))
+                .await;
+        }
+
+        for (i, result) in results.into_iter().enumerate() {
+            let cached = result.unwrap_or_else(|| panic!("job {i} in the backlog was never drained"));
+            assert_eq!(cached.status, 200, "job {i} should have been dispatched and completed");
+        }
+    }
+
+    // Every response takes `delay`, and advertises the given
+    // max_concurrent/rps under `<header_prefix>Max-Concurrent` /
+    // `<header_prefix>Rps` -- lets a test prove whether
+    // drain_tenant_backlog actually acted on those headers by measuring
+    // wall-clock time, the same way sse_response_is_relayed_live_not_buffered
+    // proves streaming-vs-buffering by measuring inter-chunk timing
+    // rather than trusting an internal flag. header_prefix is exercised
+    // by two different tests -- once as "X-Canalis-", once as
+    // "X-Aqueduct-" -- to prove pacing_header's fallback chain actually
+    // works, not just its preferred name.
+    async fn start_delayed_pacing_mock(
+        delay: Duration,
+        header_prefix: &'static str,
+        max_concurrent: &'static str,
+        rps: &'static str,
+    ) -> String {
+        async fn handler(
+            AxumState((delay, header_prefix, max_concurrent, rps)): AxumState<(
+                Duration,
+                &'static str,
+                &'static str,
+                &'static str,
+            )>,
+        ) -> Response {
+            tokio::time::sleep(delay).await;
+            Response::builder()
+                .status(200)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .header(format!("{header_prefix}Max-Concurrent"), max_concurrent)
+                .header(format!("{header_prefix}Rps"), rps)
+                .body(Body::from(r#"{"status":"completed"}"#))
+                .expect("a hardcoded response should always build")
+        }
+        let app = Router::new()
+            .route("/jobs", post(handler))
+            .with_state((delay, header_prefix, max_concurrent, rps));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    // Shared by both pacing-header tests below -- only header_prefix
+    // differs between them, everything else (job count, delay, the
+    // timing assertions) is the exact same claim under test.
+    async fn assert_pacing_header_drives_concurrency(header_prefix: &'static str, user_id_prefix: &str) {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let mut valkey = test_valkey().await;
+        let user_id = unique(user_id_prefix);
+
+        // Every response advertises room for 4 concurrent, at 100rps --
+        // fast enough that dispatch-start pacing is a non-factor once
+        // it's been learned. The *first* job still has to go out alone
+        // against the conservative default (1 concurrent, 2rps), so the
+        // real claim under test is: job 1 pays the 300ms delay by
+        // itself, then jobs 2-4 pay it together, not one after another.
+        // Fully serial (bug: headers ignored) would take ~4*300ms=1200ms;
+        // header-driven concurrency should land close to ~600ms.
+        let delay = Duration::from_millis(300);
+        let mock_addr = start_delayed_pacing_mock(delay, header_prefix, "4", "100").await;
+
+        let jobs: Vec<JobRequest> = (0..4).map(|_| job_for(&user_id)).collect();
+        for job in &jobs {
+            account_queue::enqueue(&mut valkey, job).await.unwrap();
+        }
+
+        let mut state = AppState {
+            valkey: valkey.clone(),
+            http: reqwest::Client::new(),
+        };
+        let added = assign::register_if_free(&mut state.valkey, &mock_addr)
+            .await
+            .unwrap();
+        assert!(added, "test setup bug: expected this to be a genuinely new pool add");
+
+        let start = Instant::now();
+        try_drain_one(state).await.unwrap();
+        let elapsed = start.elapsed();
+
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:account_queue:{user_id}")).await;
+        for job in &jobs {
+            let _: redis::RedisResult<()> = valkey
+                .del(format!("canalis:result:{}", job.idempotent_key))
+                .await;
+        }
+
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "expected {header_prefix}-driven concurrency to clear 4 jobs in ~2 waves of {delay:?}, not 4 sequential waves; took {elapsed:?}"
+        );
+        assert!(
+            elapsed >= delay,
+            "expected at least one full delay's worth of real waiting (job 1 always goes out alone), took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn x_canalis_headers_raise_concurrency_and_pacing_mid_drain() {
+        assert_pacing_header_drives_concurrency("X-Canalis-", "user-pacing-canalis").await;
+    }
+
+    // Proves pacing_header's fallback chain, not just its preferred
+    // name: an instance advertising pacing under Aquifer's own existing
+    // header names (no X-Canalis-* at all) should drive the exact same
+    // concurrency behavior, in case that's the simpler integration path
+    // for Aquifer/ezthrottle-local to actually ship.
+    #[tokio::test]
+    async fn x_aqueduct_headers_are_accepted_as_a_fallback_pacing_signal() {
+        assert_pacing_header_drives_concurrency("X-Aqueduct-", "user-pacing-aqueduct").await;
     }
 }

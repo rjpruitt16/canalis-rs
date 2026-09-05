@@ -75,6 +75,33 @@ pub async fn pop_one(valkey: &mut Valkey) -> redis::RedisResult<Option<JobReques
     }
 }
 
+/// Pops the next job directly from user_id's own queue, bypassing the
+/// pending_tenants selection step in pop_one(). Used to drain the rest of
+/// a tenant's backlog once pop_one() has already resolved which tenant
+/// to drain and an address has been assigned for them -- every remaining
+/// job in that same tenant's queue goes to the same sticky assignment, so
+/// there's no reason to re-roll which tenant gets drained next.
+///
+/// Deliberately doesn't touch pending_tenants either way: pop_one()
+/// already re-adds user_id there if more than one job was queued, so a
+/// second, concurrent drain attempt landing on this same tenant mid-loop
+/// just finds an empty queue and no-ops, rather than racing this one for
+/// jobs.
+pub async fn pop_for(valkey: &mut Valkey, user_id: &str) -> redis::RedisResult<Option<JobRequest>> {
+    let popped: Option<String> = valkey.rpop(account_queue_key(user_id), None).await?;
+    let Some(payload) = popped else {
+        return Ok(None);
+    };
+
+    match serde_json::from_str(&payload) {
+        Ok(job) => Ok(Some(job)),
+        Err(err) => {
+            tracing::error!("dropping unparseable queued job for {user_id}: {err}");
+            Ok(None)
+        }
+    }
+}
+
 /// The cached outcome of a drained job -- everything the still-waiting
 /// connection (or a future polling endpoint) needs to reconstruct the
 /// same response it would have gotten synchronously.
