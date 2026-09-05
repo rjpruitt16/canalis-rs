@@ -30,10 +30,6 @@ Health-check-driven failover also tends to flap: a backend gets overwhelmed, is 
 
 **Reserved instances for guaranteed capacity** (designed, not yet shipped — see `DESIGN.md`). An instance can register as dedicated to one `user_id` and never enter the community pool, for tenants needing guaranteed unshared capacity rather than a fair share of a pool. Canalis assumes it sits behind an API gateway that's already authenticated the caller, so it needs no credential system of its own — the gateway is the trust boundary.
 
-## Status
-
-Registration, sticky assignment (community pool), request forwarding (buffered and live-streamed), the durable Valkey-backed account-queue, and concurrent header-driven pacing on drain are built and tested end-to-end — see `DESIGN.md` for full detail, verification notes, and open questions. Reserved-instance support and a `GET /jobs/<idempotent_key>` polling endpoint are designed but not implemented. This is a hands-on Rust learning project as much as an infrastructure one — implementation is deliberate and incremental, not a race to 1.0.
-
 ## Quick start
 
 Needs a running Valkey (or Redis) instance and at least one Aquifer or ezthrottle-local instance to route to.
