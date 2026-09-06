@@ -4,6 +4,8 @@
 
 One Aquifer (or ezthrottle-local) instance paces and durably queues requests to a single backend based on what that backend says it can absorb. Canalis does the same job one layer up: given a fleet of such instances, it decides which tenant gets which instance, keeps that assignment sticky for the instance's lifetime, and durably queues a tenant's work when the fleet is genuinely out of capacity — instead of dropping it, retrying blindly, or splitting one tenant's traffic across instances in a way that blinds all of them to that tenant's real burst pattern.
 
+Each fleet member is usually protecting something that can't scale on a whim — a GPU, a database, a CI runner — where "more capacity" means provisioning another machine, not flipping a switch. Canalis's account-queue exists because that gap is real but temporary: it holds work while more compute comes online, it doesn't manufacture capacity that isn't coming. If what's behind the fleet has a genuinely fixed ceiling that more machines can never raise, none of this is worth building — you'd just be queuing in front of a wall.
+
 It's not a generic reverse proxy with rate-limiting bolted on — it's built to sit in front of instances that already speak a pacing dialect (`X-Aqueduct-*`) and keep that dialect meaningful across more than one instance.
 
 Sibling projects, either of which can be a fleet member: [Aquifer](https://github.com/rjpruitt16/aquifer) (Go) and [ezthrottle-local](https://github.com/rjpruitt16/ezthrottle-local) (Elixir).
