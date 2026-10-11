@@ -93,12 +93,12 @@ A hardcoded ceiling (`MAX_DRAIN_CONCURRENCY_CEILING = 50`) caps how far
 an instance's own claimed max-concurrent value can push things,
 independent of what it advertises.
 
-**Not yet emitted by Aquifer or ezthrottle-local under any of these
+**Not yet emitted by Aquifer or Spillway under any of these
 names** — until an instance actually sends one, every drain stays at
 the conservative sequential default, which is still strictly correct,
 just not yet taking advantage of instance-reported capacity. Proposed
 as [aquifer#13](https://github.com/rjpruitt16/aquifer/issues/13) and
-[ezthrottle-local#9](https://github.com/rjpruitt16/ezthrottle-local/issues/9)
+[spillway#9](https://github.com/rjpruitt16/spillway/issues/9)
 rather than built directly into those repos in this pass, matching how
 the earlier reconciliation-adjacent ideas this project produced were
 handled.
@@ -165,11 +165,11 @@ only ever resolves *new* tenant requests against *new* capacity, not
 requests stuck on an instance that's gone for good.
 
 **Also explicitly deferred:** streaming job-state transitions (not just
-terminal webhooks) from Aquifer/ezthrottle-local, to reduce how much
+terminal webhooks) from Aquifer/Spillway, to reduce how much
 in-flight work is lost if a machine goes offline *permanently* rather
 than just restarting — filed as
 [aquifer#12](https://github.com/rjpruitt16/aquifer/issues/12) /
-[ezthrottle-local#8](https://github.com/rjpruitt16/ezthrottle-local/issues/8),
+[spillway#8](https://github.com/rjpruitt16/spillway/issues/8),
 not designed or scoped for implementation.
 
 The reconciliation sweep, Reserved-pool overrides, and idempotency
@@ -195,7 +195,7 @@ sufficient and simpler.
 ## What it is
 
 Canalis is a control-plane + gateway for the edge/Fly.io side of the Aqueduct
-model (Aquifer, and by extension ezthrottle-local). It sits in front of a
+model (Aquifer, and by extension Spillway). It sits in front of a
 fleet of Aquifer instances and does two jobs: assign each tenant to an
 instance (sticky, so a given user always lands on the same one), and forward
 that tenant's requests to the assigned instance, adapting how it forwards
@@ -204,13 +204,13 @@ based on that instance's real-time health.
 Written in Rust (Tokio + Tower), backed by Valkey. No BEAM/Elixir version —
 Canalis-RS alone is the whole story for this project. One reason for Rust
 specifically: some potential adopters won't take a dependency on a BEAM
-runtime at all, regardless of how good ezthrottle-local is on its own merits.
+runtime at all, regardless of how good Spillway is on its own merits.
 A Rust control plane in front of the fleet sidesteps that objection for
 anyone who'd otherwise never look past the runtime.
 
 ## Why it exists
 
-Aquifer and ezthrottle-local each handle a single instance's local pacing,
+Aquifer and Spillway each handle a single instance's local pacing,
 queuing, and cross-region failover well. Neither handles "which instance
 should this tenant's traffic go to in the first place" — that's a fleet-level
 question, not a single-instance question, and answering it requires shared
@@ -353,7 +353,7 @@ there) already expresses the decelerate-quickly half of this — nothing new
 needed there, just naming what already exists.
 
 The accelerate-slowly half is now also a real, shipped feature in both
-Aquifer and ezthrottle-local (as of this session): `X-Aqueduct-Slow-Start`
+Aquifer and Spillway (as of this session): `X-Aqueduct-Slow-Start`
 starts a brand-new queue at a low floor rate instead of its full configured
 rate, ramping up via the same gradual-recovery mechanism that already
 brings a throttled queue back up. Canalis's own ported account-queue
@@ -403,10 +403,10 @@ not reach for by default.
 ## Testing
 
 - **Aqueduct Runner** (the existing cross-repo contract-test framework
-  already used to test Aquifer against ezthrottle-local in CI) should grow
+  already used to test Aquifer against Spillway in CI) should grow
   Canalis contract tests too, so a change on either side that breaks the
   drain/report-back/reassignment contract gets caught the same way a
-  break between Aquifer and ezthrottle-local already does.
+  break between Aquifer and Spillway already does.
 - **Dagger**, locally to start (not necessarily wired into CI yet): spin up
   Valkey (official Docker image) alongside Canalis-RS and an Aquifer
   instance, and exercise the real drain → report-back → reassignment cycle
@@ -437,7 +437,7 @@ picked on your behalf:
 
 - Canalis-BEAM. Decided against — Canalis-RS alone is a strong enough
   story on its own; a second implementation isn't worth the maintenance
-  burden on top of Aquifer + ezthrottle-local.
+  burden on top of Aquifer + Spillway.
 - Any code. This doc exists so the design doesn't have to be
   reconstructed from memory later — implementation is a separate,
   future effort, and deliberately a hands-on one (this project is partly
@@ -451,8 +451,8 @@ picked on your behalf:
   — the concurrency mechanism itself is built and tested. What's still
   genuinely open: no instance actually emits any of these headers yet,
   so every drain runs at the conservative sequential default in
-  practice until Aquifer/ezthrottle-local ship one (aquifer#13,
-  ezthrottle-local#9). Also unresolved: is
+  practice until Aquifer/Spillway ship one (aquifer#13,
+  spillway#9). Also unresolved: is
   registration-time capacity reporting (the fix this section originally
   proposed) still worth building *in addition* to response-header
   pacing, e.g. as a better starting point than the fixed default before
