@@ -199,7 +199,7 @@ fn pacing_header<'a>(headers: &'a reqwest::header::HeaderMap, name: &str) -> Opt
 // are the *backend* telling an Aquifer instance how hard it'll tolerate
 // being hit; X-Canalis-* is the *instance* telling Canalis the same
 // thing about itself, one layer further out. Not yet emitted by
-// Aquifer/ezthrottle-local under any of these names -- until an
+// Aquifer/Spillway under any of these names -- until an
 // instance actually sends one, every drain stays at the conservative
 // sequential default above.
 struct PacingSignal {
@@ -449,7 +449,7 @@ struct RetryConfig {
 }
 
 impl RetryConfig {
-    // Env-var overridable, same convention Aquifer/ezthrottle-local
+    // Env-var overridable, same convention Aquifer/Spillway
     // already use for their own idle/drain timers -- production should
     // leave these at the defaults.
     fn from_env() -> Self {
@@ -1167,7 +1167,7 @@ mod tests {
     // name: an instance advertising pacing under Aquifer's own existing
     // header names (no X-Canalis-* at all) should drive the exact same
     // concurrency behavior, in case that's the simpler integration path
-    // for Aquifer/ezthrottle-local to actually ship.
+    // for Aquifer/Spillway to actually ship.
     #[tokio::test]
     async fn x_aqueduct_headers_are_accepted_as_a_fallback_pacing_signal() {
         assert_pacing_header_drives_concurrency("X-Aqueduct-", "user-pacing-aqueduct").await;

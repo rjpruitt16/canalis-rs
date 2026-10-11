@@ -1,14 +1,14 @@
 # Canalis — a sticky load balancer for pacing, fairness, and agentic burst
 
-**Scale a fleet of Aquifer/ezthrottle-local instances without breaking what makes either of them work.**
+**Scale a fleet of Aquifer/Spillway instances without breaking what makes either of them work.**
 
-One Aquifer (or ezthrottle-local) instance paces and durably queues requests to a single backend based on what that backend says it can absorb. Canalis does the same job one layer up: given a fleet of such instances, it decides which tenant gets which instance, keeps that assignment sticky for the instance's lifetime, and durably queues a tenant's work when the fleet is genuinely out of capacity — instead of dropping it, retrying blindly, or splitting one tenant's traffic across instances in a way that blinds all of them to that tenant's real burst pattern.
+One Aquifer (or Spillway) instance paces and durably queues requests to a single backend based on what that backend says it can absorb. Canalis does the same job one layer up: given a fleet of such instances, it decides which tenant gets which instance, keeps that assignment sticky for the instance's lifetime, and durably queues a tenant's work when the fleet is genuinely out of capacity — instead of dropping it, retrying blindly, or splitting one tenant's traffic across instances in a way that blinds all of them to that tenant's real burst pattern.
 
 Each fleet member is usually protecting something that can't scale on a whim — a GPU, a database, a CI runner — where "more capacity" means provisioning another machine, not flipping a switch. Canalis's account-queue exists because that gap is real but temporary: it holds work while more compute comes online, it doesn't manufacture capacity that isn't coming. If what's behind the fleet has a genuinely fixed ceiling that more machines can never raise, none of this is worth building — you'd just be queuing in front of a wall.
 
 It's not a generic reverse proxy with rate-limiting bolted on — it's built to sit in front of instances that already speak a pacing dialect (`X-Aqueduct-*`) and keep that dialect meaningful across more than one instance.
 
-Sibling projects, either of which can be a fleet member: [Aquifer](https://github.com/rjpruitt16/aquifer) (Go) and [ezthrottle-local](https://github.com/rjpruitt16/ezthrottle-local) (Elixir).
+Sibling projects, either of which can be a fleet member: [Aquifer](https://github.com/rjpruitt16/aquifer) (Go) and [Spillway](https://github.com/rjpruitt16/spillway) (Elixir).
 
 ---
 
@@ -28,7 +28,7 @@ This is the core mechanism the rest of the design exists to support. Aquifer's o
 
 When an instance frees up, Canalis doesn't just release one queued job and wait for the next heartbeat — it drains that tenant's entire backlog, dispatched concurrently via a `tokio::task::JoinSet`, starting conservative (1 concurrent, 2rps, Aquifer's own defaults) and adjusting live from what the instance reports on each response: `X-Canalis-Max-Concurrent` / `X-Canalis-Rps`, falling back to Aquifer's own `X-Aqueduct-*` / `X-Aquifer-*` names if that's the simpler thing for an instance to emit. No separate coordination needed to make this work across multiple Canalis processes either — the backlog itself lives in Valkey, not in any one process's memory, so several processes each reacting to their own registration events already drain safely in parallel.
 
-## How this scales Aquifer and ezthrottle-local
+## How this scales Aquifer and Spillway
 
 **Sticky assignment.** One `user_id`, one instance, for the instance's lifetime — resolved once via `SET ... NX` against Valkey and never re-decided, so a tenant's whole history lands on one instance's own account-queue instead of fragmenting.
 
@@ -38,7 +38,7 @@ When an instance frees up, Canalis doesn't just release one queued job and wait 
 
 ## Quick start
 
-Needs a running Valkey (or Redis) instance and at least one Aquifer or ezthrottle-local instance to route to.
+Needs a running Valkey (or Redis) instance and at least one Aquifer or Spillway instance to route to.
 
 ```bash
 docker build -t canalis-rs .
