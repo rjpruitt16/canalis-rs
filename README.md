@@ -30,11 +30,13 @@ When an instance frees up, Canalis doesn't just release one queued job and wait 
 
 ## How this scales Aquifer and Spillway
 
-**Sticky assignment.** One `user_id`, one instance, for the instance's lifetime — resolved once via `SET ... NX` against Valkey and never re-decided, so a tenant's whole history lands on one instance's own account-queue instead of fragmenting.
+**Sticky assignment, in Aquifer's own table.** One `user_id` stays on one instance, so a tenant's whole history lands on one instance's own account-queue instead of fragmenting. Canalis doesn't keep a table of its own for this: it uses the one Aquifer's Valkey cluster mode already writes (`aqueduct:instance:<id>`, `aqueduct:assignment:<sha256(user_id)>`) and claims through the same Lua script, so Canalis and Aquifer instances coordinating through Valkey agree on where every user lives. Instances take many users each, up to their capacity, and an assignment that sits idle (`CANALIS_ASSIGNMENT_IDLE_SECONDS`) is released, so capacity comes back on its own.
 
-**A shared pool with a waiting line.** Free instances sit in a community pool; when it's genuinely empty, a tenant's job goes into Canalis's line, on the Canalis node's own disk (redb), rather than being dropped or held in an in-memory retry loop that dies with the process. Whoever has waited longest is handed the next free instance. The line is bounded on purpose: past its limits Canalis answers `429` with `Retry-After` instead of growing, because queueing in front of capacity that isn't coming just hides an outage. The bet: fleet size scales with *machines*, and most tenants just need that gap between "capacity exists" and "capacity is running right now" absorbed gracefully, rather than dedicated infrastructure of their own. Millions of active users doesn't mean millions of simultaneous instances.
+**Fullness decides who gets new users.** Every instance reports how full it is (`X-Aqueduct-Fullness`, 0–100, on each response and in its registration ping). Past `CANALIS_QUEUE_AT_PERCENT` (80 by default) an instance gets no new users; the ones already on it stay.
 
-**Reserved instances for guaranteed capacity** (designed, not yet shipped — see `DESIGN.md`). An instance can register as dedicated to one `user_id` and never enter the community pool, for tenants needing guaranteed unshared capacity rather than a fair share of a pool. Canalis assumes it sits behind an API gateway that's already authenticated the caller, so it needs no credential system of its own — the gateway is the trust boundary.
+**A waiting line when everything is full.** When every instance is past that threshold or at capacity, a tenant's job goes into Canalis's line, on the Canalis node's own disk (redb), rather than being dropped or held in an in-memory retry loop that dies with the process. Whoever has waited longest is handed the next free instance. The line is bounded on purpose: past its limits Canalis answers `429` with `Retry-After` instead of growing, because queueing in front of capacity that isn't coming just hides an outage. The bet: fleet size scales with *machines*, and most tenants just need that gap between "capacity exists" and "capacity is running right now" absorbed gracefully, rather than dedicated infrastructure of their own. Millions of active users doesn't mean millions of simultaneous instances.
+
+**Reserved, drain-mode, and WebSocket instances.** An instance registered with `reserved_for` (`AQUIFER_REGISTRY_RESERVED_FOR`) only ever takes that user, who gets it before any shared instance. A drain-mode instance takes one tenant at a time and is handed to the next as soon as it reports `drain_state: unassigned`. A `role: ws` instance isn't given HTTP traffic. Canalis assumes it sits behind an API gateway that's already authenticated the caller, so it needs no credential system of its own — the gateway is the trust boundary.
 
 ## Quick start
 
@@ -82,3 +84,8 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked against free instances (also runs at startup, which is crash recovery) |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |
+| `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this fullness, an instance gets no new users; when every instance is there, new users wait in line |
+| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | Users an instance takes when its record doesn't say (drain-mode instances take 1) |
+| `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long an idle user keeps their instance before it's released |
+| `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Valkey key prefix for the shared assignment table; must match `AQUIFER_CLUSTER_VALKEY_PREFIX` |
+| `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |
