@@ -176,6 +176,13 @@ impl Line {
     /// process last died is still there: redb commits are durable (fsync)
     /// before `commit()` returns.
     pub fn open(path: impl AsRef<Path>, limits: LineLimits) -> Result<Self, LineError> {
+        // A configured CANALIS_LINE_PATH whose directory doesn't exist yet
+        // shouldn't stop Canalis from starting.
+        if let Some(dir) = path.as_ref().parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| {
+                LineError::Storage(format!("create {}: {e}", dir.display()))
+            })?;
+        }
         let db = Database::create(path)?;
         let txn = db.begin_write()?;
         {
@@ -652,6 +659,15 @@ mod tests {
 
         line.requeue(&popped).unwrap();
         assert_eq!(line.pop_for("a").unwrap().unwrap().path, "/proxy", "requeue keeps it too");
+    }
+
+    #[test]
+    fn opening_creates_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not").join("there").join("line.redb");
+        let line = Line::open(&path, LineLimits::default()).unwrap();
+        assert_eq!(line.len().unwrap(), 0);
+        assert!(path.exists());
     }
 
     #[test]
