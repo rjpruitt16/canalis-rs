@@ -1,5 +1,56 @@
 # Canalis — design doc
 
+## Direction (October 2026)
+
+**Canalis owns connections and admission; Aquifer and Spillway own the
+work.** Canalis blocks, holds, moves bytes, and tells waiting callers where
+they stand. It does not pace backends, retry against them, or deliver
+webhooks: that is what the nodes it routes to already do, and a third
+implementation of those semantics (after Go and Elixir) is a maintenance
+cost with no upside. Benchmarks on Aquifer also show a node does better
+focused on one kind of traffic, which is a job Canalis can do for the
+fleet: route WebSocket and HTTP traffic to nodes dedicated to each.
+
+**Built: the line** (`src/line.rs`). When no instance is free, a job waits
+in a durable, bounded line on the Canalis node's own disk (redb), not in
+Valkey. Oldest waiter is served first; a retried submission keeps its
+place instead of taking a second one; a tenant can hold at most
+`CANALIS_LINE_MAX_PER_TENANT` of it; past `CANALIS_LINE_MAX_JOBS` /
+`CANALIS_LINE_MAX_BYTES` Canalis answers `429` + `Retry-After` (same body
+shape as Aquifer's admission rejections) rather than growing. A job taken
+out for handoff that can't be placed goes back in its original position.
+A sweep at startup and every `CANALIS_LINE_SWEEP_SECONDS` drains the line
+against free instances, which is also crash recovery. Proven with a real
+abort-mid-write test and an end-to-end `kill -9` / restart run.
+`GET /jobs/{idempotent_key}?user_id=` reports the result or place in line.
+Tradeoffs, chosen deliberately: the line is per node, so a dead Canalis
+node's waiters wait for it to come back (the same tradeoff Aquifer makes
+with local SQLite), and status has to be asked of the node that queued it.
+Valkey still holds assignment state.
+
+**Still to do, in order:**
+
+1. **Align with Aquifer's current protocol.** Read the registration
+   `state` field and stop assigning `draining`/`offline` nodes; verify the
+   L8 signature Aquifer already puts on registration pings; support three
+   node kinds: drain-mode (exclusive, released when the node reports it's
+   free; how it reports that is an open question on the Aquifer side),
+   cluster (shared, using Aquifer's `aqueduct:` Valkey keys and the same
+   Lua claim script, with a contract test so the Go and Rust copies can't
+   drift), and reserved (an optional `reserved_for` user id in the
+   registration ping, e.g. from an `AQUIFER_REGISTRY_RESERVED_FOR`).
+2. **Waiting-room streaming.** SSE `queued` / `position` / `assigned`
+   events from the line, then the assigned node's own stream spliced in
+   live. Needs the drain path to pipe a node's response into the waiting
+   connection instead of buffering it into the result cache.
+3. **WebSocket forwarding**, routed by node role, with connection limits
+   and graceful drain.
+4. Later: line length as the signal to scale out more nodes.
+
+Everything below is the earlier design history, kept for the record.
+
+---
+
 Status: registration, assignment (community pool only), and request
 forwarding — both buffered and live-streamed — are built and verified
 end-to-end. `POST /proxy` and `POST /jobs` resolve the assignment,
@@ -12,6 +63,9 @@ Axum's `Body::from_stream` — genuinely proven, not assumed: a mock
 sending two chunks 2 seconds apart showed the client receiving them
 2.007s apart too, ruling out Canalis secretly buffering the whole
 response before relaying it.
+
+*(Superseded October 2026: the Valkey-backed queue described in the next
+few paragraphs was replaced by the local line, see "Direction" above.)*
 
 **Pool exhaustion now queues durably (`account_queue.rs`), not via an
 in-memory retry loop.** The retry-loop version (an earlier iteration of

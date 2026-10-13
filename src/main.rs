@@ -1,9 +1,9 @@
 mod assign;
-mod account_queue;
+mod line;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -11,9 +11,12 @@ use axum::{
 };
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ConnectionManager and reqwest::Client both derive Clone (each wraps an
 // Arc internally), so it's safe to hand a copy of the whole state to
@@ -26,6 +29,25 @@ pub type Valkey = redis::aio::ConnectionManager;
 pub struct AppState {
     valkey: Valkey,
     http: reqwest::Client,
+    // This node's own durable waiting line -- see line.rs. Valkey still
+    // holds assignment state; queued work never goes there.
+    line: Arc<line::Line>,
+    // Tenants whose backlog a drain task is already working through, so a
+    // second drain (a sweep, another registration) doesn't start a parallel
+    // one against the same instance and blow past its concurrency.
+    draining: Arc<Mutex<HashSet<String>>>,
+}
+
+// redb is a blocking store; every call goes through spawn_blocking so a
+// commit's fsync never stalls the async executor.
+async fn on_line<T: Send + 'static>(
+    line: &Arc<line::Line>,
+    f: impl FnOnce(&line::Line) -> Result<T, line::LineError> + Send + 'static,
+) -> Result<T, line::LineError> {
+    let line = line.clone();
+    tokio::task::spawn_blocking(move || f(&line))
+        .await
+        .map_err(|err| line::LineError::Storage(err.to_string()))?
 }
 
 #[tokio::main]
@@ -44,10 +66,39 @@ async fn main() {
         .await
         .expect("failed to connect to Valkey");
 
+    let line_path =
+        std::env::var("CANALIS_LINE_PATH").unwrap_or_else(|_| "canalis-line.redb".into());
+    let line = line::Line::open(&line_path, line::LineLimits::from_env())
+        .unwrap_or_else(|err| panic!("failed to open the line at {line_path}: {err}"));
+
+    match line.len() {
+        Ok(0) => {}
+        Ok(waiting) => tracing::info!("line at {line_path} still holds {waiting} jobs from before the restart"),
+        Err(err) => tracing::error!("failed to read the line's length: {err}"),
+    }
+
     let state = AppState {
         valkey,
         http: reqwest::Client::new(),
+        line: Arc::new(line),
+        draining: Arc::default(),
     };
+
+    // Runs once immediately -- that's crash recovery: whatever was in line
+    // when this process last died gets drained as soon as instances are
+    // free -- and then periodically, so a line held by this node still
+    // drains when the instance that freed up registered with a different
+    // Canalis node.
+    let sweep_every = Duration::from_secs(env_u64("CANALIS_LINE_SWEEP_SECONDS", 5).max(1));
+    let sweeper_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = sweep_once(sweeper_state.clone()).await {
+                tracing::error!("line sweep failed: {err}");
+            }
+            tokio::time::sleep(sweep_every).await;
+        }
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -55,6 +106,7 @@ async fn main() {
         .route("/register", post(register))
         .route("/proxy", post(proxy))
         .route("/jobs", post(jobs))
+        .route("/jobs/{idempotent_key}", get(job_status))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
@@ -147,8 +199,8 @@ async fn register(
 
     if newly_freed {
         // Spawned, not awaited: registration shouldn't block on a full
-        // job dispatch completing. If nothing's pending, pop_one just
-        // returns None immediately and this does nothing.
+        // job dispatch completing. If the line is empty, this returns
+        // immediately and does nothing.
         tokio::spawn(async move {
             if let Err(err) = try_drain_one(state).await {
                 tracing::error!("failed while attempting to drain a pending job: {err}");
@@ -223,28 +275,85 @@ impl PacingSignal {
     }
 }
 
-// Pops a pending tenant's oldest job (if any), assigns them an instance,
-// and drains the rest of that same tenant's backlog against the same
-// sticky assignment. Assignment is sticky per user_id, so there's no
-// reason a single freed instance should only ever clear one of their
-// jobs before waiting for another registration to come along.
-async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
-    let Some(job) = account_queue::pop_one(&mut state.valkey).await? else {
-        return Ok(());
-    };
+// Marks a tenant as being drained for as long as it's alive, so the
+// marker can't leak if a drain task errors out or panics partway.
+struct DrainGuard {
+    draining: Arc<Mutex<HashSet<String>>>,
+    user_id: String,
+}
 
-    let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
-        Ok(assign::AssignOutcome::Assigned(addr)) => addr,
-        Ok(assign::AssignOutcome::PoolExhausted) => {
-            // Someone else's request claimed the freed instance in the
-            // gap between register() and this task running. Put the job
-            // back for the next registration to try.
-            return account_queue::enqueue(&mut state.valkey, &job).await;
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.draining.lock() {
+            set.remove(&self.user_id);
         }
-        Err(err) => return Err(err),
+    }
+}
+
+// Takes the longest-waiting job out of line and resolves an instance for
+// its tenant. If nothing's free after all, the job goes back in its
+// original place (not to the back of the line) and this returns None.
+async fn claim_next(
+    state: &mut AppState,
+) -> Result<Option<(line::QueuedJob, String, DrainGuard)>, BoxError> {
+    let skip = state.draining.lock().map_err(|e| e.to_string())?.clone();
+    let Some(queued) = on_line(&state.line, move |l| l.pop_oldest(&skip)).await? else {
+        return Ok(None);
     };
 
-    drain_tenant_backlog(state, job, addr).await
+    let user_id = queued.job.user_id.clone();
+    let newly_marked = state.draining.lock().map_err(|e| e.to_string())?.insert(user_id.clone());
+    if !newly_marked {
+        // A drain for this tenant started between the snapshot above and
+        // now; it'll reach this job itself.
+        on_line(&state.line, move |l| l.requeue(&queued)).await?;
+        return Ok(None);
+    }
+    let guard = DrainGuard { draining: state.draining.clone(), user_id: user_id.clone() };
+
+    match assign::assign(&mut state.valkey, &user_id).await {
+        Ok(assign::AssignOutcome::Assigned(addr)) => Ok(Some((queued, addr, guard))),
+        Ok(assign::AssignOutcome::PoolExhausted) => {
+            on_line(&state.line, move |l| l.requeue(&queued)).await?;
+            Ok(None)
+        }
+        Err(err) => {
+            on_line(&state.line, move |l| l.requeue(&queued)).await?;
+            Err(err.into())
+        }
+    }
+}
+
+// Drains one tenant's whole backlog against one freed instance, waiting
+// for it to finish. Assignment is sticky per user_id, so there's no
+// reason a single freed instance should only ever clear one of their jobs
+// before waiting for another registration to come along. Returns whether
+// anything was drained.
+async fn try_drain_one(mut state: AppState) -> Result<bool, BoxError> {
+    let Some((first, addr, guard)) = claim_next(&mut state).await? else {
+        return Ok(false);
+    };
+    drain_tenant_backlog(state, first.job, addr, guard).await?;
+    Ok(true)
+}
+
+// Starts a drain for every tenant in line that can get an instance right
+// now, without waiting for them to finish, and drops expired results.
+// Returns how many drains were started.
+async fn sweep_once(mut state: AppState) -> Result<usize, BoxError> {
+    on_line(&state.line, |l| l.expire_results()).await?;
+
+    let mut started = 0;
+    while let Some((first, addr, guard)) = claim_next(&mut state).await? {
+        let drain_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(err) = drain_tenant_backlog(drain_state, first.job, addr, guard).await {
+                tracing::error!("drain failed: {err}");
+            }
+        });
+        started += 1;
+    }
+    Ok(started)
 }
 
 // Drains user_id's entire backlog against one sticky assignment,
@@ -253,8 +362,8 @@ async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
 // dispatch -- a direct port of Aquifer's own account_queue.go run()
 // loop (pull work, dispatch up to maxConc concurrently, paced at 1/rps
 // between dispatch *starts*, adjust both from each completion's
-// response headers) with two differences: work comes from Valkey
-// instead of an in-memory channel, and there's no jitter (Aquifer's
+// response headers) with two differences: work comes from this node's
+// line (line.rs) instead of an in-memory channel, and there's no jitter (Aquifer's
 // jitter exists to keep many *different* domains' queues from
 // resonating against a shared backend; one tenant's own drain has no
 // sibling queue to desynchronize from, so the complexity isn't worth it
@@ -269,10 +378,11 @@ async fn try_drain_one(mut state: AppState) -> redis::RedisResult<()> {
 // finish, then read whatever it settled on" shape, which is exactly
 // what's needed here.
 async fn drain_tenant_backlog(
-    mut state: AppState,
+    state: AppState,
     first_job: JobRequest,
     addr: String,
-) -> redis::RedisResult<()> {
+    _guard: DrainGuard,
+) -> Result<(), BoxError> {
     let user_id = first_job.user_id.clone();
     let mut pending = Some(first_job);
     let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
@@ -284,10 +394,13 @@ async fn drain_tenant_backlog(
         while in_flight.len() < max_concurrent {
             let job = match pending.take() {
                 Some(job) => job,
-                None => match account_queue::pop_for(&mut state.valkey, &user_id).await? {
-                    Some(job) => job,
-                    None => break,
-                },
+                None => {
+                    let user_id = user_id.clone();
+                    match on_line(&state.line, move |l| l.pop_for(&user_id)).await? {
+                        Some(queued) => queued.job,
+                        None => break,
+                    }
+                }
             };
 
             if let Some(prev) = last_dispatch_at {
@@ -300,7 +413,7 @@ async fn drain_tenant_backlog(
             last_dispatch_at = Some(Instant::now());
 
             in_flight.spawn(dispatch_drained_job(
-                state.valkey.clone(),
+                state.line.clone(),
                 state.http.clone(),
                 addr.clone(),
                 job,
@@ -313,13 +426,7 @@ async fn drain_tenant_backlog(
             break;
         };
 
-        let signal = joined.map_err(|err| {
-            redis::RedisError::from((
-                redis::ErrorKind::Client,
-                "drain dispatch task panicked",
-                err.to_string(),
-            ))
-        })?;
+        let signal = joined.map_err(|err| format!("drain dispatch task panicked: {err}"))?;
 
         if let Some(mc) = signal.max_concurrent {
             max_concurrent = mc.min(MAX_DRAIN_CONCURRENCY_CEILING);
@@ -341,7 +448,7 @@ async fn drain_tenant_backlog(
 // these in flight at once there's no single caller left to hand a
 // Result to.
 async fn dispatch_drained_job(
-    mut valkey: Valkey,
+    line: Arc<line::Line>,
     http: reqwest::Client,
     addr: String,
     job: JobRequest,
@@ -367,10 +474,10 @@ async fn dispatch_drained_job(
             // result is the same text a live viewer would have seen.
             let body = resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned());
             let cached = match body {
-                Ok(body) => account_queue::CachedResult { status, content_type, body },
+                Ok(body) => line::CachedResult { status, content_type, body },
                 Err(err) => {
                     tracing::error!("failed to read drained response body from {addr}: {err}");
-                    account_queue::CachedResult {
+                    line::CachedResult {
                         status: 502,
                         content_type: "application/json".into(),
                         body: serde_json::json!({ "error": "failed to read upstream response" })
@@ -382,7 +489,7 @@ async fn dispatch_drained_job(
         }
         Err(err) => {
             tracing::error!("failed to dispatch drained job to {addr}: {err}");
-            let cached = account_queue::CachedResult {
+            let cached = line::CachedResult {
                 status: 502,
                 content_type: "application/json".into(),
                 body: serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") })
@@ -392,7 +499,8 @@ async fn dispatch_drained_job(
         }
     };
 
-    if let Err(err) = account_queue::store_result(&mut valkey, &job.idempotent_key, &cached).await {
+    let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
+    if let Err(err) = on_line(&line, move |l| l.store_result(&user_id, &key, &cached)).await {
         tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
     }
 
@@ -404,7 +512,7 @@ async fn dispatch_drained_job(
 // translation layer -- the whole point of the assignment-then-passthrough
 // design (see DESIGN.md). Serialize too: this struct gets forwarded
 // as-is to whichever instance Canalis assigns, not rebuilt field by field.
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub(crate) struct JobRequest {
     pub(crate) user_id: String,
     pub(crate) idempotent_key: String,
@@ -471,7 +579,7 @@ impl RetryConfig {
     }
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
+pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -493,12 +601,13 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Respons
 // gets a few quick retries against the instance itself (a momentary
 // blip), then a clean error -- assignment is sticky, so there's no point
 // waiting further; nothing changes without the not-yet-built release
-// mechanism. Pool exhaustion is different: durably enqueue the job (see
-// pending.rs -- survives a Canalis crash, unlike the in-memory retry
-// loop this replaced) and poll for a cached result, since a *new*
-// registration genuinely can resolve this one. try_drain_one (triggered
-// from register()) is what actually dispatches a queued job once a slot
-// frees up; this function only waits for that result to show up.
+// mechanism. Pool exhaustion is different: put the job in this node's
+// line (line.rs -- on local disk, survives a Canalis crash, and bounded:
+// a full line answers 429 instead of growing) and poll for its result,
+// since a *new* registration genuinely can resolve this one.
+// try_drain_one (on register()) and sweep_once (periodic, and at startup)
+// are what actually dispatch queued jobs once a slot frees up; this
+// function only waits for the result to show up.
 async fn forward_with_config(
     mut state: AppState,
     job: JobRequest,
@@ -508,17 +617,28 @@ async fn forward_with_config(
     let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
         Ok(assign::AssignOutcome::Assigned(addr)) => addr,
         Ok(assign::AssignOutcome::PoolExhausted) => {
-            if let Err(err) = account_queue::enqueue(&mut state.valkey, &job).await {
-                tracing::error!("failed to durably enqueue job for {}: {err}", job.user_id);
-                return json_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    serde_json::json!({ "error": "internal error" }),
-                );
+            let queued_job = job.clone();
+            match on_line(&state.line, move |l| l.enqueue(&queued_job)).await {
+                Ok(line::Enqueued::AlreadyDone(cached)) => return cached_result_response(cached),
+                Ok(line::Enqueued::Queued { ahead } | line::Enqueued::AlreadyQueued { ahead }) => {
+                    tracing::info!("no instance free for {}; in line with {ahead} ahead", job.user_id);
+                }
+                Err(line::LineError::Full { reason, limit }) => {
+                    return line_full_response(reason, limit, state.line.limits().retry_after_seconds);
+                }
+                Err(err) => {
+                    tracing::error!("failed to durably enqueue job for {}: {err}", job.user_id);
+                    return json_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        serde_json::json!({ "error": "internal error" }),
+                    );
+                }
             }
 
             let wait_deadline = Instant::now() + config.pool_wait_timeout;
             loop {
-                match account_queue::get_result(&mut state.valkey, &job.idempotent_key).await {
+                let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
+                match on_line(&state.line, move |l| l.get_result(&user_id, &key)).await {
                     Ok(Some(cached)) => return cached_result_response(cached),
                     Ok(None) => {}
                     Err(err) => {
@@ -530,18 +650,17 @@ async fn forward_with_config(
                     }
                 }
                 if Instant::now() >= wait_deadline {
-                    // The job stays durably queued -- this only gives up
-                    // on *this* connection, not the work itself. A caller
-                    // with a webhook_url still gets notified once it's
-                    // eventually drained; one without has no way to learn
-                    // the outcome once this connection closes, an
-                    // accepted, documented gap until the polling endpoint
-                    // (the next slice) exists.
+                    // The job stays in line -- this only gives up on *this*
+                    // connection, not the work itself. A caller with a
+                    // webhook_url still gets notified once it's drained;
+                    // anyone can check GET /jobs/{idempotent_key} on this
+                    // same Canalis node meanwhile.
                     return json_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         serde_json::json!({
                             "error": "no Aquifer instance became available in time",
-                            "note": "the job remains queued and will still be attempted"
+                            "note": "the job remains queued and will still be attempted",
+                            "status": format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id),
                         }),
                     );
                 }
@@ -658,13 +777,67 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+// Same body shape as Aquifer's own admission rejections
+// ({"error", "limit_reason", "limit"}), so a client handling one handles
+// both.
+fn line_full_response(reason: &'static str, limit: u64, retry_after_seconds: u64) -> Response {
+    let mut response = json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({
+            "error": "line full: no instance is free and the waiting line is at its limit",
+            "limit_reason": reason,
+            "limit": limit,
+        }),
+    );
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from(retry_after_seconds),
+    );
+    response
+}
+
+#[derive(Deserialize)]
+struct StatusQuery {
+    user_id: String,
+}
+
+// Where a queued job stands, on *this* Canalis node: its finished result
+// (same response the waiting connection would have gotten), its place in
+// line (202), or 404. The line is per-node, so this has to be asked of the
+// node that queued it.
+async fn job_status(
+    State(state): State<AppState>,
+    Path(idempotent_key): Path<String>,
+    Query(query): Query<StatusQuery>,
+) -> Response {
+    let user_id = query.user_id;
+    match on_line(&state.line, move |l| l.lookup(&user_id, &idempotent_key)).await {
+        Ok(line::Lookup::Done(cached)) => cached_result_response(cached),
+        Ok(line::Lookup::Queued { ahead }) => json_response(
+            StatusCode::ACCEPTED,
+            serde_json::json!({ "status": "queued", "ahead": ahead }),
+        ),
+        Ok(line::Lookup::Unknown) => json_response(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "no queued job or recent result for that key" }),
+        ),
+        Err(err) => {
+            tracing::error!("failed to look up job status: {err}");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "internal error" }),
+            )
+        }
+    }
+}
+
 // A drained job's cached outcome is the *complete* text a live viewer
 // would have seen (the full SSE event history, or a plain body) -- it's
 // replayed back all at once here rather than live, since the job already
 // finished by the time anyone's asking. No information is lost, only the
 // incremental delivery is, which is an honest, deliberate simplification
 // for a result that's already history.
-fn cached_result_response(cached: account_queue::CachedResult) -> Response {
+fn cached_result_response(cached: line::CachedResult) -> Response {
     let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut builder = Response::builder().status(status);
     if !cached.content_type.is_empty() {
@@ -701,10 +874,33 @@ mod tests {
         format!("{prefix}-{nanos}")
     }
 
+    // Every test gets its own line file, so queued jobs can never leak from
+    // one test (or one failed run) into another. Keep the TempDir alive for
+    // as long as the state is in use -- dropping it deletes the file.
+    async fn test_state_with(limits: line::LineLimits) -> (AppState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let line = line::Line::open(dir.path().join("line.redb"), limits).unwrap();
+        let state = AppState {
+            valkey: test_valkey().await,
+            http: reqwest::Client::new(),
+            line: Arc::new(line),
+            draining: Arc::default(),
+        };
+        (state, dir)
+    }
+
+    async fn test_state() -> (AppState, tempfile::TempDir) {
+        test_state_with(line::LineLimits::default()).await
+    }
+
+    async fn cleanup_assignment(valkey: &mut Valkey, addr: &str, user_id: &str) {
+        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", addr).await;
+        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", addr).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
+    }
+
     // A real mock server (not Canalis), answering POST /proxy with a real
-    // SSE stream: one chunk immediately, a second after `delay`. This is
-    // the automated version of the manual proof already done with a
-    // Python mock + timestamped client -- same claim under test: if
+    // SSE stream: one chunk immediately, a second after `delay`. If
     // forward() secretly buffered the whole upstream response before
     // relaying it, both chunks would arrive at our test client together,
     // near t=delay, not one near t=0 and the other near t=delay.
@@ -738,35 +934,19 @@ mod tests {
 
     #[tokio::test]
     async fn sse_response_is_relayed_live_not_buffered() {
-        // Shared with assign.rs's own tests -- canalis:pool:free is a
-        // global key, and this test seeds+pops it, so it needs the same
-        // serialization those tests already use against each other. See
-        // TEST_LOCK's own doc comment in assign.rs for why this caused a
-        // real, confusing failure before it was shared across modules.
+        // canalis:pool:free is a global key and this test seeds+pops it --
+        // see TEST_LOCK's doc comment in assign.rs.
         let _guard = assign::TEST_LOCK.lock().await;
 
         let delay = Duration::from_millis(400);
         let mock_addr = start_delayed_sse_mock(delay).await;
 
-        let mut valkey = test_valkey().await;
+        let (mut state, _dir) = test_state().await;
         let user_id = unique("user-sse-timing");
-        let _: () = valkey.sadd("canalis:pool:free", &mock_addr).await.unwrap();
+        let _: () = state.valkey.sadd("canalis:pool:free", &mock_addr).await.unwrap();
+        let mut valkey = state.valkey.clone();
 
-        let state = AppState {
-            valkey,
-            http: reqwest::Client::new(),
-        };
-        let job = JobRequest {
-            user_id: user_id.clone(),
-            idempotent_key: "k".into(),
-            url: "https://example.com".into(),
-            method: "GET".into(),
-            headers: HashMap::new(),
-            body: None,
-            webhook_url: None,
-        };
-
-        let response = forward(state, job, "/proxy").await;
+        let response = forward(state, job_for(&user_id), "/proxy").await;
         assert_eq!(response.status(), StatusCode::OK);
 
         let mut body = response.into_body();
@@ -778,14 +958,12 @@ mod tests {
                 arrivals.push(start.elapsed());
             }
         }
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
 
         assert_eq!(arrivals.len(), 2, "expected exactly two data chunks");
         let gap = arrivals[1] - arrivals[0];
-
-        // Loose bound on purpose: "roughly delay, not roughly zero" is
-        // the actual claim under test. A live relay should show a gap
-        // close to `delay`; a secretly-buffered one would show both
-        // chunks arriving together, gap near zero.
+        // Loose bound on purpose: "roughly delay, not roughly zero" is the
+        // actual claim under test.
         assert!(
             gap > delay / 2,
             "expected a gap close to {delay:?} between chunks (proving live relay, not buffering), got {gap:?}"
@@ -801,14 +979,9 @@ mod tests {
         }
     }
 
-    // A separate, more generous config for the "eventually succeeds"
-    // test specifically -- that one needs real headroom for a background
-    // task to register, drain, and complete an actual HTTP round-trip
-    // before the deadline, which found to be genuinely flaky at 500ms
-    // under real test-parallelism load (not a logic bug: the failure was
-    // always a timeout, never a wrong result). short_retry_config's tight
-    // bound stays as-is for the *timeout* test, which specifically wants
-    // to prove giving-up-quickly, not the other way around.
+    // More headroom for the "eventually succeeds" test: a background task
+    // has to register, drain, and complete a real HTTP round-trip before
+    // the deadline, which was flaky at 500ms under test-parallelism load.
     fn generous_wait_retry_config() -> RetryConfig {
         RetryConfig {
             pool_wait_timeout: Duration::from_secs(3),
@@ -821,9 +994,6 @@ mod tests {
     fn job_for(user_id: &str) -> JobRequest {
         JobRequest {
             user_id: user_id.to_string(),
-            // Unique, not a fixed literal -- canalis:result:<idempotent_key>
-            // is keyed by this alone, not scoped by user_id, so a shared
-            // literal here would collide across every test using job_for.
             idempotent_key: unique("k"),
             url: "https://example.com".into(),
             method: "GET".into(),
@@ -853,73 +1023,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_exhaustion_retries_until_a_new_registration_succeeds() {
+    async fn pool_exhaustion_waits_in_line_until_a_new_registration_succeeds() {
         let _guard = assign::TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
+        let (state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
         let user_id = unique("user-pool-wait");
 
-        // Deliberately nothing seeded in the pool yet -- forward() has to
-        // durably enqueue and wait, with nothing to claim at first.
+        // Nothing in the pool yet -- forward() has to put the job in line
+        // and wait. register_if_free alone doesn't drain; the real
+        // register() handler calls try_drain_one right after a genuinely
+        // new add, so mirror that here.
         let mock_addr = start_plain_ok_mock().await;
-        let mock_addr_for_task = mock_addr.clone();
-        let state_for_task = AppState {
-            valkey: test_valkey().await,
-            http: reqwest::Client::new(),
-        };
+        let task_addr = mock_addr.clone();
+        let mut task_state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            // register_if_free alone only adds to the pool -- it does not
-            // trigger a drain by itself. The real HTTP register() handler
-            // calls try_drain_one right after a genuinely new add; mirror
-            // that here rather than calling register_if_free in
-            // isolation, which was the actual bug this test caught the
-            // first time it was written (it passed a stale positive
-            // before this fix, since nothing ever drove the drain).
-            let mut state_for_task = state_for_task;
-            let added = assign::register_if_free(&mut state_for_task.valkey, &mock_addr_for_task)
+            let added = assign::register_if_free(&mut task_state.valkey, &task_addr)
                 .await
                 .unwrap();
             assert!(added, "test setup bug: expected this to be a genuinely new pool add");
-            try_drain_one(state_for_task).await.unwrap();
+            try_drain_one(task_state).await.unwrap();
         });
 
-        let job = job_for(&user_id);
-        let idempotent_key = job.idempotent_key.clone();
-        let state = AppState {
-            valkey: valkey.clone(),
-            http: reqwest::Client::new(),
-        };
-        // Generous deadline, not the tight one: this test needs real
-        // headroom for a background task to register, drain, and
-        // complete an actual HTTP round-trip before giving up -- see
-        // generous_wait_retry_config's own doc comment for why 500ms
-        // turned out to be genuinely flaky under real test-parallelism
-        // load, not a logic bug.
         let response =
-            forward_with_config(state, job, "/proxy", &generous_wait_retry_config()).await;
+            forward_with_config(state, job_for(&user_id), "/proxy", &generous_wait_retry_config())
+                .await;
         let status = response.status();
-
-        // Cleanup runs *before* the assert on purpose, unconditionally --
-        // an assert! panic aborts the test function immediately, and any
-        // cleanup written after it would silently never run on failure.
-        // That's exactly what caused a real, confusing bug here: an
-        // earlier failed run left an undrained job sitting in
-        // canalis:pending_tenants forever, which a *later*, unrelated
-        // test run's SPOP could then pick up instead of its own real
-        // job, timing out for a reason that had nothing to do with its
-        // own logic. Defensive cleanup of pending_tenants/account_queue
-        // below covers the case where the drain never actually happened.
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey
-            .del(format!("canalis:assignment:{user_id}"))
-            .await;
-        let _: redis::RedisResult<()> =
-            valkey.del(format!("canalis:result:{idempotent_key}")).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
-        let _: redis::RedisResult<()> = valkey
-            .del(format!("canalis:account_queue:{user_id}"))
-            .await;
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
 
         assert_eq!(
             status,
@@ -929,71 +1059,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_exhaustion_gives_up_after_the_configured_wait() {
+    async fn pool_exhaustion_gives_up_waiting_but_keeps_the_job_in_line() {
         let _guard = assign::TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
+        let (state, _dir) = test_state().await;
+        let line = state.line.clone();
         let user_id = unique("user-pool-timeout");
-
-        // Nothing seeded, nothing ever registered -- this should hit
-        // pool_wait_timeout and give up, not hang. The job still gets
-        // durably enqueued regardless (giving up only ends this
-        // connection's wait, not the queued work itself) -- cleaned up
-        // below since nothing will ever drain it in this test.
         let job = job_for(&user_id);
-        let idempotent_key = job.idempotent_key.clone();
-        let state = AppState {
-            valkey: valkey.clone(),
-            http: reqwest::Client::new(),
-        };
+        let key = job.idempotent_key.clone();
+
         let start = Instant::now();
         let response = forward_with_config(state, job, "/proxy", &short_retry_config()).await;
         let elapsed = start.elapsed();
-
-        let _: redis::RedisResult<()> =
-            valkey.srem("canalis:pending_tenants", &user_id).await;
-        let _: redis::RedisResult<()> = valkey
-            .del(format!("canalis:account_queue:{user_id}"))
-            .await;
-        let _: redis::RedisResult<()> =
-            valkey.del(format!("canalis:result:{idempotent_key}")).await;
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             elapsed < Duration::from_secs(2),
             "expected this to give up close to the configured 500ms wait, took {elapsed:?}"
         );
+        assert!(
+            matches!(line.lookup(&user_id, &key).unwrap(), line::Lookup::Queued { ahead: 0 }),
+            "giving up on the connection must not drop the job from the line"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_line_blocks_with_429_and_retry_after() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let limits = line::LineLimits { max_jobs: 1, retry_after_seconds: 7, ..Default::default() };
+        let (state, _dir) = test_state_with(limits).await;
+        state.line.enqueue(&job_for(&unique("already-waiting"))).unwrap();
+
+        let response =
+            forward_with_config(state, job_for(&unique("user-full")), "/proxy", &short_retry_config())
+                .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers().get("retry-after").unwrap(), "7");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["limit_reason"], "line_jobs");
+        assert_eq!(body["limit"], 1);
     }
 
     #[tokio::test]
     async fn dead_assigned_instance_retries_then_gives_a_clean_error_not_a_hang() {
         let _guard = assign::TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
+        let (mut state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
         let user_id = unique("user-dead-instance");
 
-        // 127.0.0.1:1 -- nothing listens on port 1, a real, immediate
-        // connection-refused, not a slow timeout. Seeded directly into
-        // the pool so assign() hands it back deterministically.
+        // Nothing listens on port 1: an immediate connection-refused.
         let dead_addr = "127.0.0.1:1".to_string();
-        let _: () = valkey.sadd("canalis:pool:free", &dead_addr).await.unwrap();
+        let _: () = state.valkey.sadd("canalis:pool:free", &dead_addr).await.unwrap();
 
-        let state = AppState {
-            valkey: valkey.clone(),
-            http: reqwest::Client::new(),
-        };
         let start = Instant::now();
         let response =
             forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
         let elapsed = start.elapsed();
-
         let status = response.status();
-
-        // Cleanup before the asserts, same reasoning as the other tests
-        // in this file -- a panic here shouldn't leave canalis:assigned
-        // permanently holding a dead address.
-        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &dead_addr).await;
-        let _: redis::RedisResult<()> = valkey
-            .del(format!("canalis:assignment:{user_id}"))
-            .await;
+        cleanup_assignment(&mut valkey, &dead_addr, &user_id).await;
 
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(
@@ -1005,67 +1129,120 @@ mod tests {
     #[tokio::test]
     async fn one_registration_drains_a_tenants_whole_backlog_not_just_one_job() {
         let _guard = assign::TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
+        let (mut state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
         let user_id = unique("user-deep-backlog");
         let mock_addr = start_plain_ok_mock().await;
 
-        // Three jobs queued for the *same* tenant before anything is
-        // registered for them -- proving the fix directly: a single
-        // freed instance should clear all three, not just the first one
-        // popped off canalis:pending_tenants.
         let jobs: Vec<JobRequest> = (0..3).map(|_| job_for(&user_id)).collect();
         for job in &jobs {
-            account_queue::enqueue(&mut valkey, job).await.unwrap();
+            state.line.enqueue(job).unwrap();
         }
 
-        let mut state = AppState {
-            valkey: valkey.clone(),
-            http: reqwest::Client::new(),
-        };
-        let added = assign::register_if_free(&mut state.valkey, &mock_addr)
-            .await
-            .unwrap();
+        let added = assign::register_if_free(&mut state.valkey, &mock_addr).await.unwrap();
         assert!(added, "test setup bug: expected this to be a genuinely new pool add");
-        try_drain_one(state).await.unwrap();
+        let line = state.line.clone();
+        assert!(try_drain_one(state).await.unwrap());
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
 
-        let mut results = Vec::new();
-        for job in &jobs {
-            results.push(
-                account_queue::get_result(&mut valkey, &job.idempotent_key)
-                    .await
-                    .unwrap(),
-            );
-        }
-
-        // Cleanup before the asserts, same reasoning as every other test
-        // in this file.
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
-        let _: redis::RedisResult<()> = valkey.del(format!("canalis:account_queue:{user_id}")).await;
-        for job in &jobs {
-            let _: redis::RedisResult<()> = valkey
-                .del(format!("canalis:result:{}", job.idempotent_key))
-                .await;
-        }
-
-        for (i, result) in results.into_iter().enumerate() {
-            let cached = result.unwrap_or_else(|| panic!("job {i} in the backlog was never drained"));
+        for (i, job) in jobs.iter().enumerate() {
+            let cached = line
+                .get_result(&user_id, &job.idempotent_key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("job {i} in the backlog was never drained"));
             assert_eq!(cached.status, 200, "job {i} should have been dispatched and completed");
         }
+        assert_eq!(line.len().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_free_instance_puts_the_job_back_in_its_place() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let first = job_for(&unique("first-in-line"));
+        let second = job_for(&unique("second-in-line"));
+        state.line.enqueue(&first).unwrap();
+        state.line.enqueue(&second).unwrap();
+
+        // Nothing registered for these tenants, so the drain can't hand the
+        // job anywhere. It must go back in front, not behind `second`.
+        let line = state.line.clone();
+        let pool_size: usize = state.valkey.clone().scard("canalis:pool:free").await.unwrap_or(0);
+        if pool_size == 0 {
+            assert!(!try_drain_one(state).await.unwrap());
+            let next = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+            assert_eq!(next.job.user_id, first.user_id);
+        }
+    }
+
+    // Crash recovery end to end: a job queued before a restart (a fresh
+    // Line opened on the same file) is drained by the startup sweep once
+    // an instance is free, with no new request needed to trigger it.
+    #[tokio::test]
+    async fn the_sweep_drains_jobs_left_in_line_by_a_previous_process() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line.redb");
+        let user_id = unique("user-after-restart");
+        let job = job_for(&user_id);
+        {
+            let before = line::Line::open(&path, line::LineLimits::default()).unwrap();
+            before.enqueue(&job).unwrap();
+        }
+
+        let line = Arc::new(line::Line::open(&path, line::LineLimits::default()).unwrap());
+        let mut state = AppState {
+            valkey: test_valkey().await,
+            http: reqwest::Client::new(),
+            line: line.clone(),
+            draining: Arc::default(),
+        };
+        let mut valkey = state.valkey.clone();
+        let mock_addr = start_plain_ok_mock().await;
+        assign::register_if_free(&mut state.valkey, &mock_addr).await.unwrap();
+
+        let started = sweep_once(state).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut result = None;
+        while result.is_none() && Instant::now() < deadline {
+            result = line.get_result(&user_id, &job.idempotent_key).unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
+
+        assert_eq!(started, 1);
+        assert_eq!(result.expect("the restarted line was never drained").status, 200);
+    }
+
+    #[tokio::test]
+    async fn job_status_reports_place_in_line_then_the_result() {
+        let (state, _dir) = test_state().await;
+        let user_id = unique("user-status");
+        let job = job_for(&user_id);
+        state.line.enqueue(&job_for(&unique("ahead-of-you"))).unwrap();
+        state.line.enqueue(&job).unwrap();
+
+        let ask = |state: AppState| {
+            let (key, user_id) = (job.idempotent_key.clone(), user_id.clone());
+            async move { job_status(State(state), Path(key), Query(StatusQuery { user_id })).await }
+        };
+
+        let queued = ask(state.clone()).await;
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let body = queued.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ahead"], 1);
+
+        state.line.pop_for(&user_id).unwrap();
+        let result = line::CachedResult { status: 201, content_type: String::new(), body: "made".into() };
+        state.line.store_result(&user_id, &job.idempotent_key, &result).unwrap();
+        assert_eq!(ask(state.clone()).await.status(), StatusCode::CREATED);
     }
 
     // Every response takes `delay`, and advertises the given
     // max_concurrent/rps under `<header_prefix>Max-Concurrent` /
     // `<header_prefix>Rps` -- lets a test prove whether
     // drain_tenant_backlog actually acted on those headers by measuring
-    // wall-clock time, the same way sse_response_is_relayed_live_not_buffered
-    // proves streaming-vs-buffering by measuring inter-chunk timing
-    // rather than trusting an internal flag. header_prefix is exercised
-    // by two different tests -- once as "X-Canalis-", once as
-    // "X-Aqueduct-" -- to prove pacing_header's fallback chain actually
-    // works, not just its preferred name.
+    // wall-clock time.
     async fn start_delayed_pacing_mock(
         delay: Duration,
         header_prefix: &'static str,
@@ -1100,53 +1277,30 @@ mod tests {
         addr.to_string()
     }
 
-    // Shared by both pacing-header tests below -- only header_prefix
-    // differs between them, everything else (job count, delay, the
-    // timing assertions) is the exact same claim under test.
     async fn assert_pacing_header_drives_concurrency(header_prefix: &'static str, user_id_prefix: &str) {
         let _guard = assign::TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
+        let (mut state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
         let user_id = unique(user_id_prefix);
 
-        // Every response advertises room for 4 concurrent, at 100rps --
-        // fast enough that dispatch-start pacing is a non-factor once
-        // it's been learned. The *first* job still has to go out alone
-        // against the conservative default (1 concurrent, 2rps), so the
-        // real claim under test is: job 1 pays the 300ms delay by
-        // itself, then jobs 2-4 pay it together, not one after another.
-        // Fully serial (bug: headers ignored) would take ~4*300ms=1200ms;
-        // header-driven concurrency should land close to ~600ms.
+        // Every response advertises room for 4 concurrent, at 100rps. The
+        // *first* job still goes out alone against the conservative
+        // default, so: job 1 pays the 300ms delay by itself, then jobs 2-4
+        // pay it together. Fully serial would take ~1200ms; header-driven
+        // concurrency lands close to ~600ms.
         let delay = Duration::from_millis(300);
         let mock_addr = start_delayed_pacing_mock(delay, header_prefix, "4", "100").await;
 
-        let jobs: Vec<JobRequest> = (0..4).map(|_| job_for(&user_id)).collect();
-        for job in &jobs {
-            account_queue::enqueue(&mut valkey, job).await.unwrap();
+        for _ in 0..4 {
+            state.line.enqueue(&job_for(&user_id)).unwrap();
         }
-
-        let mut state = AppState {
-            valkey: valkey.clone(),
-            http: reqwest::Client::new(),
-        };
-        let added = assign::register_if_free(&mut state.valkey, &mock_addr)
-            .await
-            .unwrap();
+        let added = assign::register_if_free(&mut state.valkey, &mock_addr).await.unwrap();
         assert!(added, "test setup bug: expected this to be a genuinely new pool add");
 
         let start = Instant::now();
         try_drain_one(state).await.unwrap();
         let elapsed = start.elapsed();
-
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", &mock_addr).await;
-        let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
-        let _: redis::RedisResult<()> = valkey.srem("canalis:pending_tenants", &user_id).await;
-        let _: redis::RedisResult<()> = valkey.del(format!("canalis:account_queue:{user_id}")).await;
-        for job in &jobs {
-            let _: redis::RedisResult<()> = valkey
-                .del(format!("canalis:result:{}", job.idempotent_key))
-                .await;
-        }
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
 
         assert!(
             elapsed < Duration::from_millis(900),
@@ -1163,11 +1317,7 @@ mod tests {
         assert_pacing_header_drives_concurrency("X-Canalis-", "user-pacing-canalis").await;
     }
 
-    // Proves pacing_header's fallback chain, not just its preferred
-    // name: an instance advertising pacing under Aquifer's own existing
-    // header names (no X-Canalis-* at all) should drive the exact same
-    // concurrency behavior, in case that's the simpler integration path
-    // for Aquifer/Spillway to actually ship.
+    // Proves pacing_header's fallback chain, not just its preferred name.
     #[tokio::test]
     async fn x_aqueduct_headers_are_accepted_as_a_fallback_pacing_signal() {
         assert_pacing_header_drives_concurrency("X-Aqueduct-", "user-pacing-aqueduct").await;

@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 axum = "0.8.9"
+redb = "2.6.4"
 redis = { version = "1.6.0", features = ["connection-manager", "tokio-comp"] }
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -17,4 +18,5 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1.5"
+tempfile = "3.27.0"
 tokio-stream = "0.1.19"
