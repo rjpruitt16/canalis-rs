@@ -59,6 +59,13 @@ node's `job_id` and then stays on the line through the node's own
 the caller used, so the node gets the job the same way. Verified against
 two real Aquifer nodes started while both callers were waiting.
 
+**Built: instance headers reach the caller.** A forwarded response keeps
+the instance's own headers (`Retry-After` on a 429, `X-Aqueduct-*`,
+`X-Aqueduct-Node-State`, the content type), live or buffered; hop-by-hop
+headers and anything the instance's `Connection` header names stay
+behind. A drained job's stored result keeps them too, so a caller who
+waited in line gets them in `canalis_result` and from `GET /jobs/{key}`.
+
 Correction to the history below: Aquifer's `POST /jobs` answers `201`
 with a `job_id` acknowledgment, not a full SSE lifecycle; the lifecycle
 lives at `GET /jobs/{id}/stream`.
@@ -93,16 +100,12 @@ by Canalis.
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
    of L8, which overlaps the later trust-broker work.
-2. **Pass instance response headers through.** Canalis relays a buffered
-   response's status, content type, and body, but not the instance's own
-   headers (`Retry-After` on a 429, `X-Aqueduct-*`); a caller should see
-   those.
-3. **A contract test that the claim script can't drift** between
+2. **A contract test that the claim script can't drift** between
    Aquifer's Go copy and Canalis's Rust copy (and Aquifer taking the same
    optional strict argument, so there's one canonical script).
-4. **WebSocket forwarding**, routed by node role, with connection limits
+3. **WebSocket forwarding**, routed by node role, with connection limits
    and graceful drain.
-5. Later: line length as the signal to scale out more nodes.
+4. Later: line length as the signal to scale out more nodes.
 
 Everything below is the earlier design history, kept for the record.
 
