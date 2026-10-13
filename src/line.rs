@@ -87,18 +87,35 @@ struct StoredResult {
 }
 
 /// A job taken out of the line, carrying its original seq so a failed
-/// handoff can put it back in exactly the same place.
+/// handoff can put it back in exactly the same place, and the path the
+/// caller used ("/proxy" or "/jobs") so it's handed to the node the same way.
 pub struct QueuedJob {
     pub seq: u64,
     pub job: JobRequest,
+    pub path: String,
+}
+
+// What's stored per job. `job` is flattened so an entry written before
+// `path` existed (a bare JobRequest) still reads back, as a /jobs job.
+#[derive(Serialize, Deserialize)]
+struct StoredJob {
+    #[serde(default = "default_path")]
+    path: String,
+    #[serde(flatten)]
+    job: JobRequest,
+}
+
+fn default_path() -> String {
+    "/jobs".into()
 }
 
 #[derive(Debug)]
 pub enum Enqueued {
-    /// Newly in line; `ahead` jobs are in front of it.
-    Queued { ahead: u64 },
+    /// Newly in line; `ahead` jobs are in front of it. `seq` is its place
+    /// in the global order, for position updates.
+    Queued { ahead: u64, seq: u64 },
     /// Same (user_id, idempotent_key) is already waiting; not queued twice.
-    AlreadyQueued { ahead: u64 },
+    AlreadyQueued { ahead: u64, seq: u64 },
     /// Same key already finished and its result is still cached.
     AlreadyDone(CachedResult),
 }
@@ -182,8 +199,8 @@ impl Line {
     /// Puts a job in line, unless it's a duplicate or the line is full.
     /// The dedup check runs before the limits, so retrying a job that's
     /// already waiting never gets a 429 for it.
-    pub fn enqueue(&self, job: &JobRequest) -> Result<Enqueued, LineError> {
-        let payload = serde_json::to_vec(job)?;
+    pub fn enqueue(&self, job: &JobRequest, path: &str) -> Result<Enqueued, LineError> {
+        let payload = serde_json::to_vec(&StoredJob { path: path.into(), job: job.clone() })?;
         let idem = (job.user_id.as_str(), job.idempotent_key.as_str());
         let txn = self.db.begin_write()?;
         let outcome = {
@@ -201,8 +218,9 @@ impl Line {
                 }
             }
             if let Some(seq) = queued_keys.get(idem)? {
-                let ahead = order.range(..seq.value())?.count() as u64;
-                return Ok(Enqueued::AlreadyQueued { ahead });
+                let seq = seq.value();
+                let ahead = order.range(..seq)?.count() as u64;
+                return Ok(Enqueued::AlreadyQueued { ahead, seq });
             }
 
             let total_jobs = meta.get(TOTAL_JOBS)?.map(|v| v.value()).unwrap_or(0);
@@ -231,7 +249,7 @@ impl Line {
             tenant_jobs.insert((job.user_id.as_str(), seq), payload.as_slice())?;
             queued_keys.insert(idem, seq)?;
 
-            Enqueued::Queued { ahead: total_jobs }
+            Enqueued::Queued { ahead: total_jobs, seq }
         };
         txn.commit()?;
         Ok(outcome)
@@ -259,7 +277,7 @@ impl Line {
         };
         let job = remove_job(&txn, &user_id, seq)?;
         txn.commit()?;
-        Ok(job.map(|job| QueuedJob { seq, job }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path }))
     }
 
     /// Takes `user_id`'s own oldest job out of line, if they have one.
@@ -278,14 +296,15 @@ impl Line {
         };
         let job = remove_job(&txn, user_id, seq)?;
         txn.commit()?;
-        Ok(job.map(|job| QueuedJob { seq, job }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path }))
     }
 
     /// Puts a job back at its original place in line -- used when a job was
     /// taken out but couldn't be handed to an instance after all. Not
     /// subject to the limits: it was already admitted once.
     pub fn requeue(&self, queued: &QueuedJob) -> Result<(), LineError> {
-        let payload = serde_json::to_vec(&queued.job)?;
+        let payload =
+            serde_json::to_vec(&StoredJob { path: queued.path.clone(), job: queued.job.clone() })?;
         let user_id = queued.job.user_id.as_str();
         let txn = self.db.begin_write()?;
         {
@@ -342,6 +361,7 @@ impl Line {
         Ok(Lookup::Unknown)
     }
 
+    #[cfg(test)]
     pub fn get_result(
         &self,
         user_id: &str,
@@ -375,6 +395,25 @@ impl Line {
         Ok(removed)
     }
 
+    /// How many jobs are ahead of each of `seqs`, in one pass over the line
+    /// rather than one count per waiting caller. Seqs no longer in line are
+    /// left out of the result.
+    pub fn ranks(&self, seqs: &HashSet<u64>) -> Result<std::collections::HashMap<u64, u64>, LineError> {
+        let txn = self.db.begin_read()?;
+        let order = txn.open_table(ORDER)?;
+        let mut ranks = std::collections::HashMap::with_capacity(seqs.len());
+        for (rank, entry) in order.range::<u64>(..)?.enumerate() {
+            let seq = entry?.0.value();
+            if seqs.contains(&seq) {
+                ranks.insert(seq, rank as u64);
+                if ranks.len() == seqs.len() {
+                    break;
+                }
+            }
+        }
+        Ok(ranks)
+    }
+
     /// Jobs currently in line.
     pub fn len(&self) -> Result<u64, LineError> {
         let txn = self.db.begin_read()?;
@@ -389,7 +428,7 @@ fn remove_job(
     txn: &redb::WriteTransaction,
     user_id: &str,
     seq: u64,
-) -> Result<Option<JobRequest>, LineError> {
+) -> Result<Option<StoredJob>, LineError> {
     let mut order = txn.open_table(ORDER)?;
     let mut tenant_jobs = txn.open_table(TENANT_JOBS)?;
     let mut counts = txn.open_table(TENANT_COUNTS)?;
@@ -414,10 +453,10 @@ fn remove_job(
         counts.insert(user_id, tenant_count - 1)?;
     }
 
-    match serde_json::from_slice::<JobRequest>(&payload) {
-        Ok(job) => {
-            queued_keys.remove((user_id, job.idempotent_key.as_str()))?;
-            Ok(Some(job))
+    match serde_json::from_slice::<StoredJob>(&payload) {
+        Ok(stored) => {
+            queued_keys.remove((user_id, stored.job.idempotent_key.as_str()))?;
+            Ok(Some(stored))
         }
         Err(err) => {
             tracing::error!("dropping unparseable queued job for {user_id}: {err}");
@@ -452,9 +491,9 @@ mod tests {
     #[test]
     fn oldest_job_across_all_tenants_comes_out_first() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("b", "1")).unwrap();
-        line.enqueue(&job("a", "1")).unwrap();
-        line.enqueue(&job("b", "2")).unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("b", "2"), "/jobs").unwrap();
 
         let first = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
         assert_eq!((first.job.user_id.as_str(), first.job.idempotent_key.as_str()), ("b", "1"));
@@ -466,8 +505,8 @@ mod tests {
     #[test]
     fn pop_oldest_skips_tenants_already_being_drained() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("busy", "1")).unwrap();
-        line.enqueue(&job("waiting", "1")).unwrap();
+        line.enqueue(&job("busy", "1"), "/jobs").unwrap();
+        line.enqueue(&job("waiting", "1"), "/jobs").unwrap();
 
         let skip: HashSet<String> = ["busy".to_string()].into();
         let popped = line.pop_oldest(&skip).unwrap().unwrap();
@@ -477,9 +516,9 @@ mod tests {
     #[test]
     fn pop_for_is_fifo_within_one_tenant() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("a", "1")).unwrap();
-        line.enqueue(&job("other", "1")).unwrap();
-        line.enqueue(&job("a", "2")).unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("other", "1"), "/jobs").unwrap();
+        line.enqueue(&job("a", "2"), "/jobs").unwrap();
 
         assert_eq!(line.pop_for("a").unwrap().unwrap().job.idempotent_key, "1");
         assert_eq!(line.pop_for("a").unwrap().unwrap().job.idempotent_key, "2");
@@ -490,8 +529,8 @@ mod tests {
     #[test]
     fn requeue_puts_a_job_back_in_its_original_place() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("a", "1")).unwrap();
-        line.enqueue(&job("b", "1")).unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
 
         let taken = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
         line.requeue(&taken).unwrap();
@@ -503,19 +542,19 @@ mod tests {
     #[test]
     fn a_retried_submission_does_not_take_a_second_place_in_line() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("a", "same")).unwrap();
-        line.enqueue(&job("b", "1")).unwrap();
+        line.enqueue(&job("a", "same"), "/jobs").unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
 
-        let again = line.enqueue(&job("a", "same")).unwrap();
-        assert!(matches!(again, Enqueued::AlreadyQueued { ahead: 0 }));
+        let again = line.enqueue(&job("a", "same"), "/jobs").unwrap();
+        assert!(matches!(again, Enqueued::AlreadyQueued { ahead: 0, seq: 0 }));
         assert_eq!(line.len().unwrap(), 2);
     }
 
     #[test]
     fn same_key_from_different_tenants_are_different_jobs() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("a", "k1")).unwrap();
-        let other = line.enqueue(&job("b", "k1")).unwrap();
+        line.enqueue(&job("a", "k1"), "/jobs").unwrap();
+        let other = line.enqueue(&job("b", "k1"), "/jobs").unwrap();
         assert!(matches!(other, Enqueued::Queued { .. }));
         assert_eq!(line.len().unwrap(), 2);
     }
@@ -526,7 +565,7 @@ mod tests {
         let result = CachedResult { status: 200, content_type: "text/plain".into(), body: "ok".into() };
         line.store_result("a", "k", &result).unwrap();
 
-        match line.enqueue(&job("a", "k")).unwrap() {
+        match line.enqueue(&job("a", "k"), "/jobs").unwrap() {
             Enqueued::AlreadyDone(cached) => assert_eq!(cached, result),
             other => panic!("expected the cached result, got {other:?}"),
         }
@@ -537,26 +576,26 @@ mod tests {
     fn full_line_blocks_instead_of_growing() {
         let limits = LineLimits { max_jobs: 2, ..LineLimits::default() };
         let (line, _dir) = open(limits);
-        line.enqueue(&job("a", "1")).unwrap();
-        line.enqueue(&job("b", "1")).unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
 
-        let err = line.enqueue(&job("c", "1")).unwrap_err();
+        let err = line.enqueue(&job("c", "1"), "/jobs").unwrap_err();
         assert!(matches!(err, LineError::Full { reason: "line_jobs", limit: 2 }));
 
         // Room frees up as soon as someone leaves the line.
         line.pop_oldest(&HashSet::new()).unwrap();
-        line.enqueue(&job("c", "1")).unwrap();
+        line.enqueue(&job("c", "1"), "/jobs").unwrap();
     }
 
     #[test]
     fn one_tenant_cannot_take_the_whole_line() {
         let limits = LineLimits { max_per_tenant: 1, ..LineLimits::default() };
         let (line, _dir) = open(limits);
-        line.enqueue(&job("noisy", "1")).unwrap();
+        line.enqueue(&job("noisy", "1"), "/jobs").unwrap();
 
-        let err = line.enqueue(&job("noisy", "2")).unwrap_err();
+        let err = line.enqueue(&job("noisy", "2"), "/jobs").unwrap_err();
         assert!(matches!(err, LineError::Full { reason: "line_tenant", .. }));
-        line.enqueue(&job("quiet", "1")).expect("another tenant still gets in");
+        line.enqueue(&job("quiet", "1"), "/jobs").expect("another tenant still gets in");
     }
 
     #[test]
@@ -564,17 +603,17 @@ mod tests {
         // One serialized test job is ~120 bytes: room for one, not two.
         let limits = LineLimits { max_bytes: 200, ..LineLimits::default() };
         let (line, _dir) = open(limits);
-        line.enqueue(&job("a", "1")).unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
 
-        let err = line.enqueue(&job("b", "1")).unwrap_err();
+        let err = line.enqueue(&job("b", "1"), "/jobs").unwrap_err();
         assert!(matches!(err, LineError::Full { reason: "line_bytes", .. }));
     }
 
     #[test]
     fn lookup_reports_place_in_line_then_the_result() {
         let (line, _dir) = open(LineLimits::default());
-        line.enqueue(&job("a", "1")).unwrap();
-        line.enqueue(&job("b", "1")).unwrap();
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
 
         assert!(matches!(line.lookup("b", "1").unwrap(), Lookup::Queued { ahead: 1 }));
         assert!(matches!(line.lookup("nobody", "1").unwrap(), Lookup::Unknown));
@@ -583,6 +622,36 @@ mod tests {
         let result = CachedResult { status: 200, content_type: String::new(), body: "done".into() };
         line.store_result("b", "1", &result).unwrap();
         assert!(matches!(line.lookup("b", "1").unwrap(), Lookup::Done(_)));
+    }
+
+    #[test]
+    fn ranks_report_how_many_are_ahead_in_one_pass() {
+        let (line, _dir) = open(LineLimits::default());
+        let mut seqs = Vec::new();
+        for user in ["a", "b", "c"] {
+            match line.enqueue(&job(user, "1"), "/jobs").unwrap() {
+                Enqueued::Queued { seq, .. } => seqs.push(seq),
+                other => panic!("expected Queued, got {other:?}"),
+            }
+        }
+        line.pop_for("a").unwrap();
+
+        let wanted: HashSet<u64> = seqs.iter().copied().collect();
+        let ranks = line.ranks(&wanted).unwrap();
+        assert_eq!(ranks.get(&seqs[0]), None, "a left the line");
+        assert_eq!(ranks[&seqs[1]], 0);
+        assert_eq!(ranks[&seqs[2]], 1);
+    }
+
+    #[test]
+    fn the_callers_path_comes_back_out_with_the_job() {
+        let (line, _dir) = open(LineLimits::default());
+        line.enqueue(&job("a", "1"), "/proxy").unwrap();
+        let popped = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        assert_eq!(popped.path, "/proxy");
+
+        line.requeue(&popped).unwrap();
+        assert_eq!(line.pop_for("a").unwrap().unwrap().path, "/proxy", "requeue keeps it too");
     }
 
     #[test]
@@ -605,8 +674,8 @@ mod tests {
     fn jobs_in_line_survive_the_process_being_killed() {
         if let Ok(path) = std::env::var("CANALIS_LINE_CRASH_CHILD") {
             let line = Line::open(&path, LineLimits::default()).unwrap();
-            line.enqueue(&job("a", "1")).unwrap();
-            line.enqueue(&job("b", "1")).unwrap();
+            line.enqueue(&job("a", "1"), "/jobs").unwrap();
+            line.enqueue(&job("b", "1"), "/jobs").unwrap();
             std::process::abort();
         }
 

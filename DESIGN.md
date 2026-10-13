@@ -42,9 +42,36 @@ Verified against a real Aquifer binary: register, serve through Canalis,
 `SIGTERM`, released, restart on the same port, serving again. Spillway's
 ping doesn't send `state` yet (treated as `active`).
 
+**Built: the waiting room.** A caller who has to wait in line gets an
+SSE stream instead of a blocking request, the same way Aquifer's own
+`/proxy` turns into a stream when it has to queue. Canalis's own events
+are prefixed so nobody mistakes Canalis's line for the node's queue:
+`canalis_queued` (`ahead`, `status` link), `canalis_position` as the line
+moves (one pass over the line per tick for every waiting caller,
+`CANALIS_POSITION_INTERVAL_MS`), `canalis_assigned`, then the node's own
+answer: a `/proxy` caller gets the node's `/proxy` response live (the
+upstream's answer as `canalis_result`, or the node's queue stream spliced
+in byte for byte); a `/jobs` caller gets `canalis_assigned` with the
+node's `job_id` and then stays on the line through the node's own
+`GET /jobs/{id}/stream` (`queued`, `position`, `dispatching`,
+`completed`). Past `CANALIS_POOL_WAIT_TIMEOUT_MS` the stream ends with
+`canalis_timeout`; the job stays in line. The line remembers which path
+the caller used, so the node gets the job the same way. Verified against
+two real Aquifer nodes started while both callers were waiting.
+
+Correction to the history below: Aquifer's `POST /jobs` answers `201`
+with a `job_id` acknowledgment, not a full SSE lifecycle; the lifecycle
+lives at `GET /jobs/{id}/stream`.
+
 **Still to do, in order:**
 
-1. **Align with Aquifer's current protocol.** Verify registration pings
+1. **L8 at the gate, and Aquifer's shared assignment.** Canalis
+   implements L8 itself, including v0.2 `request_schemas`: requests that
+   don't match a backend's published schema are blocked before they reach
+   any node. And Canalis moves onto Aquifer's `aqueduct:` Valkey keys and
+   Lua claim script, so Canalis and Aquifer nodes share one assignment
+   table (capacity-based, idle release) instead of Canalis's separate
+   one-user-per-node pool. Verify registration pings
    with L8: Aquifer only signs a delivery once the receiver has an L8
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
@@ -55,13 +82,9 @@ ping doesn't send `state` yet (treated as `active`).
    Lua claim script, with a contract test so the Go and Rust copies can't
    drift), and reserved (an optional `reserved_for` user id in the
    registration ping, e.g. from an `AQUIFER_REGISTRY_RESERVED_FOR`).
-2. **Waiting-room streaming.** SSE `queued` / `position` / `assigned`
-   events from the line, then the assigned node's own stream spliced in
-   live. Needs the drain path to pipe a node's response into the waiting
-   connection instead of buffering it into the result cache.
-3. **WebSocket forwarding**, routed by node role, with connection limits
+2. **WebSocket forwarding**, routed by node role, with connection limits
    and graceful drain.
-4. Later: line length as the signal to scale out more nodes.
+3. Later: line length as the signal to scale out more nodes.
 
 Everything below is the earlier design history, kept for the record.
 

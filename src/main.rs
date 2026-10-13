@@ -13,7 +13,11 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use axum::body::Bytes;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt as _;
 use std::time::{Duration, Instant};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -36,6 +40,57 @@ pub struct AppState {
     // second drain (a sweep, another registration) doesn't start a parallel
     // one against the same instance and blow past its concurrency.
     draining: Arc<Mutex<HashSet<String>>>,
+    // Callers on this node currently waiting in line with an open stream,
+    // keyed by (user_id, idempotent_key). The drain that dispatches their
+    // job takes their stream out of here and splices the node's own
+    // response into it.
+    waiters: Arc<Mutex<HashMap<(String, String), Waiter>>>,
+    next_waiter_id: Arc<AtomicU64>,
+}
+
+// One caller waiting in line. `seq` is the job's place in the line's
+// global order (u64::MAX until the enqueue that sets it commits).
+struct Waiter {
+    id: u64,
+    seq: u64,
+    tx: mpsc::Sender<Bytes>,
+    last_ahead: Option<u64>,
+}
+
+// Waiting-room events are prefixed `canalis_` on purpose: they describe
+// Canalis's own line, not the node's. Once a job is handed to a node, that
+// node's own events (`queued`, `dispatching`, `completed`, ...) follow on
+// the same stream -- it may have a queue of its own to go through.
+fn sse_event(name: &str, data: serde_json::Value) -> Bytes {
+    Bytes::from(format!("event: {name}\ndata: {data}\n\n"))
+}
+
+// Sends every waiting caller their new place in line, if it changed, and
+// forgets callers who hung up. One pass over the line for everyone
+// (Line::ranks), not one count per caller.
+async fn waiting_room_tick(state: &AppState) -> Result<(), BoxError> {
+    let seqs: HashSet<u64> = {
+        let mut waiters = state.waiters.lock().map_err(|e| e.to_string())?;
+        waiters.retain(|_, w| !w.tx.is_closed());
+        waiters.values().map(|w| w.seq).filter(|&seq| seq != u64::MAX).collect()
+    };
+    if seqs.is_empty() {
+        return Ok(());
+    }
+    let ranks = on_line(&state.line, move |l| l.ranks(&seqs)).await?;
+    let mut waiters = state.waiters.lock().map_err(|e| e.to_string())?;
+    for waiter in waiters.values_mut() {
+        let Some(&ahead) = ranks.get(&waiter.seq) else { continue };
+        if waiter.last_ahead != Some(ahead)
+            && waiter
+                .tx
+                .try_send(sse_event("canalis_position", serde_json::json!({ "ahead": ahead })))
+                .is_ok()
+        {
+            waiter.last_ahead = Some(ahead);
+        }
+    }
+    Ok(())
 }
 
 // redb is a blocking store; every call goes through spawn_blocking so a
@@ -82,7 +137,21 @@ async fn main() {
         http: reqwest::Client::new(),
         line: Arc::new(line),
         draining: Arc::default(),
+        waiters: Arc::default(),
+        next_waiter_id: Arc::default(),
     };
+
+    let position_every =
+        Duration::from_millis(env_u64("CANALIS_POSITION_INTERVAL_MS", 1_000).max(50));
+    let room_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = waiting_room_tick(&room_state).await {
+                tracing::error!("waiting room update failed: {err}");
+            }
+            tokio::time::sleep(position_every).await;
+        }
+    });
 
     // Runs once immediately -- that's crash recovery: whatever was in line
     // when this process last died gets drained as soon as instances are
@@ -451,6 +520,7 @@ async fn drain_tenant_backlog(
 
             in_flight.spawn(dispatch_drained_job(
                 state.line.clone(),
+                state.waiters.clone(),
                 state.http.clone(),
                 addr.clone(),
                 job,
@@ -496,57 +566,35 @@ struct DispatchOutcome {
 }
 
 // One job's worth of the drain, run as its own task so up to
-// max_concurrent of these can be in flight together. Caches its own
-// result directly rather than handing it back to drain_tenant_backlog's
-// loop -- Valkey and reqwest::Client are both cheap, Arc-backed clones,
-// so each task owns everything it needs to finish independently. A
-// caching failure here is only logged, not propagated: with several of
-// these in flight at once there's no single caller left to hand a
-// Result to.
+// max_concurrent of these can be in flight together. Every job's outcome
+// is cached for GET /jobs/{key}; if its caller is still waiting on this
+// node, the node's response is also streamed to them live, after a
+// `canalis_assigned` event -- byte for byte when the node streams SSE (as
+// Aquifer's /jobs does), or as one `canalis_result` event otherwise. A
+// caching failure is only logged: with several of these in flight at once
+// there's no single caller left to hand a Result to.
 async fn dispatch_drained_job(
     line: Arc<line::Line>,
+    waiters: Arc<Mutex<HashMap<(String, String), Waiter>>>,
     http: reqwest::Client,
     addr: String,
     queued: line::QueuedJob,
 ) -> DispatchOutcome {
     let job = &queued.job;
-    let target_url = format!("http://{addr}/jobs");
+    // Same path the caller used: a /proxy caller gets the node's /proxy
+    // answer (the upstream's own response, or its queue stream), a /jobs
+    // caller gets the job accepted on the node.
+    let target_url = format!("http://{addr}{}", queued.path);
+    let follows_job_stream = queued.path == "/jobs";
     let response = http.post(&target_url).json(job).send().await;
 
-    let (cached, pacing) = match response {
+    let mut resp = match response {
         Ok(resp) if node_is_draining(resp.status().as_u16(), resp.headers()) => {
+            // Back in line; the caller (if any) stays registered and keeps
+            // getting position updates until another node takes the job.
             return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
         }
-        Ok(resp) => {
-            let pacing = PacingSignal::from_headers(resp.headers());
-            let status = resp.status().as_u16();
-            let content_type = resp
-                .headers()
-                .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-            // .bytes() on a streamed response waits for the stream to
-            // finish (Aquifer's /jobs SSE stream closes once the job
-            // reaches a terminal state), then hands back everything that
-            // was ever sent -- the full event history, not just the
-            // final line. No manual SSE parsing needed: the cached
-            // result is the same text a live viewer would have seen.
-            let body = resp.bytes().await.map(|b| String::from_utf8_lossy(&b).into_owned());
-            let cached = match body {
-                Ok(body) => line::CachedResult { status, content_type, body },
-                Err(err) => {
-                    tracing::error!("failed to read drained response body from {addr}: {err}");
-                    line::CachedResult {
-                        status: 502,
-                        content_type: "application/json".into(),
-                        body: serde_json::json!({ "error": "failed to read upstream response" })
-                            .to_string(),
-                    }
-                }
-            };
-            (cached, pacing)
-        }
+        Ok(resp) => resp,
         Err(err) => {
             tracing::error!("failed to dispatch drained job to {addr}: {err}");
             let cached = line::CachedResult {
@@ -555,16 +603,175 @@ async fn dispatch_drained_job(
                 body: serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") })
                     .to_string(),
             };
-            (cached, PacingSignal::none())
+            let waiter = take_waiter(&waiters, job);
+            finish_drained_job(&line, job, cached, waiter, false).await;
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: None };
         }
     };
 
-    let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
-    if let Err(err) = on_line(&line, move |l| l.store_result(&user_id, &key, &cached)).await {
-        tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
+    let pacing = PacingSignal::from_headers(resp.headers());
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let streams = content_type.starts_with("text/event-stream");
+
+    let mut waiter = take_waiter(&waiters, job);
+    // A /jobs answer is the node's acknowledgment (201 + job_id); the
+    // caller learns about the assignment once that id is known, below.
+    if !follows_job_stream {
+        if let Some(tx) = &waiter {
+            if tx.send(sse_event("canalis_assigned", serde_json::json!({}))).await.is_err() {
+                waiter = None;
+            }
+        }
     }
 
+    // Read the node's response chunk by chunk: each one goes to the waiting
+    // caller as it arrives (live, not buffered) and into the cached copy.
+    let mut body = Vec::new();
+    let mut read_failed = None;
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if streams {
+                    if let Some(tx) = &waiter {
+                        if tx.send(chunk).await.is_err() {
+                            // Caller hung up; keep reading so the result
+                            // is still cached for GET /jobs/{key}.
+                            waiter = None;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(err) => {
+                read_failed = Some(err);
+                break;
+            }
+        }
+    }
+
+    let mut already_streamed = streams && read_failed.is_none();
+    let cached = match read_failed {
+        None => line::CachedResult { status, content_type, body: String::from_utf8_lossy(&body).into_owned() },
+        Some(err) => {
+            tracing::error!("failed to read drained response body from {addr}: {err}");
+            line::CachedResult {
+                status: 502,
+                content_type: "application/json".into(),
+                body: serde_json::json!({ "error": "failed to read upstream response" }).to_string(),
+            }
+        }
+    };
+
+    // A /jobs caller still on the line stays on it through the node's own
+    // job stream (`queued`, `position`, `dispatching`, `completed`), same
+    // as calling GET /jobs/{id}/stream on Aquifer directly -- joining late
+    // is safe, the node replays the states already passed. What gets
+    // cached is the acknowledgment; the outcome itself is the node's
+    // (webhook, or its own GET /jobs/{id}).
+    if follows_job_stream {
+        let job_id = (cached.status == 201)
+            .then(|| serde_json::from_str::<serde_json::Value>(&cached.body).ok())
+            .flatten()
+            .and_then(|v| v.get("job_id").and_then(|id| id.as_str()).map(str::to_string));
+        if let Some(tx) = waiter.take() {
+            let assigned = serde_json::json!({ "job_id": job_id });
+            if tx.send(sse_event("canalis_assigned", assigned)).await.is_ok() {
+                already_streamed = match &job_id {
+                    Some(id) => follow_job_stream(&http, &addr, id, &tx).await,
+                    None => false,
+                };
+                waiter = Some(tx);
+            }
+        }
+    }
+
+    finish_drained_job(&line, job, cached, waiter, already_streamed).await;
     DispatchOutcome { pacing, back_in_line: None }
+}
+
+// Splices the node's GET /jobs/{id}/stream into a waiting caller's stream.
+// Returns whether it got through it; on failure the caller gets the
+// acknowledgment as a canalis_result instead.
+async fn follow_job_stream(
+    http: &reqwest::Client,
+    addr: &str,
+    job_id: &str,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    let url = format!("http://{addr}/jobs/{job_id}/stream");
+    let mut resp = match http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp,
+        Ok(resp) => {
+            tracing::warn!("{url} answered {}; not following it", resp.status());
+            return false;
+        }
+        Err(err) => {
+            tracing::warn!("failed to open {url}: {err}");
+            return false;
+        }
+    };
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if tx.send(chunk).await.is_err() {
+                    return true; // caller hung up; nothing left to tell them
+                }
+            }
+            Ok(None) => return true,
+            Err(err) => {
+                tracing::warn!("{url} broke off: {err}");
+                return true; // part of it already went out; don't repeat it as a result
+            }
+        }
+    }
+}
+
+fn take_waiter(
+    waiters: &Mutex<HashMap<(String, String), Waiter>>,
+    job: &JobRequest,
+) -> Option<mpsc::Sender<Bytes>> {
+    waiters
+        .lock()
+        .ok()?
+        .remove(&(job.user_id.clone(), job.idempotent_key.clone()))
+        .map(|w| w.tx)
+}
+
+// Caches a drained job's outcome, then -- unless its stream already
+// carried it -- tells a still-waiting caller with a `canalis_result` event.
+// Cache first: the caller's stream ends when its sender is dropped here,
+// and a caller who checks GET /jobs/{key} right after must find the result.
+async fn finish_drained_job(
+    line: &Arc<line::Line>,
+    job: &JobRequest,
+    cached: line::CachedResult,
+    waiter: Option<mpsc::Sender<Bytes>>,
+    already_streamed: bool,
+) {
+    let event = (waiter.is_some() && !already_streamed).then(|| {
+        sse_event(
+            "canalis_result",
+            serde_json::json!({
+                "status": cached.status,
+                "content_type": cached.content_type,
+                "body": cached.body,
+            }),
+        )
+    });
+    let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
+    if let Err(err) = on_line(line, move |l| l.store_result(&user_id, &key, &cached)).await {
+        tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
+    }
+    if let (Some(tx), Some(event)) = (waiter, event) {
+        let _ = tx.send(event).await;
+    }
 }
 
 // Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
@@ -603,10 +810,9 @@ async fn jobs(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Res
 // entirely: production reads them once, via RetryConfig::from_env(), and
 // tests construct short values directly, no shared mutable state at all.
 struct RetryConfig {
-    // How long the pool-exhausted retry loop keeps waiting for a new
-    // registration to free something up before giving up for good.
+    // How long a caller's stream stays open in line before Canalis ends it
+    // with `canalis_timeout`. The job itself stays in line either way.
     pool_wait_timeout: Duration,
-    pool_wait_retry_interval: Duration,
     // A few quick retries against the *same* assigned instance, for a
     // momentary blip (a restart mid-request, a brief network hiccup) --
     // mirrors Aquifer's own account_queue.go retry pattern. Deliberately
@@ -625,10 +831,6 @@ impl RetryConfig {
             pool_wait_timeout: Duration::from_millis(env_u64(
                 "CANALIS_POOL_WAIT_TIMEOUT_MS",
                 30_000,
-            )),
-            pool_wait_retry_interval: Duration::from_millis(env_u64(
-                "CANALIS_POOL_WAIT_RETRY_INTERVAL_MS",
-                500,
             )),
             instance_retry_attempts: 3,
             instance_retry_base_delay: Duration::from_millis(env_u64(
@@ -650,24 +852,95 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Respons
     forward_with_config(state, job, target_path, &RetryConfig::from_env()).await
 }
 
-// Resolves the assignment, then forwards the same job body to the
-// assigned instance's own target_path ("/proxy" or "/jobs" -- this is
-// where those two finally diverge, now that there's real forwarding to
-// diverge in). Buffered relay only: a plain response gets its status,
-// content-type, and body relayed verbatim. An SSE response (Aquifer's
-// fallback-to-queue path, and always the case for /jobs) is relayed live.
-//
-// Two distinct fallback behaviors, not one: a dead *assigned* instance
-// gets a few quick retries against the instance itself (a momentary
-// blip), then a clean error -- assignment is sticky, so there's no point
-// waiting further; nothing changes without the not-yet-built release
-// mechanism. Pool exhaustion is different: put the job in this node's
-// line (line.rs -- on local disk, survives a Canalis crash, and bounded:
-// a full line answers 429 instead of growing) and poll for its result,
-// since a *new* registration genuinely can resolve this one.
-// try_drain_one (on register()) and sweep_once (periodic, and at startup)
-// are what actually dispatch queued jobs once a slot frees up; this
-// function only waits for the result to show up.
+// Puts the job in line and turns the caller's connection into the waiting
+// room's stream. The caller is registered as a waiter *before* the job is
+// enqueued, so a drain that picks the job up immediately still finds
+// someone to stream to.
+async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Duration) -> Response {
+    let key = (job.user_id.clone(), job.idempotent_key.clone());
+    let id = state.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    {
+        // Scoped so the guard is provably gone before any await below.
+        let Ok(mut waiters) = state.waiters.lock() else {
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" }));
+        };
+        // A second connection for the same job takes over; the earlier
+        // one's stream ends when its sender is dropped here.
+        waiters.insert(key.clone(), Waiter { id, seq: u64::MAX, tx: tx.clone(), last_ahead: None });
+    }
+
+    let unregister = |state: &AppState| {
+        if let Ok(mut waiters) = state.waiters.lock() {
+            if waiters.get(&key).is_some_and(|w| w.id == id) {
+                waiters.remove(&key);
+            }
+        }
+    };
+
+    let (queued_job, path) = (job.clone(), path.to_string());
+    let (ahead, seq) = match on_line(&state.line, move |l| l.enqueue(&queued_job, &path)).await {
+        Ok(line::Enqueued::Queued { ahead, seq } | line::Enqueued::AlreadyQueued { ahead, seq }) => (ahead, seq),
+        Ok(line::Enqueued::AlreadyDone(cached)) => {
+            unregister(&state);
+            return cached_result_response(cached);
+        }
+        Err(line::LineError::Full { reason, limit }) => {
+            unregister(&state);
+            return line_full_response(reason, limit, state.line.limits().retry_after_seconds);
+        }
+        Err(err) => {
+            unregister(&state);
+            tracing::error!("failed to durably enqueue job for {}: {err}", job.user_id);
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" }));
+        }
+    };
+    tracing::info!("no instance free for {}; in line with {ahead} ahead", job.user_id);
+
+    if let Ok(mut waiters) = state.waiters.lock() {
+        if let Some(waiter) = waiters.get_mut(&key).filter(|w| w.id == id) {
+            waiter.seq = seq;
+            waiter.last_ahead = Some(ahead);
+        }
+    }
+    let status_url = format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id);
+    let _ = tx.try_send(sse_event(
+        "canalis_queued",
+        serde_json::json!({ "reason": "no_instance_free", "ahead": ahead, "status": status_url }),
+    ));
+
+    // Only this task and the drain hold senders; once both are gone the
+    // stream ends. If the wait outlasts the timeout and the job is still
+    // ours to report on, say so and let go -- the job stays in line.
+    let timeout_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        let still_waiting = timeout_state
+            .waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| {
+                if waiters.get(&key).is_some_and(|w| w.id == id) { waiters.remove(&key) } else { None }
+            });
+        if let Some(waiter) = still_waiting {
+            let event = sse_event(
+                "canalis_timeout",
+                serde_json::json!({ "note": "still in line; this stream is closing", "status": status_url }),
+            );
+            let _ = waiter.tx.send(event).await;
+        }
+    });
+    drop(tx);
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+        .header(axum::http::header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" })))
+}
+
 // Marks a response as "the assigned instance said it's draining", so
 // forward_with_config can re-route instead of relaying it.
 #[derive(Clone)]
@@ -697,6 +970,24 @@ async fn forward_with_config(
     forward_attempt(state, job, target_path, config).await
 }
 
+// Resolves the assignment, then forwards the same job body to the
+// assigned instance's own target_path ("/proxy" or "/jobs"). A plain
+// response gets its status, content-type, and body relayed verbatim; an
+// SSE response (Aquifer's fallback-to-queue path, and always the case for
+// /jobs) is relayed live.
+//
+// Two distinct fallback behaviors, not one: a dead *assigned* instance
+// gets a few quick retries against the instance itself (a momentary
+// blip), then a clean error. Pool exhaustion is different: the job goes in
+// this node's line (line.rs -- on local disk, survives a Canalis crash,
+// and bounded: a full line answers 429 instead of growing), and the
+// caller's connection becomes the waiting room's SSE stream, the same way
+// Aquifer's own /proxy turns into a stream when it has to queue:
+// `canalis_queued`, `canalis_position` as the line moves, then
+// `canalis_assigned` and the node's own response spliced in live once a
+// drain hands the job over -- or `canalis_timeout` if that takes longer
+// than CANALIS_POOL_WAIT_TIMEOUT_MS (the job stays in line; a webhook_url
+// still fires, and GET /jobs/{key} reports it).
 async fn forward_attempt(
     mut state: AppState,
     job: JobRequest,
@@ -706,55 +997,7 @@ async fn forward_attempt(
     let addr = match assign::assign(&mut state.valkey, &job.user_id).await {
         Ok(assign::AssignOutcome::Assigned(addr)) => addr,
         Ok(assign::AssignOutcome::PoolExhausted) => {
-            let queued_job = job.clone();
-            match on_line(&state.line, move |l| l.enqueue(&queued_job)).await {
-                Ok(line::Enqueued::AlreadyDone(cached)) => return cached_result_response(cached),
-                Ok(line::Enqueued::Queued { ahead } | line::Enqueued::AlreadyQueued { ahead }) => {
-                    tracing::info!("no instance free for {}; in line with {ahead} ahead", job.user_id);
-                }
-                Err(line::LineError::Full { reason, limit }) => {
-                    return line_full_response(reason, limit, state.line.limits().retry_after_seconds);
-                }
-                Err(err) => {
-                    tracing::error!("failed to durably enqueue job for {}: {err}", job.user_id);
-                    return json_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        serde_json::json!({ "error": "internal error" }),
-                    );
-                }
-            }
-
-            let wait_deadline = Instant::now() + config.pool_wait_timeout;
-            loop {
-                let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
-                match on_line(&state.line, move |l| l.get_result(&user_id, &key)).await {
-                    Ok(Some(cached)) => return cached_result_response(cached),
-                    Ok(None) => {}
-                    Err(err) => {
-                        tracing::error!("failed to poll for queued result: {err}");
-                        return json_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            serde_json::json!({ "error": "internal error" }),
-                        );
-                    }
-                }
-                if Instant::now() >= wait_deadline {
-                    // The job stays in line -- this only gives up on *this*
-                    // connection, not the work itself. A caller with a
-                    // webhook_url still gets notified once it's drained;
-                    // anyone can check GET /jobs/{idempotent_key} on this
-                    // same Canalis node meanwhile.
-                    return json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        serde_json::json!({
-                            "error": "no Aquifer instance became available in time",
-                            "note": "the job remains queued and will still be attempted",
-                            "status": format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id),
-                        }),
-                    );
-                }
-                tokio::time::sleep(config.pool_wait_retry_interval).await;
-            }
+            return wait_in_line(state, job, target_path, config.pool_wait_timeout).await;
         }
         Err(err) => {
             tracing::error!("assign failed: {err}");
@@ -986,6 +1229,8 @@ mod tests {
             http: reqwest::Client::new(),
             line: Arc::new(line),
             draining: Arc::default(),
+            waiters: Arc::default(),
+            next_waiter_id: Arc::default(),
         };
         (state, dir)
     }
@@ -1025,7 +1270,10 @@ mod tests {
                 .expect("a hardcoded streaming response should always build")
         }
 
-        let app = Router::new().route("/proxy", post(handler)).with_state(delay);
+        let app = Router::new()
+            .route("/proxy", post(handler))
+            .route("/jobs", post(handler))
+            .with_state(delay);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1075,7 +1323,6 @@ mod tests {
     fn short_retry_config() -> RetryConfig {
         RetryConfig {
             pool_wait_timeout: Duration::from_millis(500),
-            pool_wait_retry_interval: Duration::from_millis(50),
             instance_retry_attempts: 3,
             instance_retry_base_delay: Duration::from_millis(20),
         }
@@ -1087,7 +1334,6 @@ mod tests {
     fn generous_wait_retry_config() -> RetryConfig {
         RetryConfig {
             pool_wait_timeout: Duration::from_secs(3),
-            pool_wait_retry_interval: Duration::from_millis(50),
             instance_retry_attempts: 3,
             instance_retry_base_delay: Duration::from_millis(20),
         }
@@ -1124,44 +1370,178 @@ mod tests {
         addr.to_string()
     }
 
+    async fn read_all(response: Response) -> String {
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&body).into_owned()
+    }
+
+    // The order the waiting room's events (and the node's) arrived in.
+    fn event_names(stream: &str) -> Vec<&str> {
+        stream.lines().filter_map(|l| l.strip_prefix("event: ")).collect()
+    }
+
     #[tokio::test]
-    async fn pool_exhaustion_waits_in_line_until_a_new_registration_succeeds() {
+    async fn waiting_in_line_streams_queued_then_the_nodes_answer() {
         let _guard = assign::TEST_LOCK.lock().await;
         let (state, _dir) = test_state().await;
         let mut valkey = state.valkey.clone();
         let user_id = unique("user-pool-wait");
 
-        // Nothing in the pool yet -- forward() has to put the job in line
-        // and wait. register_if_free alone doesn't drain; the real
-        // register() handler calls try_drain_one right after a genuinely
-        // new add, so mirror that here.
+        // Nothing in the pool yet -- forward() has to put the job in line.
+        // register_if_free alone doesn't drain; the real register() handler
+        // calls try_drain_one right after a genuinely new add, so mirror
+        // that here.
         let mock_addr = start_plain_ok_mock().await;
         let task_addr = mock_addr.clone();
         let mut task_state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let added = assign::register_if_free(&mut task_state.valkey, &task_addr)
-                .await
-                .unwrap();
+            let added = assign::register_if_free(&mut task_state.valkey, &task_addr).await.unwrap();
             assert!(added, "test setup bug: expected this to be a genuinely new pool add");
             try_drain_one(task_state).await.unwrap();
         });
 
         let response =
-            forward_with_config(state, job_for(&user_id), "/proxy", &generous_wait_retry_config())
-                .await;
+            forward_with_config(state, job_for(&user_id), "/proxy", &generous_wait_retry_config()).await;
         let status = response.status();
+        let content_type = response.headers()[axum::http::header::CONTENT_TYPE].clone();
+        let stream = read_all(response).await;
         cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
 
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "expected the delayed registration to eventually satisfy the waiting request"
-        );
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/event-stream");
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_assigned", "canalis_result"]);
+        assert!(stream.contains(r#"\"status\":\"completed\""#), "the node's answer rides in canalis_result: {stream}");
     }
 
     #[tokio::test]
-    async fn pool_exhaustion_gives_up_waiting_but_keeps_the_job_in_line() {
+    async fn a_nodes_own_stream_is_spliced_in_live_after_canalis_assigned() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
+        let user_id = unique("user-splice");
+        let delay = Duration::from_millis(400);
+        let mock_addr = start_delayed_sse_mock(delay).await;
+
+        let task_addr = mock_addr.clone();
+        let mut task_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assign::register_if_free(&mut task_state.valkey, &task_addr).await.unwrap();
+            try_drain_one(task_state).await.unwrap();
+        });
+
+        let response =
+            forward_with_config(state, job_for(&user_id), "/proxy", &generous_wait_retry_config()).await;
+        let mut body = response.into_body();
+        let start = Instant::now();
+        let mut stream = String::new();
+        let mut node_chunk_times = Vec::new();
+        while let Some(frame) = body.frame().await {
+            if let Ok(data) = frame.unwrap().into_data() {
+                let text = String::from_utf8_lossy(&data).into_owned();
+                if text.starts_with("event: queued") || text.starts_with("event: completed") {
+                    node_chunk_times.push(start.elapsed());
+                }
+                stream.push_str(&text);
+            }
+        }
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
+
+        // Canalis's line first, then the node's own events: two different
+        // queues, and the names say which is which.
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_assigned", "queued", "completed"]);
+        assert_eq!(node_chunk_times.len(), 2);
+        let gap = node_chunk_times[1] - node_chunk_times[0];
+        assert!(gap > delay / 2, "the node's stream must be relayed live, not buffered; gap {gap:?}");
+    }
+
+    // Answers like Aquifer: POST /jobs -> 201 {"job_id"}, and the job's
+    // own lifecycle at GET /jobs/{id}/stream.
+    async fn start_aquifer_like_jobs_mock() -> String {
+        async fn accept() -> Response {
+            Response::builder()
+                .status(201)
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"job_id":"node-job-1","status":"queued"}"#))
+                .expect("a hardcoded response should always build")
+        }
+        async fn stream(Path(id): Path<String>) -> Response {
+            let events = format!(
+                "event: queued\ndata: {{\"job_id\":\"{id}\"}}\n\nevent: completed\ndata: {{\"job_id\":\"{id}\",\"response_status\":200}}\n\n"
+            );
+            Response::builder()
+                .status(200)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(events))
+                .expect("a hardcoded response should always build")
+        }
+        let app = Router::new()
+            .route("/jobs", post(accept))
+            .route("/jobs/{id}/stream", get(stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_jobs_caller_stays_on_the_line_through_the_nodes_job_stream() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
+        let user_id = unique("user-jobs-follow");
+        let mock_addr = start_aquifer_like_jobs_mock().await;
+
+        let task_addr = mock_addr.clone();
+        let mut task_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assign::register_if_free(&mut task_state.valkey, &task_addr).await.unwrap();
+            try_drain_one(task_state).await.unwrap();
+        });
+
+        let job = job_for(&user_id);
+        let key = job.idempotent_key.clone();
+        let line = state.line.clone();
+        let response = forward_with_config(state, job, "/jobs", &generous_wait_retry_config()).await;
+        let stream = read_all(response).await;
+        cleanup_assignment(&mut valkey, &mock_addr, &user_id).await;
+
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_assigned", "queued", "completed"]);
+        assert!(stream.contains(r#""job_id":"node-job-1""#), "canalis_assigned names the node's job: {stream}");
+        let cached = line.get_result(&user_id, &key).unwrap().unwrap();
+        assert_eq!(cached.status, 201, "what's cached is the node's acknowledgment");
+    }
+
+    #[tokio::test]
+    async fn waiting_callers_hear_when_the_line_moves() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let ahead_of_you = job_for(&unique("ahead-of-you"));
+        state.line.enqueue(&ahead_of_you, "/jobs").unwrap();
+
+        let pool_size: usize = state.valkey.clone().scard("canalis:pool:free").await.unwrap_or(0);
+        if pool_size != 0 {
+            return; // can't stage an empty pool in a shared Valkey; see assign.rs
+        }
+        let response =
+            forward_with_config(state.clone(), job_for(&unique("user-moving")), "/proxy", &short_retry_config())
+                .await;
+
+        // The job in front leaves the line; the next tick tells the caller.
+        state.line.pop_for(&ahead_of_you.user_id).unwrap();
+        waiting_room_tick(&state).await.unwrap();
+
+        let stream = read_all(response).await;
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_position", "canalis_timeout"]);
+        assert!(stream.contains(r#""ahead":1"#) && stream.contains(r#""ahead":0"#), "{stream}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_runs_out_closes_the_stream_but_keeps_the_job_in_line() {
         let _guard = assign::TEST_LOCK.lock().await;
         let (state, _dir) = test_state().await;
         let line = state.line.clone();
@@ -1171,16 +1551,18 @@ mod tests {
 
         let start = Instant::now();
         let response = forward_with_config(state, job, "/proxy", &short_retry_config()).await;
+        let stream = read_all(response).await;
         let elapsed = start.elapsed();
 
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_timeout"]);
+        assert!(stream.contains(&format!("/jobs/{key}?user_id={user_id}")), "points at the status endpoint");
         assert!(
             elapsed < Duration::from_secs(2),
-            "expected this to give up close to the configured 500ms wait, took {elapsed:?}"
+            "expected the stream to close near the configured 500ms wait, took {elapsed:?}"
         );
         assert!(
             matches!(line.lookup(&user_id, &key).unwrap(), line::Lookup::Queued { ahead: 0 }),
-            "giving up on the connection must not drop the job from the line"
+            "closing the stream must not drop the job from the line"
         );
     }
 
@@ -1189,7 +1571,7 @@ mod tests {
         let _guard = assign::TEST_LOCK.lock().await;
         let limits = line::LineLimits { max_jobs: 1, retry_after_seconds: 7, ..Default::default() };
         let (state, _dir) = test_state_with(limits).await;
-        state.line.enqueue(&job_for(&unique("already-waiting"))).unwrap();
+        state.line.enqueue(&job_for(&unique("already-waiting")), "/jobs").unwrap();
 
         let response =
             forward_with_config(state, job_for(&unique("user-full")), "/proxy", &short_retry_config())
@@ -1238,7 +1620,7 @@ mod tests {
 
         let jobs: Vec<JobRequest> = (0..3).map(|_| job_for(&user_id)).collect();
         for job in &jobs {
-            state.line.enqueue(job).unwrap();
+            state.line.enqueue(job, "/jobs").unwrap();
         }
 
         let added = assign::register_if_free(&mut state.valkey, &mock_addr).await.unwrap();
@@ -1263,8 +1645,8 @@ mod tests {
         let (state, _dir) = test_state().await;
         let first = job_for(&unique("first-in-line"));
         let second = job_for(&unique("second-in-line"));
-        state.line.enqueue(&first).unwrap();
-        state.line.enqueue(&second).unwrap();
+        state.line.enqueue(&first, "/jobs").unwrap();
+        state.line.enqueue(&second, "/jobs").unwrap();
 
         // Nothing registered for these tenants, so the drain can't hand the
         // job anywhere. It must go back in front, not behind `second`.
@@ -1289,7 +1671,7 @@ mod tests {
         let job = job_for(&user_id);
         {
             let before = line::Line::open(&path, line::LineLimits::default()).unwrap();
-            before.enqueue(&job).unwrap();
+            before.enqueue(&job, "/jobs").unwrap();
         }
 
         let line = Arc::new(line::Line::open(&path, line::LineLimits::default()).unwrap());
@@ -1298,6 +1680,8 @@ mod tests {
             http: reqwest::Client::new(),
             line: line.clone(),
             draining: Arc::default(),
+            waiters: Arc::default(),
+            next_waiter_id: Arc::default(),
         };
         let mut valkey = state.valkey.clone();
         let mock_addr = start_plain_ok_mock().await;
@@ -1321,8 +1705,8 @@ mod tests {
         let (state, _dir) = test_state().await;
         let user_id = unique("user-status");
         let job = job_for(&user_id);
-        state.line.enqueue(&job_for(&unique("ahead-of-you"))).unwrap();
-        state.line.enqueue(&job).unwrap();
+        state.line.enqueue(&job_for(&unique("ahead-of-you")), "/jobs").unwrap();
+        state.line.enqueue(&job, "/jobs").unwrap();
 
         let ask = |state: AppState| {
             let (key, user_id) = (job.idempotent_key.clone(), user_id.clone());
@@ -1435,7 +1819,7 @@ mod tests {
 
         let jobs: Vec<JobRequest> = (0..2).map(|_| job_for(&user_id)).collect();
         for job in &jobs {
-            state.line.enqueue(job).unwrap();
+            state.line.enqueue(job, "/jobs").unwrap();
         }
         let _: () = valkey.set(format!("canalis:assignment:{user_id}"), &draining_addr).await.unwrap();
         let _: () = valkey.sadd("canalis:assigned", &draining_addr).await.unwrap();
@@ -1511,7 +1895,7 @@ mod tests {
         let mock_addr = start_delayed_pacing_mock(delay, header_prefix, "4", "100").await;
 
         for _ in 0..4 {
-            state.line.enqueue(&job_for(&user_id)).unwrap();
+            state.line.enqueue(&job_for(&user_id), "/jobs").unwrap();
         }
         let added = assign::register_if_free(&mut state.valkey, &mock_addr).await.unwrap();
         assert!(added, "test setup bug: expected this to be a genuinely new pool add");

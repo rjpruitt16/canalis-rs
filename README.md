@@ -57,7 +57,18 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 
 Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`.
 
-A caller whose wait for a free instance times out gets a `503` with a `status` link; the job stays in line. `GET /jobs/{idempotent_key}?user_id=...` answers with the finished result, `202 {"status":"queued","ahead":N}`, or `404`. The line is per Canalis node, so ask the node that queued it.
+When no instance is free, the caller's connection becomes a stream from Canalis's line. Canalis's own events are prefixed `canalis_` so they're never confused with the node's queue:
+
+```
+event: canalis_queued      data: {"ahead":3,"reason":"no_instance_free","status":"/jobs/k1?user_id=acme"}
+event: canalis_position    data: {"ahead":1}
+event: canalis_assigned    data: {"job_id":"..."}        (job_id for /jobs callers)
+event: queued / completed  ...                           (the node's own stream, /jobs callers)
+event: canalis_result      data: {"status":200,"body":"..."}  (a /proxy answer that isn't a stream)
+event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in line; stream closing)
+```
+
+`GET /jobs/{idempotent_key}?user_id=...` answers with the finished result, `202 {"status":"queued","ahead":N}`, or `404`. The line is per Canalis node, so ask the node that queued it.
 
 | Env var | Default | Description |
 |---|---|---|
@@ -69,4 +80,5 @@ A caller whose wait for a free instance times out gets a `503` with a `status` l
 | `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full-line `429` |
 | `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a drained job's result stays available |
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked against free instances (also runs at startup, which is crash recovery) |
-| `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's connection waits in line before the `503` |
+| `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
+| `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |
