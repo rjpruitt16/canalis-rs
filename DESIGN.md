@@ -28,12 +28,28 @@ node's waiters wait for it to come back (the same tradeoff Aquifer makes
 with local SQLite), and status has to be asked of the node that queued it.
 Valkey still holds assignment state.
 
+**Built: node lifecycle.** A registration ping with `state: draining` or
+`offline` takes the node out of the free pool and releases its users
+(`canalis:instance_tenants:<addr>` is the reverse index that makes this
+possible); a release only deletes an assignment that still points at that
+node, so it can't clobber a newer one. The same address coming back
+`active` (a restart) rejoins the pool instead of staying "assigned"
+forever. A request that hits a node answering `503` +
+`X-Aqueduct-Node-State: draining` before its ping arrives is re-routed
+once (another node, or the line); a drain that hits one puts the job back
+in line in its original place instead of storing the 503 as its result.
+Verified against a real Aquifer binary: register, serve through Canalis,
+`SIGTERM`, released, restart on the same port, serving again. Spillway's
+ping doesn't send `state` yet (treated as `active`).
+
 **Still to do, in order:**
 
-1. **Align with Aquifer's current protocol.** Read the registration
-   `state` field and stop assigning `draining`/`offline` nodes; verify the
-   L8 signature Aquifer already puts on registration pings; support three
-   node kinds: drain-mode (exclusive, released when the node reports it's
+1. **Align with Aquifer's current protocol.** Verify registration pings
+   with L8: Aquifer only signs a delivery once the receiver has an L8
+   trust established, and Canalis doesn't implement the receiving side
+   yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
+   of L8, which overlaps the later trust-broker work. Support three node
+   kinds: drain-mode (exclusive, released when the node reports it's
    free; how it reports that is an open question on the Aquifer side),
    cluster (shared, using Aquifer's `aqueduct:` Valkey keys and the same
    Lua claim script, with a contract test so the Go and Rust copies can't

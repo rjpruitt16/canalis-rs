@@ -150,10 +150,17 @@ async fn valkey_check(State(mut state): State<AppState>) -> String {
 // below gives us the real source IP directly from the connection itself,
 // which is more trustworthy than anything the instance could claim about
 // its own reachable address.
+//
+// `state` is Aquifer's lifecycle state: `active` on normal heartbeats,
+// `draining` as soon as it gets SIGTERM, a best-effort `offline` once its
+// accepted work is done (see Aquifer's REGISTRATION.md). Missing means
+// `active` -- Spillway's ping doesn't send it yet.
 #[derive(Deserialize)]
 struct RegisterRequest {
     port: String,
     reported_at: String,
+    #[serde(default)]
+    state: Option<String>,
 }
 
 // Registrations expire on their own if pings stop arriving, rather than
@@ -164,22 +171,44 @@ struct RegisterRequest {
 const REGISTRATION_TTL_SECONDS: u64 = 45;
 
 async fn register(
-    State(mut state): State<AppState>,
+    State(state): State<AppState>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     Json(payload): Json<RegisterRequest>,
 ) -> StatusCode {
     let address = format!("{}:{}", remote.ip(), payload.port);
+    match handle_registration(state, &address, &payload).await {
+        Ok(()) => StatusCode::OK,
+        Err(err) => {
+            tracing::error!("failed to register instance {address}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn handle_registration(
+    mut state: AppState,
+    address: &str,
+    payload: &RegisterRequest,
+) -> Result<(), BoxError> {
+    let node_state = payload.state.as_deref().unwrap_or("active");
     let key = format!("canalis:instance:{address}");
 
-    let result: redis::RedisResult<()> = state
+    if node_state == "draining" || node_state == "offline" {
+        // Stop handing it work right away, and give its users back: their
+        // next request lands on another node, or waits in line. The node
+        // finishes whatever it already accepted on its own.
+        let released = assign::retire_instance(&mut state.valkey, address).await?;
+        if node_state == "offline" {
+            let _: () = state.valkey.del(&key).await?;
+        }
+        tracing::info!("instance {address} is {node_state}; released {released} users from it");
+        return Ok(());
+    }
+
+    let _: () = state
         .valkey
         .set_ex(&key, &payload.reported_at, REGISTRATION_TTL_SECONDS)
-        .await;
-
-    if let Err(err) = result {
-        tracing::error!("failed to register instance {address}: {err}");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
+        .await?;
 
     // Every heartbeat, not just the first -- but a no-op if addr is
     // already claimed or already in the pool (see register_if_free's own
@@ -187,14 +216,7 @@ async fn register(
     // it actually added something new, not just "the call succeeded" --
     // that's what tells us whether it's worth attempting to drain a
     // pending job, rather than checking on every single heartbeat.
-    let newly_freed = match assign::register_if_free(&mut state.valkey, &address).await {
-        Ok(added) => added,
-        Err(err) => {
-            tracing::error!("failed to add {address} to the free pool: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR;
-        }
-    };
-
+    let newly_freed = assign::register_if_free(&mut state.valkey, address).await?;
     tracing::info!("registered instance {address}");
 
     if newly_freed {
@@ -207,8 +229,20 @@ async fn register(
             }
         });
     }
+    Ok(())
+}
 
-    StatusCode::OK
+// Aquifer answers 503 with X-Aqueduct-Node-State: draining (Spillway the
+// same, lowercase) once it's shutting down, even before its next
+// registration ping says so.
+fn node_is_draining(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
+    status == 503
+        && ["X-Aqueduct-Node-State", "X-Aquifer-Node-State"].iter().any(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case("draining"))
+        })
 }
 
 // Default pacing before anything's been learned about the target
@@ -333,7 +367,7 @@ async fn try_drain_one(mut state: AppState) -> Result<bool, BoxError> {
     let Some((first, addr, guard)) = claim_next(&mut state).await? else {
         return Ok(false);
     };
-    drain_tenant_backlog(state, first.job, addr, guard).await?;
+    drain_tenant_backlog(state, first, addr, guard).await?;
     Ok(true)
 }
 
@@ -347,7 +381,7 @@ async fn sweep_once(mut state: AppState) -> Result<usize, BoxError> {
     while let Some((first, addr, guard)) = claim_next(&mut state).await? {
         let drain_state = state.clone();
         tokio::spawn(async move {
-            if let Err(err) = drain_tenant_backlog(drain_state, first.job, addr, guard).await {
+            if let Err(err) = drain_tenant_backlog(drain_state, first, addr, guard).await {
                 tracing::error!("drain failed: {err}");
             }
         });
@@ -378,26 +412,29 @@ async fn sweep_once(mut state: AppState) -> Result<usize, BoxError> {
 // finish, then read whatever it settled on" shape, which is exactly
 // what's needed here.
 async fn drain_tenant_backlog(
-    state: AppState,
-    first_job: JobRequest,
+    mut state: AppState,
+    first: line::QueuedJob,
     addr: String,
     _guard: DrainGuard,
 ) -> Result<(), BoxError> {
-    let user_id = first_job.user_id.clone();
-    let mut pending = Some(first_job);
+    let user_id = first.job.user_id.clone();
+    let mut pending = Some(first);
     let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
     let mut rps = DEFAULT_DRAIN_RPS;
     let mut last_dispatch_at: Option<Instant> = None;
-    let mut in_flight: tokio::task::JoinSet<PacingSignal> = tokio::task::JoinSet::new();
+    let mut in_flight: tokio::task::JoinSet<DispatchOutcome> = tokio::task::JoinSet::new();
+    // Set once the instance says it's draining: stop taking more jobs out
+    // of line, let what's in flight finish, then hand the tenant back.
+    let mut node_draining = false;
 
     loop {
-        while in_flight.len() < max_concurrent {
+        while !node_draining && in_flight.len() < max_concurrent {
             let job = match pending.take() {
                 Some(job) => job,
                 None => {
                     let user_id = user_id.clone();
                     match on_line(&state.line, move |l| l.pop_for(&user_id)).await? {
-                        Some(queued) => queued.job,
+                        Some(queued) => queued,
                         None => break,
                     }
                 }
@@ -426,7 +463,12 @@ async fn drain_tenant_backlog(
             break;
         };
 
-        let signal = joined.map_err(|err| format!("drain dispatch task panicked: {err}"))?;
+        let outcome = joined.map_err(|err| format!("drain dispatch task panicked: {err}"))?;
+        if let Some(job) = outcome.back_in_line {
+            node_draining = true;
+            on_line(&state.line, move |l| l.requeue(&job)).await?;
+        }
+        let signal = outcome.pacing;
 
         if let Some(mc) = signal.max_concurrent {
             max_concurrent = mc.min(MAX_DRAIN_CONCURRENCY_CEILING);
@@ -436,7 +478,21 @@ async fn drain_tenant_backlog(
         }
     }
 
+    if node_draining {
+        // The rest of this tenant's line stays where it is; releasing the
+        // assignment means the next claim finds them a different node.
+        assign::release_user(&mut state.valkey, &user_id, &addr).await?;
+        tracing::info!("{addr} is draining; {user_id}'s remaining jobs stay in line for another node");
+    }
     Ok(())
+}
+
+// What one drained dispatch hands back to drain_tenant_backlog: the
+// instance's pacing signal, plus the job itself if the instance turned out
+// to be draining and it has to go back in line instead of being finished.
+struct DispatchOutcome {
+    pacing: PacingSignal,
+    back_in_line: Option<line::QueuedJob>,
 }
 
 // One job's worth of the drain, run as its own task so up to
@@ -451,12 +507,16 @@ async fn dispatch_drained_job(
     line: Arc<line::Line>,
     http: reqwest::Client,
     addr: String,
-    job: JobRequest,
-) -> PacingSignal {
+    queued: line::QueuedJob,
+) -> DispatchOutcome {
+    let job = &queued.job;
     let target_url = format!("http://{addr}/jobs");
-    let response = http.post(&target_url).json(&job).send().await;
+    let response = http.post(&target_url).json(job).send().await;
 
     let (cached, pacing) = match response {
+        Ok(resp) if node_is_draining(resp.status().as_u16(), resp.headers()) => {
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
+        }
         Ok(resp) => {
             let pacing = PacingSignal::from_headers(resp.headers());
             let status = resp.status().as_u16();
@@ -504,7 +564,7 @@ async fn dispatch_drained_job(
         tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
     }
 
-    pacing
+    DispatchOutcome { pacing, back_in_line: None }
 }
 
 // Mirrors Aquifer's own POST /proxy and POST /jobs request body exactly,
@@ -608,7 +668,36 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Respons
 // try_drain_one (on register()) and sweep_once (periodic, and at startup)
 // are what actually dispatch queued jobs once a slot frees up; this
 // function only waits for the result to show up.
+// Marks a response as "the assigned instance said it's draining", so
+// forward_with_config can re-route instead of relaying it.
+#[derive(Clone)]
+struct NodeDraining(String);
+
 async fn forward_with_config(
+    state: AppState,
+    job: JobRequest,
+    target_path: &str,
+    config: &RetryConfig,
+) -> Response {
+    let mut valkey = state.valkey.clone();
+    let user_id = job.user_id.clone();
+    let first = forward_attempt(state.clone(), job.clone(), target_path, config).await;
+    let Some(NodeDraining(addr)) = first.extensions().get::<NodeDraining>().cloned() else {
+        return first;
+    };
+
+    // The assigned instance is shutting down: hand this user back and try
+    // once more -- a different instance, or the line. Once, not in a loop:
+    // a second draining answer is relayed as-is.
+    if let Err(err) = assign::release_user(&mut valkey, &user_id, &addr).await {
+        tracing::error!("failed to release {user_id} from draining instance {addr}: {err}");
+        return first;
+    }
+    tracing::info!("{addr} is draining; re-routing {user_id}");
+    forward_attempt(state, job, target_path, config).await
+}
+
+async fn forward_attempt(
     mut state: AppState,
     job: JobRequest,
     target_path: &str,
@@ -713,6 +802,18 @@ async fn forward_with_config(
             );
         }
     };
+
+    if node_is_draining(upstream.status().as_u16(), upstream.headers()) {
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "assigned instance is draining" }),
+        );
+        response
+            .headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(1u32));
+        response.extensions_mut().insert(NodeDraining(addr));
+        return response;
+    }
 
     let content_type = upstream
         .headers()
@@ -897,6 +998,7 @@ mod tests {
         let _: redis::RedisResult<()> = valkey.srem("canalis:pool:free", addr).await;
         let _: redis::RedisResult<()> = valkey.srem("canalis:assigned", addr).await;
         let _: redis::RedisResult<()> = valkey.del(format!("canalis:assignment:{user_id}")).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:instance_tenants:{addr}")).await;
     }
 
     // A real mock server (not Canalis), answering POST /proxy with a real
@@ -1236,6 +1338,123 @@ mod tests {
         let result = line::CachedResult { status: 201, content_type: String::new(), body: "made".into() };
         state.line.store_result(&user_id, &job.idempotent_key, &result).unwrap();
         assert_eq!(ask(state.clone()).await.status(), StatusCode::CREATED);
+    }
+
+    // Answers everything the way a shutting-down Aquifer does.
+    async fn start_draining_mock() -> String {
+        async fn handler() -> Response {
+            Response::builder()
+                .status(503)
+                .header("X-Aqueduct-Node-State", "draining")
+                .header("Retry-After", "1")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"aquifer is draining"}"#))
+                .expect("a hardcoded response should always build")
+        }
+        let app = Router::new()
+            .route("/proxy", post(handler))
+            .route("/jobs", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    fn ping(state: &str) -> RegisterRequest {
+        RegisterRequest {
+            port: "0".into(),
+            reported_at: "2026-10-13T00:00:00Z".into(),
+            state: Some(state.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draining_ping_releases_users_and_an_active_ping_brings_the_node_back() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (mut state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
+        let addr = unique("node");
+        let user_id = unique("user-on-draining-node");
+
+        handle_registration(state.clone(), &addr, &ping("active")).await.unwrap();
+        assert!(matches!(
+            assign::assign(&mut state.valkey, &user_id).await.unwrap(),
+            assign::AssignOutcome::Assigned(a) if a == addr
+        ));
+
+        handle_registration(state.clone(), &addr, &ping("draining")).await.unwrap();
+        let assignment: Option<String> =
+            valkey.get(format!("canalis:assignment:{user_id}")).await.unwrap();
+        let in_pool: bool = valkey.sismember("canalis:pool:free", &addr).await.unwrap();
+        let back_after_restart = {
+            handle_registration(state.clone(), &addr, &ping("active")).await.unwrap();
+            valkey.sismember::<_, _, bool>("canalis:pool:free", &addr).await.unwrap()
+        };
+        cleanup_assignment(&mut valkey, &addr, &user_id).await;
+        let _: redis::RedisResult<()> = valkey.del(format!("canalis:instance:{addr}")).await;
+
+        assert!(assignment.is_none(), "users on a draining node must be released");
+        assert!(!in_pool, "a draining node must not be handed new users");
+        assert!(back_after_restart, "the same address coming back active must be usable again");
+    }
+
+    #[tokio::test]
+    async fn a_request_hitting_a_draining_node_is_rerouted_not_failed() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
+        let user_id = unique("user-rerouted");
+        let draining_addr = start_draining_mock().await;
+        let ok_addr = start_plain_ok_mock().await;
+
+        // Already assigned to the node that's shutting down (its draining
+        // ping hasn't arrived yet), with a healthy node free.
+        let _: () = valkey.set(format!("canalis:assignment:{user_id}"), &draining_addr).await.unwrap();
+        let _: () = valkey.sadd("canalis:assigned", &draining_addr).await.unwrap();
+        let _: () = valkey.sadd("canalis:pool:free", &ok_addr).await.unwrap();
+
+        let response = forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
+        let status = response.status();
+        let now_on: Option<String> = valkey.get(format!("canalis:assignment:{user_id}")).await.unwrap();
+        cleanup_assignment(&mut valkey, &draining_addr, &user_id).await;
+        cleanup_assignment(&mut valkey, &ok_addr, &user_id).await;
+
+        assert_eq!(status, StatusCode::OK, "the caller should get the healthy node's answer");
+        assert_eq!(now_on.as_deref(), Some(ok_addr.as_str()));
+    }
+
+    #[tokio::test]
+    async fn draining_the_line_into_a_draining_node_keeps_the_jobs_in_line() {
+        let _guard = assign::TEST_LOCK.lock().await;
+        let (state, _dir) = test_state().await;
+        let mut valkey = state.valkey.clone();
+        let user_id = unique("user-line-vs-draining");
+        let draining_addr = start_draining_mock().await;
+
+        let jobs: Vec<JobRequest> = (0..2).map(|_| job_for(&user_id)).collect();
+        for job in &jobs {
+            state.line.enqueue(job).unwrap();
+        }
+        let _: () = valkey.set(format!("canalis:assignment:{user_id}"), &draining_addr).await.unwrap();
+        let _: () = valkey.sadd("canalis:assigned", &draining_addr).await.unwrap();
+
+        let line = state.line.clone();
+        assert!(try_drain_one(state).await.unwrap());
+        let assignment: Option<String> = valkey.get(format!("canalis:assignment:{user_id}")).await.unwrap();
+        cleanup_assignment(&mut valkey, &draining_addr, &user_id).await;
+
+        assert_eq!(line.len().unwrap(), 2, "both jobs must still be waiting, not lost");
+        for job in &jobs {
+            assert!(
+                line.get_result(&user_id, &job.idempotent_key).unwrap().is_none(),
+                "a draining node's 503 must not be stored as the job's result"
+            );
+        }
+        let first = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        assert_eq!(first.job.idempotent_key, jobs[0].idempotent_key, "and still in their original order");
+        assert!(assignment.is_none(), "the tenant must be free to get a different node");
     }
 
     // Every response takes `delay`, and advertises the given
