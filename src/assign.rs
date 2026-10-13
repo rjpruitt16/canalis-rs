@@ -1,366 +1,619 @@
+//! Assignment: which instance a user's traffic goes to.
+//!
+//! Canalis shares Aquifer's own cluster assignment table in Valkey (its
+//! `AQUIFER_CLUSTER_PROVIDER=valkey` mode, cluster_valkey.go) instead of
+//! keeping a separate one, so Canalis and Aquifer nodes that coordinate
+//! through Valkey agree on where every user lives:
+//!
+//! ```text
+//! aqueduct:instances                         set of instance ids
+//! aqueduct:instance:<id>                     member JSON, expires without heartbeats
+//! aqueduct:instance:<id>:assignments         zset: user-scope hash -> expiry (ms)
+//! aqueduct:assignment:<sha256(user_id)>      instance id, expires after idling
+//! aqueduct:instance:<id>:fullness            0-100 as last reported (Canalis's own)
+//! ```
+//!
+//! Claims run in the same Lua script Aquifer uses, so concurrent claims
+//! from Canalis and Aquifer converge on the first one. Canalis passes one
+//! extra flag ("strict"): when every candidate is at capacity, Aquifer
+//! falls back to the least-loaded instance because it has nowhere else to
+//! put the work; Canalis has its line, so it gets nothing back and queues
+//! the user instead.
+//!
+//! What Canalis adds on top, before the script runs: instances at or above
+//! CANALIS_QUEUE_AT_PERCENT fullness aren't offered to new users (a user
+//! already on one stays -- the script keeps live assignments sticky), an
+//! instance reserved for one user is only offered to that user, and a
+//! `ws`-role instance isn't offered HTTP traffic.
+
 use crate::Valkey;
 use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::time::Duration;
 
-// canalis:pool:free and canalis:assigned are global keys, not scoped
-// per-test the way canalis:assignment:<user_id> is -- so any test
-// touching them (in this module's own tests, or main.rs's forwarding
-// tests) can't safely run concurrently against another one without pool
-// state bleeding across tests. Shared here, at crate visibility, rather
-// than defined separately in each test module -- a lock in assign.rs's
-// own tests wouldn't serialize against a *different* lock in main.rs's
-// tests, and this exact gap caused a real, confusing test failure before
-// it was fixed (main.rs's SSE relay test lost a race against this
-// module's own tests popping the same seeded pool entry).
-#[cfg(test)]
-pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-const ASSIGNMENT_KEY_PREFIX: &str = "canalis:assignment:";
-const FREE_POOL_KEY: &str = "canalis:pool:free";
-const ASSIGNED_KEY: &str = "canalis:assigned";
-// addr -> the user_ids assigned to it: the reverse of
-// canalis:assignment:<user_id>, so a node that starts draining can hand
-// its users back without scanning every assignment key.
-const INSTANCE_TENANTS_PREFIX: &str = "canalis:instance_tenants:";
-
-fn instance_tenants_key(addr: &str) -> String {
-    format!("{INSTANCE_TENANTS_PREFIX}{addr}")
+/// Where assignment state lives and the policy around it.
+#[derive(Clone, Debug)]
+pub struct Aqueduct {
+    /// Key prefix, shared with Aquifer (`AQUIFER_CLUSTER_VALKEY_PREFIX`).
+    pub prefix: String,
+    /// How long an idle assignment lives before the user is free to land
+    /// elsewhere; every request through Canalis renews it.
+    pub assignment_ttl: Duration,
+    /// How long an instance stays assignable without a heartbeat.
+    pub instance_ttl: Duration,
+    /// Users an instance takes when it doesn't say (drain-mode instances
+    /// always take exactly one).
+    pub default_capacity: i64,
+    /// At or above this fullness, an instance gets no new users.
+    pub queue_at_percent: u8,
 }
 
-// Deletes an assignment only if it still points at the given address, so
-// releasing a user from a draining node can never clobber a newer
-// assignment someone else already made for them.
-const RELEASE_IF_STILL_ASSIGNED: &str = r"
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-  return redis.call('DEL', KEYS[1])
-end
-return 0
-";
+impl Aqueduct {
+    pub fn from_env() -> Self {
+        let mut prefix = std::env::var("CANALIS_AQUEDUCT_PREFIX").unwrap_or_else(|_| "aqueduct:".into());
+        if !prefix.ends_with(':') {
+            prefix.push(':');
+        }
+        let heartbeat = crate::env_u64("CANALIS_REGISTRATION_INTERVAL_SECONDS", 15);
+        Self {
+            prefix,
+            // Same shape as Aquifer's assignmentTTL: idle window plus two
+            // heartbeats of slack.
+            assignment_ttl: Duration::from_secs(
+                crate::env_u64("CANALIS_ASSIGNMENT_IDLE_SECONDS", 300) + 2 * heartbeat,
+            ),
+            instance_ttl: Duration::from_secs(3 * heartbeat),
+            default_capacity: crate::env_u64("CANALIS_DEFAULT_USER_CAPACITY", 100).max(1) as i64,
+            queue_at_percent: crate::env_u64("CANALIS_QUEUE_AT_PERCENT", 80).clamp(1, 100) as u8,
+        }
+    }
+
+    fn instances_key(&self) -> String {
+        format!("{}instances", self.prefix)
+    }
+    fn instance_key(&self, id: &str) -> String {
+        format!("{}instance:{id}", self.prefix)
+    }
+    fn assignments_key(&self, id: &str) -> String {
+        format!("{}instance:{id}:assignments", self.prefix)
+    }
+    fn fullness_key(&self, id: &str) -> String {
+        format!("{}instance:{id}:fullness", self.prefix)
+    }
+    fn assignment_key(&self, scope_hash: &str) -> String {
+        format!("{}assignment:{scope_hash}", self.prefix)
+    }
+}
+
+/// An instance's record, the same JSON Aquifer's ClusterMember writes.
+/// Canalis's extra fields ride along; Aquifer ignores what it doesn't know.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Member {
+    pub id: String,
+    /// Base URL requests go to, e.g. `http://10.0.0.5:8080`.
+    pub address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub active_users: i64,
+    #[serde(rename = "user_capacity", default, skip_serializing_if = "is_zero")]
+    pub capacity: i64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reported_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_for: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_state: Option<String>,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+impl Member {
+    pub fn is_active(&self) -> bool {
+        !matches!(self.state.as_deref(), Some("draining") | Some("offline"))
+    }
+}
+
+/// The instance a user is assigned to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Node {
+    pub id: String,
+    pub base_url: String,
+}
 
 pub enum AssignOutcome {
-    Assigned(String),
+    Assigned(Node),
     PoolExhausted,
 }
 
-/// Resolves user_id's sticky assignment, creating one if it doesn't exist
-/// yet. Race-safe against concurrent requests for the *same* user_id via
-/// SET ... NX: if we lose that race, the instance we needlessly claimed
-/// gets returned to the free pool, and we return whoever actually won
-/// instead. Does not handle a Canalis process crashing mid-operation (a
-/// real, separate gap; see DESIGN.md's reconciliation-sweep section, not
-/// yet built).
-pub async fn assign(valkey: &mut Valkey, user_id: &str) -> redis::RedisResult<AssignOutcome> {
-    let assignment_key = format!("{ASSIGNMENT_KEY_PREFIX}{user_id}");
+/// Same hash Aquifer uses for assignment keys (store.go's hashKey), so
+/// Canalis and Aquifer find each other's assignments.
+pub fn scope_hash(user_id: &str) -> String {
+    hex(&Sha256::digest(user_id.as_bytes()))
+}
 
-    if let Some(existing) = valkey.get::<_, Option<String>>(&assignment_key).await? {
-        return Ok(AssignOutcome::Assigned(existing));
+/// Same ranking as Aquifer's rankedOwners: highest
+/// sha256(id + ":" + user_id) first, ties by id -- so for a brand-new user
+/// Canalis and Aquifer have the same first choice.
+fn rendezvous_score(id: &str, user_id: &str) -> String {
+    hex(&Sha256::digest(format!("{id}:{user_id}").as_bytes()))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Aquifer's assignClusterScopeScript (cluster_valkey.go), plus one optional
+// trailing argument: "1" means strict -- when no candidate is under
+// capacity, return nothing instead of the least-loaded one. Without it the
+// script behaves exactly as Aquifer's does.
+const ASSIGN_LUA: &str = r"
+local assignment = redis.call('GET', KEYS[1])
+local clock = redis.call('TIME')
+local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
+local ttl = tonumber(ARGV[1])
+local scope = ARGV[2]
+local count = tonumber(ARGV[3])
+local prefix = ARGV[4]
+
+local function active_member(payload)
+  if not payload then return nil end
+  local ok, member = pcall(cjson.decode, payload)
+  if ok and member['state'] ~= 'draining' and member['state'] ~= 'offline' then
+    return member
+  end
+  return nil
+end
+
+if assignment then
+  local payload = redis.call('GET', prefix .. 'instance:' .. assignment)
+  if active_member(payload) then
+    redis.call('PEXPIRE', KEYS[1], ttl)
+    redis.call('ZADD', prefix .. 'instance:' .. assignment .. ':assignments', now + ttl, scope)
+    return payload
+  end
+  redis.call('DEL', KEYS[1])
+  redis.call('ZREM', prefix .. 'instance:' .. assignment .. ':assignments', scope)
+end
+
+local selected = 0
+local least = 0
+local least_ratio = nil
+for i = 1, count do
+  local payload = redis.call('GET', KEYS[2 + (i - 1) * 2])
+  local member = active_member(payload)
+  if member then
+    local assignments = KEYS[3 + (i - 1) * 2]
+    redis.call('ZREMRANGEBYSCORE', assignments, '-inf', now)
+    local used = redis.call('ZCARD', assignments)
+    local reported = tonumber(member['active_users']) or 0
+    if reported > used then used = reported end
+    local capacity = tonumber(member['user_capacity']) or tonumber(ARGV[4 + (i - 1) * 2 + 2])
+    if capacity < 1 then capacity = 1 end
+    if selected == 0 and used < capacity then selected = i end
+    local ratio = used / capacity
+    if least == 0 or ratio < least_ratio then
+      least = i
+      least_ratio = ratio
+    end
+  end
+end
+if selected == 0 and ARGV[5 + count * 2] ~= '1' then selected = least end
+if selected == 0 then return '' end
+
+local id = ARGV[4 + (selected - 1) * 2 + 1]
+redis.call('SET', KEYS[1], id, 'PX', ttl)
+redis.call('ZADD', KEYS[3 + (selected - 1) * 2], now + ttl, scope)
+return redis.call('GET', KEYS[2 + (selected - 1) * 2])
+";
+
+// Aquifer's releaseClusterScopeScript: only removes an assignment that
+// still points at this instance, never a newer one.
+const RELEASE_LUA: &str = r"
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+redis.call('ZREM', KEYS[2], ARGV[2])
+return 1
+";
+
+/// Every live instance record. Ids whose record has expired (no
+/// heartbeat) are pruned from the set, as Aquifer's Members() does.
+pub async fn members(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<Member>> {
+    let ids: Vec<String> = valkey.smembers(aq.instances_key()).await?;
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
+    let keys: Vec<String> = ids.iter().map(|id| aq.instance_key(id)).collect();
+    let values: Vec<Option<String>> = valkey.mget(&keys).await?;
 
-    let popped: Option<String> = valkey.spop(FREE_POOL_KEY).await?;
-    let Some(addr) = popped else {
-        return Ok(AssignOutcome::PoolExhausted);
+    let mut members = Vec::with_capacity(ids.len());
+    let mut stale = Vec::new();
+    for (id, value) in ids.iter().zip(values) {
+        match value.and_then(|v| serde_json::from_str::<Member>(&v).ok()) {
+            Some(m) if !m.id.is_empty() && !m.address.is_empty() => members.push(m),
+            _ => stale.push(id.clone()),
+        }
+    }
+    if !stale.is_empty() {
+        let _: () = valkey.srem(aq.instances_key(), &stale).await?;
+        for id in &stale {
+            let _: () = valkey.del(aq.assignments_key(id)).await?;
+        }
+    }
+    Ok(members)
+}
+
+/// The record last written for one instance, if it's still live.
+pub async fn member(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::RedisResult<Option<Member>> {
+    let value: Option<String> = valkey.get(aq.instance_key(id)).await?;
+    Ok(value.and_then(|v| serde_json::from_str(&v).ok()))
+}
+
+/// Writes an instance's record and keeps it in the set, same as Aquifer's
+/// own heartbeat. The record expires on its own if heartbeats stop.
+pub async fn heartbeat(valkey: &mut Valkey, aq: &Aqueduct, member: &Member) -> redis::RedisResult<()> {
+    let payload = serde_json::to_string(member)
+        .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "encode member", e.to_string())))?;
+    let _: () = redis::pipe()
+        .atomic()
+        .sadd(aq.instances_key(), &member.id)
+        .ignore()
+        .set_ex(aq.instance_key(&member.id), payload, aq.instance_ttl.as_secs().max(1))
+        .ignore()
+        .query_async(valkey)
+        .await?;
+    Ok(())
+}
+
+/// Forgets an instance entirely (it said it's offline).
+pub async fn remove_instance(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::RedisResult<()> {
+    let _: () = redis::pipe()
+        .atomic()
+        .del(aq.instance_key(id))
+        .ignore()
+        .del(aq.fullness_key(id))
+        .ignore()
+        .srem(aq.instances_key(), id)
+        .ignore()
+        .query_async(valkey)
+        .await?;
+    release_all(valkey, aq, id).await.map(|_| ())
+}
+
+/// Marks an instance draining in its own record, because it just answered
+/// a request with `503` + `X-Aqueduct-Node-State: draining` and its own
+/// draining ping may not have arrived yet. Without this the next claim
+/// could pick the same instance again. Its next heartbeat overwrites this
+/// with whatever it reports itself.
+pub async fn mark_draining(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::RedisResult<()> {
+    if let Some(mut m) = member(valkey, aq, id).await? {
+        m.state = Some("draining".into());
+        heartbeat(valkey, aq, &m).await?;
+    }
+    Ok(())
+}
+
+/// Remembers how full an instance said it was, from its registration ping
+/// or the X-Aqueduct-Fullness header on any response. Short-lived, so a
+/// reading that stops being refreshed stops counting.
+pub async fn record_fullness(valkey: &mut Valkey, aq: &Aqueduct, id: &str, percent: u8) -> redis::RedisResult<()> {
+    valkey.set_ex(aq.fullness_key(id), percent, aq.instance_ttl.as_secs().max(1)).await
+}
+
+/// Resolves user_id's instance: their live assignment if they have one
+/// (renewed), otherwise a claim on the best eligible instance, otherwise
+/// PoolExhausted -- every eligible instance is full, and the caller queues.
+pub async fn assign(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str) -> redis::RedisResult<AssignOutcome> {
+    let all = members(valkey, aq).await?;
+    let fullness_keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
+    let fullness: Vec<Option<u8>> = if fullness_keys.is_empty() {
+        Vec::new()
+    } else {
+        valkey.mget(&fullness_keys).await?
     };
 
-    let won: bool = valkey.set_nx(&assignment_key, &addr).await?;
-    if won {
-        let _: () = valkey.sadd(ASSIGNED_KEY, &addr).await?;
-        let _: () = valkey.sadd(instance_tenants_key(&addr), user_id).await?;
-        return Ok(AssignOutcome::Assigned(addr));
-    }
+    let mut candidates: Vec<&Member> = all
+        .iter()
+        .zip(fullness.iter())
+        .filter(|(m, full)| {
+            m.is_active()
+                && m.role.as_deref().is_none_or(|role| role != "ws")
+                && m.reserved_for.as_deref().is_none_or(|owner| owner == user_id)
+                && full.is_none_or(|f| f < aq.queue_at_percent)
+        })
+        .map(|(m, _)| m)
+        .collect();
+    // An instance reserved for this user first, then Aquifer's ranking.
+    candidates.sort_by(|a, b| {
+        let mine = |m: &Member| m.reserved_for.as_deref() == Some(user_id);
+        mine(b)
+            .cmp(&mine(a))
+            .then_with(|| rendezvous_score(&b.id, user_id).cmp(&rendezvous_score(&a.id, user_id)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
-    // Lost the race -- someone else's concurrent request for this same
-    // user_id already wrote the assignment first. Give back the instance
-    // we didn't need and return whoever actually won.
-    let _: () = valkey.sadd(FREE_POOL_KEY, &addr).await?;
-    let winner: Option<String> = valkey.get(&assignment_key).await?;
-    match winner {
-        Some(addr) => Ok(AssignOutcome::Assigned(addr)),
-        // Only reachable if the winning assignment key vanished between
-        // our failed NX and this GET -- assignment keys carry no TTL, so
-        // this should never actually happen in practice.
-        None => Err((redis::ErrorKind::Client, "assignment vanished after NX loss").into()),
+    // Runs even with no candidates: a user who already has a live
+    // assignment keeps it, full or not.
+    let hash = scope_hash(user_id);
+    let assign_script = redis::Script::new(ASSIGN_LUA);
+    let mut script = assign_script.prepare_invoke();
+    script.key(aq.assignment_key(&hash));
+    script
+        .arg(aq.assignment_ttl.as_millis() as u64)
+        .arg(&hash)
+        .arg(candidates.len())
+        .arg(&aq.prefix);
+    for m in &candidates {
+        script.key(aq.instance_key(&m.id)).key(aq.assignments_key(&m.id));
+        let capacity = if m.capacity > 0 { m.capacity } else { aq.default_capacity };
+        script.arg(&m.id).arg(capacity);
     }
+    script.arg("1");
+
+    let payload: String = script.invoke_async(valkey).await?;
+    if payload.is_empty() {
+        return Ok(AssignOutcome::PoolExhausted);
+    }
+    let member: Member = serde_json::from_str(&payload)
+        .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "decode member", e.to_string())))?;
+    Ok(AssignOutcome::Assigned(Node { id: member.id, base_url: member.address }))
 }
 
-/// Called on every registration ping (see main.rs's `register` handler).
-/// Adds addr to the free pool unless it's already claimed by someone --
-/// SADD is a no-op if addr is already present, so a repeatedly-heartbeating
-/// *unassigned* instance never creates duplicate pool entries (which would
-/// let the same address get claimed twice). Switched the pool from a List
-/// to a Set specifically for this idempotency property; trades away FIFO
-/// fairness, which this slice never required (first-free-wins, per the
-/// original scoping).
-/// Returns whether this call actually added a genuinely new free instance
-/// (as opposed to a no-op on an already-claimed or already-pooled one) --
-/// callers use this to decide whether it's worth attempting to drain a
-/// pending job, rather than checking on every single heartbeat.
-pub async fn register_if_free(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<bool> {
-    let already_assigned: bool = valkey.sismember(ASSIGNED_KEY, addr).await?;
-    if already_assigned {
-        return Ok(false);
-    }
-    let added: i64 = valkey.sadd(FREE_POOL_KEY, addr).await?;
-    Ok(added > 0)
+/// Releases user_id from node_id, if that's still where they're assigned.
+/// Their next request resolves a fresh assignment, or waits in line.
+pub async fn release_user(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str, node_id: &str) -> redis::RedisResult<bool> {
+    let hash = scope_hash(user_id);
+    release_scope(valkey, aq, &hash, node_id).await
 }
 
-/// Releases user_id from addr, if that's still where they're assigned.
-/// Their next request resolves a fresh assignment (or waits in line).
-/// addr itself is NOT returned to the free pool -- this is for a node
-/// that's draining, which shouldn't be handed new tenants.
-pub async fn release_user(valkey: &mut Valkey, user_id: &str, addr: &str) -> redis::RedisResult<bool> {
-    let released: i64 = redis::Script::new(RELEASE_IF_STILL_ASSIGNED)
-        .key(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}"))
-        .arg(addr)
+async fn release_scope(valkey: &mut Valkey, aq: &Aqueduct, hash: &str, node_id: &str) -> redis::RedisResult<bool> {
+    let released: i64 = redis::Script::new(RELEASE_LUA)
+        .key(aq.assignment_key(hash))
+        .key(aq.assignments_key(node_id))
+        .arg(node_id)
+        .arg(hash)
         .invoke_async(valkey)
         .await?;
-    let _: () = valkey.srem(instance_tenants_key(addr), user_id).await?;
     Ok(released > 0)
 }
 
-/// Takes addr out of rotation because it reported `draining` or `offline`:
-/// it leaves the free pool, every user assigned to it is released, and it
-/// stops counting as assigned -- so if the same address later comes back
-/// `active` (a restart), its next heartbeat makes it free again instead of
-/// it staying stuck as "assigned" forever. Returns how many users were
-/// released.
-pub async fn retire_instance(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<usize> {
-    let _: () = valkey.srem(FREE_POOL_KEY, addr).await?;
-    let tenants: Vec<String> = valkey.smembers(instance_tenants_key(addr)).await?;
+/// Releases every user assigned to node_id -- a drain-mode instance that
+/// just reported itself free, or one that went offline. Returns how many.
+pub async fn release_all(valkey: &mut Valkey, aq: &Aqueduct, node_id: &str) -> redis::RedisResult<usize> {
+    let scopes: Vec<String> = valkey.zrange(aq.assignments_key(node_id), 0, -1).await?;
     let mut released = 0;
-    for user_id in &tenants {
-        if release_user(valkey, user_id, addr).await? {
+    for hash in &scopes {
+        if release_scope(valkey, aq, hash, node_id).await? {
             released += 1;
         }
     }
-    let _: () = valkey.del(instance_tenants_key(addr)).await?;
-    let _: () = valkey.srem(ASSIGNED_KEY, addr).await?;
+    let _: () = valkey.del(aq.assignments_key(node_id)).await?;
     Ok(released)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    // Nanosecond timestamps alone aren't guaranteed unique -- two calls a
-    // few CPU cycles apart can return the identical value on real
-    // hardware (clock resolution isn't always truly nanosecond). Found
-    // this the hard way: it produced a same-tenant collision that looked
-    // like a real assign() bug. A monotonic counter closes the gap for
-    // real, regardless of clock resolution.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn unique(prefix: &str) -> String {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{prefix}-{nanos}-{n}")
+    pub(crate) fn unique(prefix: &str) -> String {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        format!("{prefix}-{nanos}-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
     }
 
-    async fn test_valkey() -> Valkey {
-        let client = redis::Client::open("redis://127.0.0.1:6379")
-            .expect("valid Valkey URL");
+    pub(crate) async fn test_valkey() -> Valkey {
+        let client = redis::Client::open("redis://127.0.0.1:6379").expect("valid Valkey URL");
         redis::aio::ConnectionManager::new(client)
             .await
             .expect("connect to a real local Valkey on 127.0.0.1:6379 -- required for these tests")
     }
 
-    async fn cleanup(valkey: &mut Valkey, addrs: &[&str], user_ids: &[&str]) {
-        for addr in addrs {
-            let _: redis::RedisResult<()> = valkey.srem(FREE_POOL_KEY, *addr).await;
-            let _: redis::RedisResult<()> = valkey.srem(ASSIGNED_KEY, *addr).await;
-            let _: redis::RedisResult<()> = valkey.del(instance_tenants_key(addr)).await;
-        }
-        for user_id in user_ids {
-            let _: redis::RedisResult<()> =
-                valkey.del(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}")).await;
+    /// Its own key prefix per test: nothing a test writes can be seen by
+    /// another test, or by a real Aquifer sharing the same Valkey.
+    pub(crate) fn test_aqueduct() -> Aqueduct {
+        Aqueduct {
+            prefix: format!("{}:", unique("test-aqueduct")),
+            assignment_ttl: Duration::from_secs(60),
+            instance_ttl: Duration::from_secs(60),
+            default_capacity: 100,
+            queue_at_percent: 80,
         }
     }
 
-    #[tokio::test]
-    async fn fresh_assignment_claims_a_free_instance() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr = unique("instance");
-        let user_id = unique("user");
-
-        let _: () = valkey.sadd(FREE_POOL_KEY, &addr).await.unwrap();
-
-        let outcome = assign(&mut valkey, &user_id).await.unwrap();
-        match outcome {
-            AssignOutcome::Assigned(got) => assert_eq!(got, addr),
-            AssignOutcome::PoolExhausted => panic!("expected an assignment, got PoolExhausted"),
-        }
-
-        let recorded: String = valkey
-            .get(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}"))
+    /// Deletes everything under the test's prefix.
+    pub(crate) async fn cleanup(valkey: &mut Valkey, aq: &Aqueduct) {
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{}*", aq.prefix))
+            .query_async(valkey)
             .await
-            .unwrap();
-        assert_eq!(recorded, addr);
-
-        let now_assigned: bool = valkey.sismember(ASSIGNED_KEY, &addr).await.unwrap();
-        assert!(now_assigned, "claimed instance should be recorded in canalis:assigned");
-
-        cleanup(&mut valkey, &[&addr], &[&user_id]).await;
-    }
-
-    #[tokio::test]
-    async fn assignment_is_sticky_across_repeat_calls() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr = unique("instance");
-        let user_id = unique("user");
-
-        let _: () = valkey.sadd(FREE_POOL_KEY, &addr).await.unwrap();
-
-        let first = match assign(&mut valkey, &user_id).await.unwrap() {
-            AssignOutcome::Assigned(a) => a,
-            AssignOutcome::PoolExhausted => panic!("expected an assignment"),
-        };
-
-        // Second call: pool is now empty, so if this weren't sticky (i.e.
-        // if it tried to claim a *new* instance instead of returning the
-        // existing assignment) it would come back PoolExhausted, not the
-        // same address.
-        let second = match assign(&mut valkey, &user_id).await.unwrap() {
-            AssignOutcome::Assigned(a) => a,
-            AssignOutcome::PoolExhausted => panic!("expected the same sticky assignment, not PoolExhausted"),
-        };
-
-        assert_eq!(first, second);
-        assert_eq!(first, addr);
-
-        cleanup(&mut valkey, &[&addr], &[&user_id]).await;
-    }
-
-    #[tokio::test]
-    async fn different_tenants_get_different_instances() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr_a = unique("instance-a");
-        let addr_b = unique("instance-b");
-        let user_1 = unique("user");
-        let user_2 = unique("user");
-
-        let _: () = valkey.sadd(FREE_POOL_KEY, &addr_a).await.unwrap();
-        let _: () = valkey.sadd(FREE_POOL_KEY, &addr_b).await.unwrap();
-
-        let got_1 = match assign(&mut valkey, &user_1).await.unwrap() {
-            AssignOutcome::Assigned(a) => a,
-            AssignOutcome::PoolExhausted => panic!("expected an assignment"),
-        };
-        let got_2 = match assign(&mut valkey, &user_2).await.unwrap() {
-            AssignOutcome::Assigned(a) => a,
-            AssignOutcome::PoolExhausted => panic!("expected an assignment"),
-        };
-
-        assert_ne!(got_1, got_2, "two tenants should never be handed the same instance");
-
-        cleanup(&mut valkey, &[&addr_a, &addr_b], &[&user_1, &user_2]).await;
-    }
-
-    #[tokio::test]
-    async fn pool_exhausted_when_nothing_is_free() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let user_id = unique("user");
-
-        // No SADD here -- deliberately asking for an assignment with
-        // nothing available. Doesn't touch/clear the shared pool key
-        // itself (other tests may have legitimate items queued right
-        // before/after this one under the same lock); a fresh user_id
-        // with nothing pre-seeded for it is enough to prove the miss path
-        // without asserting anything about global pool emptiness.
-        //
-        // This only proves the behavior when the pool is at zero for this
-        // attempt; it's possible (though the lock makes it unlikely given
-        // this test suite's own usage) for a leftover item from outside
-        // this test file to be claimed instead. Real isolation would
-        // require a dedicated test Valkey DB (SELECT n) or flushing
-        // before each test -- worth doing if this ever gets flaky.
-        let outcome = assign(&mut valkey, &user_id).await.unwrap();
-
-        // Only assert PoolExhausted if the pool key doesn't currently
-        // exist/have members -- otherwise this test would be asserting
-        // something it can't actually guarantee in a shared-key world.
-        let pool_size: usize = valkey.scard(FREE_POOL_KEY).await.unwrap_or(0);
-        if pool_size == 0 {
-            assert!(matches!(outcome, AssignOutcome::PoolExhausted));
+            .unwrap_or_default();
+        if !keys.is_empty() {
+            let _: redis::RedisResult<()> = valkey.del(keys).await;
         }
-
-        cleanup(&mut valkey, &[], &[&user_id]).await;
     }
 
-    #[tokio::test]
-    async fn register_if_free_skips_an_already_assigned_instance() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr = unique("instance");
+    pub(crate) fn node(id: &str) -> Member {
+        Member { id: id.into(), address: format!("http://{id}"), state: Some("active".into()), ..Default::default() }
+    }
 
-        let _: () = valkey.sadd(ASSIGNED_KEY, &addr).await.unwrap();
+    async fn assigned(valkey: &mut Valkey, aq: &Aqueduct, user: &str) -> Option<String> {
+        match assign(valkey, aq, user).await.unwrap() {
+            AssignOutcome::Assigned(node) => Some(node.id),
+            AssignOutcome::PoolExhausted => None,
+        }
+    }
 
-        register_if_free(&mut valkey, &addr).await.unwrap();
-
-        let in_pool: bool = valkey.sismember(FREE_POOL_KEY, &addr).await.unwrap();
-        assert!(
-            !in_pool,
-            "an already-assigned instance's heartbeat must not leak it back into the free pool"
+    #[test]
+    fn scope_hash_matches_aquifers_hash_key() {
+        // Lowercase hex SHA-256, what Go's hex.EncodeToString(sha256.Sum256(...)) gives.
+        assert_eq!(
+            scope_hash("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-
-        cleanup(&mut valkey, &[&addr], &[]).await;
     }
 
     #[tokio::test]
-    async fn retiring_a_draining_instance_releases_its_users_and_lets_it_return_later() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr = unique("instance-draining");
-        let user_id = unique("user");
+    async fn a_user_lands_on_an_instance_and_stays_there() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("a")).await.unwrap();
+        heartbeat(&mut v, &aq, &node("b")).await.unwrap();
 
-        let _: () = valkey.sadd(FREE_POOL_KEY, &addr).await.unwrap();
-        assert!(matches!(assign(&mut valkey, &user_id).await.unwrap(), AssignOutcome::Assigned(_)));
+        let first = assigned(&mut v, &aq, "acme").await;
+        let again = assigned(&mut v, &aq, "acme").await;
+        let stored: Option<String> = v.get(aq.assignment_key(&scope_hash("acme"))).await.unwrap();
+        cleanup(&mut v, &aq).await;
 
-        assert_eq!(retire_instance(&mut valkey, &addr).await.unwrap(), 1);
-        let assignment: Option<String> =
-            valkey.get(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}")).await.unwrap();
-        assert!(assignment.is_none(), "the user must be free to land somewhere else");
-        let in_pool: bool = valkey.sismember(FREE_POOL_KEY, &addr).await.unwrap();
-        assert!(!in_pool, "a draining node must not be handed new tenants");
-
-        // Restarted on the same address and back to `active`: it's free again.
-        assert!(register_if_free(&mut valkey, &addr).await.unwrap());
-
-        cleanup(&mut valkey, &[&addr], &[&user_id]).await;
+        assert!(first.is_some());
+        assert_eq!(first, again, "assignment is sticky");
+        assert_eq!(stored, first, "stored under Aquifer's own key shape");
     }
 
     #[tokio::test]
-    async fn release_user_never_clobbers_a_newer_assignment() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let user_id = unique("user");
-        let key = format!("{ASSIGNMENT_KEY_PREFIX}{user_id}");
-        let _: () = valkey.set(&key, "new-node").await.unwrap();
+    async fn many_users_share_an_instance_up_to_its_capacity_then_queue() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { capacity: 2, ..node("only") }).await.unwrap();
 
-        assert!(!release_user(&mut valkey, &user_id, "old-node").await.unwrap());
-        let still: String = valkey.get(&key).await.unwrap();
+        let one = assigned(&mut v, &aq, "u1").await;
+        let two = assigned(&mut v, &aq, "u2").await;
+        let three = assigned(&mut v, &aq, "u3").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(one.as_deref(), Some("only"));
+        assert_eq!(two.as_deref(), Some("only"));
+        assert_eq!(three, None, "strict: a full fleet means the line, not an overloaded instance");
+    }
+
+    #[tokio::test]
+    async fn an_instance_past_the_fullness_threshold_gets_no_new_users_but_keeps_its_own() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("busy")).await.unwrap();
+        let before = assigned(&mut v, &aq, "already-here").await;
+
+        record_fullness(&mut v, &aq, "busy", 85).await.unwrap();
+        let newcomer = assigned(&mut v, &aq, "newcomer").await;
+        let existing = assigned(&mut v, &aq, "already-here").await;
+
+        heartbeat(&mut v, &aq, &node("spare")).await.unwrap();
+        let newcomer_later = assigned(&mut v, &aq, "newcomer").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(before.as_deref(), Some("busy"));
+        assert_eq!(newcomer, None, "85% >= the 80% threshold: queue the newcomer");
+        assert_eq!(existing.as_deref(), Some("busy"), "users already there stay");
+        assert_eq!(newcomer_later.as_deref(), Some("spare"));
+    }
+
+    #[tokio::test]
+    async fn a_reserved_instance_only_takes_its_own_user() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { reserved_for: Some("vip".into()), ..node("vip-node") }).await.unwrap();
+
+        let stranger = assigned(&mut v, &aq, "stranger").await;
+        let owner = assigned(&mut v, &aq, "vip").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(stranger, None);
+        assert_eq!(owner.as_deref(), Some("vip-node"));
+    }
+
+    #[tokio::test]
+    async fn a_reserved_user_prefers_their_own_instance() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        for id in ["shared-1", "shared-2", "shared-3"] {
+            heartbeat(&mut v, &aq, &node(id)).await.unwrap();
+        }
+        heartbeat(&mut v, &aq, &Member { reserved_for: Some("vip".into()), ..node("vip-node") }).await.unwrap();
+
+        let owner = assigned(&mut v, &aq, "vip").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(owner.as_deref(), Some("vip-node"));
+    }
+
+    #[tokio::test]
+    async fn ws_instances_are_kept_out_of_http_routing() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { role: Some("ws".into()), ..node("ws-node") }).await.unwrap();
+
+        let user = assigned(&mut v, &aq, "acme").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn a_draining_instance_hands_its_users_to_another() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("leaving")).await.unwrap();
+        let before = assigned(&mut v, &aq, "acme").await;
+
+        heartbeat(&mut v, &aq, &Member { state: Some("draining".into()), ..node("leaving") }).await.unwrap();
+        heartbeat(&mut v, &aq, &node("staying")).await.unwrap();
+        let after = assigned(&mut v, &aq, "acme").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(before.as_deref(), Some("leaving"));
+        assert_eq!(after.as_deref(), Some("staying"));
+    }
+
+    #[tokio::test]
+    async fn release_all_frees_a_drain_mode_instance_for_the_next_tenant() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { capacity: 1, drain_state: Some("active".into()), ..node("drain") }).await.unwrap();
+        let first = assigned(&mut v, &aq, "tenant-1").await;
+        let blocked = assigned(&mut v, &aq, "tenant-2").await;
+
+        let released = release_all(&mut v, &aq, "drain").await.unwrap();
+        let next = assigned(&mut v, &aq, "tenant-2").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(first.as_deref(), Some("drain"));
+        assert_eq!(blocked, None, "one tenant at a time");
+        assert_eq!(released, 1);
+        assert_eq!(next.as_deref(), Some("drain"));
+    }
+
+    #[tokio::test]
+    async fn release_never_clobbers_a_newer_assignment() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        let _: () = v.set(aq.assignment_key(&scope_hash("acme")), "new-node").await.unwrap();
+
+        let released = release_user(&mut v, &aq, "acme", "old-node").await.unwrap();
+        let still: String = v.get(aq.assignment_key(&scope_hash("acme"))).await.unwrap();
+        cleanup(&mut v, &aq).await;
+
+        assert!(!released);
         assert_eq!(still, "new-node");
-
-        cleanup(&mut valkey, &[], &[&user_id]).await;
     }
 
     #[tokio::test]
-    async fn register_if_free_adds_a_genuinely_unassigned_instance() {
-        let _guard = TEST_LOCK.lock().await;
-        let mut valkey = test_valkey().await;
-        let addr = unique("instance");
+    async fn an_expired_instance_is_pruned_and_never_offered() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        let _: () = v.sadd(aq.instances_key(), "ghost").await.unwrap();
 
-        register_if_free(&mut valkey, &addr).await.unwrap();
+        let user = assigned(&mut v, &aq, "acme").await;
+        let still_listed: bool = v.sismember(aq.instances_key(), "ghost").await.unwrap();
+        cleanup(&mut v, &aq).await;
 
-        let in_pool: bool = valkey.sismember(FREE_POOL_KEY, &addr).await.unwrap();
-        assert!(in_pool, "a genuinely free instance should land in the pool");
-
-        cleanup(&mut valkey, &[&addr], &[]).await;
+        assert_eq!(user, None);
+        assert!(!still_listed);
     }
 }

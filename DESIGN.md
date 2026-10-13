@@ -63,28 +63,46 @@ Correction to the history below: Aquifer's `POST /jobs` answers `201`
 with a `job_id` acknowledgment, not a full SSE lifecycle; the lifecycle
 lives at `GET /jobs/{id}/stream`.
 
+**Built: Aquifer's shared assignment table.** Canalis no longer keeps its
+own `canalis:` registry and one-user-per-instance pool. A registration ping
+becomes the instance's record in Aquifer's Valkey cluster table
+(`aqueduct:instance:<id>` with Aquifer's ClusterMember JSON, plus Canalis's
+extra fields), and claims run Aquifer's own `assignClusterScopeScript` with
+one optional trailing argument, strict: when no candidate is under
+capacity, return nothing instead of the least-loaded instance, so Canalis
+queues rather than overloads. Without that argument the script behaves as
+Aquifer's. Candidates are ranked exactly as Aquifer ranks them
+(`sha256(id + ":" + user_id)`, ties by id). Before the script runs, Canalis
+drops instances at or past `CANALIS_QUEUE_AT_PERCENT` fullness (from the
+ping's `fullness` or any response's `X-Aqueduct-Fullness`, kept in
+`aqueduct:instance:<id>:fullness`), instances reserved for someone else,
+and `ws`-role instances; a user's own reserved instance comes first.
+Drain-mode instances have capacity 1 and are released on the transition to
+`drain_state: unassigned`. A `503` + draining answer marks the instance
+draining in its record right away. Verified against a real Aquifer in
+`AQUIFER_CLUSTER_PROVIDER=valkey` mode: a user claimed through Canalis is
+served by Aquifer as its own, and a user Aquifer claimed directly is found
+by Canalis.
+
 **Still to do, in order:**
 
-1. **L8 at the gate, and Aquifer's shared assignment.** Canalis
-   implements L8 itself, including v0.2 `request_schemas`: requests that
-   don't match a backend's published schema are blocked before they reach
-   any node. And Canalis moves onto Aquifer's `aqueduct:` Valkey keys and
-   Lua claim script, so Canalis and Aquifer nodes share one assignment
-   table (capacity-based, idle release) instead of Canalis's separate
-   one-user-per-node pool. Verify registration pings
+1. **L8 at the gate.** Canalis implements L8 itself, including v0.2
+   `request_schemas`: requests that don't match a backend's published
+   schema are blocked before they reach any node. Verify registration pings
    with L8: Aquifer only signs a delivery once the receiver has an L8
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
-   of L8, which overlaps the later trust-broker work. Support three node
-   kinds: drain-mode (exclusive, released when the node reports it's
-   free; how it reports that is an open question on the Aquifer side),
-   cluster (shared, using Aquifer's `aqueduct:` Valkey keys and the same
-   Lua claim script, with a contract test so the Go and Rust copies can't
-   drift), and reserved (an optional `reserved_for` user id in the
-   registration ping, e.g. from an `AQUIFER_REGISTRY_RESERVED_FOR`).
-2. **WebSocket forwarding**, routed by node role, with connection limits
+   of L8, which overlaps the later trust-broker work.
+2. **Pass instance response headers through.** Canalis relays a buffered
+   response's status, content type, and body, but not the instance's own
+   headers (`Retry-After` on a 429, `X-Aqueduct-*`); a caller should see
+   those.
+3. **A contract test that the claim script can't drift** between
+   Aquifer's Go copy and Canalis's Rust copy (and Aquifer taking the same
+   optional strict argument, so there's one canonical script).
+4. **WebSocket forwarding**, routed by node role, with connection limits
    and graceful drain.
-3. Later: line length as the signal to scale out more nodes.
+5. Later: line length as the signal to scale out more nodes.
 
 Everything below is the earlier design history, kept for the record.
 
