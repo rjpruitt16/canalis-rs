@@ -17,6 +17,24 @@ pub(crate) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 const ASSIGNMENT_KEY_PREFIX: &str = "canalis:assignment:";
 const FREE_POOL_KEY: &str = "canalis:pool:free";
 const ASSIGNED_KEY: &str = "canalis:assigned";
+// addr -> the user_ids assigned to it: the reverse of
+// canalis:assignment:<user_id>, so a node that starts draining can hand
+// its users back without scanning every assignment key.
+const INSTANCE_TENANTS_PREFIX: &str = "canalis:instance_tenants:";
+
+fn instance_tenants_key(addr: &str) -> String {
+    format!("{INSTANCE_TENANTS_PREFIX}{addr}")
+}
+
+// Deletes an assignment only if it still points at the given address, so
+// releasing a user from a draining node can never clobber a newer
+// assignment someone else already made for them.
+const RELEASE_IF_STILL_ASSIGNED: &str = r"
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+";
 
 pub enum AssignOutcome {
     Assigned(String),
@@ -45,6 +63,7 @@ pub async fn assign(valkey: &mut Valkey, user_id: &str) -> redis::RedisResult<As
     let won: bool = valkey.set_nx(&assignment_key, &addr).await?;
     if won {
         let _: () = valkey.sadd(ASSIGNED_KEY, &addr).await?;
+        let _: () = valkey.sadd(instance_tenants_key(&addr), user_id).await?;
         return Ok(AssignOutcome::Assigned(addr));
     }
 
@@ -83,6 +102,40 @@ pub async fn register_if_free(valkey: &mut Valkey, addr: &str) -> redis::RedisRe
     Ok(added > 0)
 }
 
+/// Releases user_id from addr, if that's still where they're assigned.
+/// Their next request resolves a fresh assignment (or waits in line).
+/// addr itself is NOT returned to the free pool -- this is for a node
+/// that's draining, which shouldn't be handed new tenants.
+pub async fn release_user(valkey: &mut Valkey, user_id: &str, addr: &str) -> redis::RedisResult<bool> {
+    let released: i64 = redis::Script::new(RELEASE_IF_STILL_ASSIGNED)
+        .key(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}"))
+        .arg(addr)
+        .invoke_async(valkey)
+        .await?;
+    let _: () = valkey.srem(instance_tenants_key(addr), user_id).await?;
+    Ok(released > 0)
+}
+
+/// Takes addr out of rotation because it reported `draining` or `offline`:
+/// it leaves the free pool, every user assigned to it is released, and it
+/// stops counting as assigned -- so if the same address later comes back
+/// `active` (a restart), its next heartbeat makes it free again instead of
+/// it staying stuck as "assigned" forever. Returns how many users were
+/// released.
+pub async fn retire_instance(valkey: &mut Valkey, addr: &str) -> redis::RedisResult<usize> {
+    let _: () = valkey.srem(FREE_POOL_KEY, addr).await?;
+    let tenants: Vec<String> = valkey.smembers(instance_tenants_key(addr)).await?;
+    let mut released = 0;
+    for user_id in &tenants {
+        if release_user(valkey, user_id, addr).await? {
+            released += 1;
+        }
+    }
+    let _: () = valkey.del(instance_tenants_key(addr)).await?;
+    let _: () = valkey.srem(ASSIGNED_KEY, addr).await?;
+    Ok(released)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,6 +171,7 @@ mod tests {
         for addr in addrs {
             let _: redis::RedisResult<()> = valkey.srem(FREE_POOL_KEY, *addr).await;
             let _: redis::RedisResult<()> = valkey.srem(ASSIGNED_KEY, *addr).await;
+            let _: redis::RedisResult<()> = valkey.del(instance_tenants_key(addr)).await;
         }
         for user_id in user_ids {
             let _: redis::RedisResult<()> =
@@ -256,6 +310,44 @@ mod tests {
         );
 
         cleanup(&mut valkey, &[&addr], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn retiring_a_draining_instance_releases_its_users_and_lets_it_return_later() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut valkey = test_valkey().await;
+        let addr = unique("instance-draining");
+        let user_id = unique("user");
+
+        let _: () = valkey.sadd(FREE_POOL_KEY, &addr).await.unwrap();
+        assert!(matches!(assign(&mut valkey, &user_id).await.unwrap(), AssignOutcome::Assigned(_)));
+
+        assert_eq!(retire_instance(&mut valkey, &addr).await.unwrap(), 1);
+        let assignment: Option<String> =
+            valkey.get(format!("{ASSIGNMENT_KEY_PREFIX}{user_id}")).await.unwrap();
+        assert!(assignment.is_none(), "the user must be free to land somewhere else");
+        let in_pool: bool = valkey.sismember(FREE_POOL_KEY, &addr).await.unwrap();
+        assert!(!in_pool, "a draining node must not be handed new tenants");
+
+        // Restarted on the same address and back to `active`: it's free again.
+        assert!(register_if_free(&mut valkey, &addr).await.unwrap());
+
+        cleanup(&mut valkey, &[&addr], &[&user_id]).await;
+    }
+
+    #[tokio::test]
+    async fn release_user_never_clobbers_a_newer_assignment() {
+        let _guard = TEST_LOCK.lock().await;
+        let mut valkey = test_valkey().await;
+        let user_id = unique("user");
+        let key = format!("{ASSIGNMENT_KEY_PREFIX}{user_id}");
+        let _: () = valkey.set(&key, "new-node").await.unwrap();
+
+        assert!(!release_user(&mut valkey, &user_id, "old-node").await.unwrap());
+        let still: String = valkey.get(&key).await.unwrap();
+        assert_eq!(still, "new-node");
+
+        cleanup(&mut valkey, &[], &[&user_id]).await;
     }
 
     #[tokio::test]

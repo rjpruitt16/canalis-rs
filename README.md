@@ -26,13 +26,13 @@ Health-check-driven failover also tends to flap: a backend gets overwhelmed, is 
 
 This is the core mechanism the rest of the design exists to support. Aquifer's own pacing adapts a single instance's dispatch rate to what its backend can absorb; Canalis adapts its own dispatch rate to what a *specific fleet instance* can absorb, using the same idea one layer further out.
 
-When an instance frees up, Canalis doesn't just release one queued job and wait for the next heartbeat — it drains that tenant's entire backlog, dispatched concurrently via a `tokio::task::JoinSet`, starting conservative (1 concurrent, 2rps, Aquifer's own defaults) and adjusting live from what the instance reports on each response: `X-Canalis-Max-Concurrent` / `X-Canalis-Rps`, falling back to Aquifer's own `X-Aqueduct-*` / `X-Aquifer-*` names if that's the simpler thing for an instance to emit. No separate coordination needed to make this work across multiple Canalis processes either — the backlog itself lives in Valkey, not in any one process's memory, so several processes each reacting to their own registration events already drain safely in parallel.
+When an instance frees up, Canalis doesn't just release one queued job and wait for the next heartbeat — it drains that tenant's entire backlog, dispatched concurrently via a `tokio::task::JoinSet`, starting conservative (1 concurrent, 2rps, Aquifer's own defaults) and adjusting live from what the instance reports on each response: `X-Canalis-Max-Concurrent` / `X-Canalis-Rps`, falling back to Aquifer's own `X-Aqueduct-*` / `X-Aquifer-*` names if that's the simpler thing for an instance to emit. Each Canalis node drains its own line: on every new registration it receives, and on a periodic sweep, so a line still drains when the freed instance happened to register with a different Canalis node.
 
 ## How this scales Aquifer and Spillway
 
 **Sticky assignment.** One `user_id`, one instance, for the instance's lifetime — resolved once via `SET ... NX` against Valkey and never re-decided, so a tenant's whole history lands on one instance's own account-queue instead of fragmenting.
 
-**A shared pool with a durable fallback.** Free instances sit in a community pool; when it's genuinely empty, a tenant's job durably enqueues per-tenant in Valkey rather than being dropped or held in an in-memory retry loop that dies with the process. The bet: fleet size scales with *machines*, and most tenants just need that gap between "capacity exists" and "capacity is running right now" absorbed gracefully, rather than dedicated infrastructure of their own. Millions of active users doesn't mean millions of simultaneous instances.
+**A shared pool with a waiting line.** Free instances sit in a community pool; when it's genuinely empty, a tenant's job goes into Canalis's line, on the Canalis node's own disk (redb), rather than being dropped or held in an in-memory retry loop that dies with the process. Whoever has waited longest is handed the next free instance. The line is bounded on purpose: past its limits Canalis answers `429` with `Retry-After` instead of growing, because queueing in front of capacity that isn't coming just hides an outage. The bet: fleet size scales with *machines*, and most tenants just need that gap between "capacity exists" and "capacity is running right now" absorbed gracefully, rather than dedicated infrastructure of their own. Millions of active users doesn't mean millions of simultaneous instances.
 
 **Reserved instances for guaranteed capacity** (designed, not yet shipped — see `DESIGN.md`). An instance can register as dedicated to one `user_id` and never enter the community pool, for tenants needing guaranteed unshared capacity rather than a fair share of a pool. Canalis assumes it sits behind an API gateway that's already authenticated the caller, so it needs no credential system of its own — the gateway is the trust boundary.
 
@@ -42,7 +42,7 @@ Needs a running Valkey (or Redis) instance and at least one Aquifer or Spillway 
 
 ```bash
 docker build -t canalis-rs .
-docker run -p 8080:8080 -e CANALIS_VALKEY_URL=redis://your-valkey-host:6379 canalis-rs
+docker run -p 8080:8080 -v $(pwd)/data:/data -e CANALIS_VALKEY_URL=redis://your-valkey-host:6379 canalis-rs
 ```
 
 ```bash
@@ -54,3 +54,31 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 `/register` takes the port an instance listens on (its address is derived from the caller's connecting IP plus that port) and re-sends on every heartbeat; a registration expires on its own if pings stop, with no explicit deregistration call.
 
 `/proxy` and `/jobs` mirror Aquifer's own request body shape exactly, so a caller already speaking Aquifer's API can point at Canalis with no translation layer.
+
+Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`.
+
+When no instance is free, the caller's connection becomes a stream from Canalis's line. Canalis's own events are prefixed `canalis_` so they're never confused with the node's queue:
+
+```
+event: canalis_queued      data: {"ahead":3,"reason":"no_instance_free","status":"/jobs/k1?user_id=acme"}
+event: canalis_position    data: {"ahead":1}
+event: canalis_assigned    data: {"job_id":"..."}        (job_id for /jobs callers)
+event: queued / completed  ...                           (the node's own stream, /jobs callers)
+event: canalis_result      data: {"status":200,"body":"..."}  (a /proxy answer that isn't a stream)
+event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in line; stream closing)
+```
+
+`GET /jobs/{idempotent_key}?user_id=...` answers with the finished result, `202 {"status":"queued","ahead":N}`, or `404`. The line is per Canalis node, so ask the node that queued it.
+
+| Env var | Default | Description |
+|---|---|---|
+| `CANALIS_VALKEY_URL` | `redis://127.0.0.1:6379` | Assignment state and instance registry |
+| `CANALIS_LINE_PATH` | `canalis-line.redb` | The waiting line's file (`/data/canalis-line.redb` in the Docker image) |
+| `CANALIS_LINE_MAX_JOBS` | `10000` | Jobs in line before new ones get `429` |
+| `CANALIS_LINE_MAX_PER_TENANT` | `1000` | One tenant's share of the line, so a single burst can't fill it |
+| `CANALIS_LINE_MAX_BYTES` | `268435456` (256MB) | Total size of queued job bodies |
+| `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full-line `429` |
+| `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a drained job's result stays available |
+| `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked against free instances (also runs at startup, which is crash recovery) |
+| `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
+| `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |

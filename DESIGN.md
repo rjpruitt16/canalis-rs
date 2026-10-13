@@ -1,5 +1,95 @@
 # Canalis — design doc
 
+## Direction (October 2026)
+
+**Canalis owns connections and admission; Aquifer and Spillway own the
+work.** Canalis blocks, holds, moves bytes, and tells waiting callers where
+they stand. It does not pace backends, retry against them, or deliver
+webhooks: that is what the nodes it routes to already do, and a third
+implementation of those semantics (after Go and Elixir) is a maintenance
+cost with no upside. Benchmarks on Aquifer also show a node does better
+focused on one kind of traffic, which is a job Canalis can do for the
+fleet: route WebSocket and HTTP traffic to nodes dedicated to each.
+
+**Built: the line** (`src/line.rs`). When no instance is free, a job waits
+in a durable, bounded line on the Canalis node's own disk (redb), not in
+Valkey. Oldest waiter is served first; a retried submission keeps its
+place instead of taking a second one; a tenant can hold at most
+`CANALIS_LINE_MAX_PER_TENANT` of it; past `CANALIS_LINE_MAX_JOBS` /
+`CANALIS_LINE_MAX_BYTES` Canalis answers `429` + `Retry-After` (same body
+shape as Aquifer's admission rejections) rather than growing. A job taken
+out for handoff that can't be placed goes back in its original position.
+A sweep at startup and every `CANALIS_LINE_SWEEP_SECONDS` drains the line
+against free instances, which is also crash recovery. Proven with a real
+abort-mid-write test and an end-to-end `kill -9` / restart run.
+`GET /jobs/{idempotent_key}?user_id=` reports the result or place in line.
+Tradeoffs, chosen deliberately: the line is per node, so a dead Canalis
+node's waiters wait for it to come back (the same tradeoff Aquifer makes
+with local SQLite), and status has to be asked of the node that queued it.
+Valkey still holds assignment state.
+
+**Built: node lifecycle.** A registration ping with `state: draining` or
+`offline` takes the node out of the free pool and releases its users
+(`canalis:instance_tenants:<addr>` is the reverse index that makes this
+possible); a release only deletes an assignment that still points at that
+node, so it can't clobber a newer one. The same address coming back
+`active` (a restart) rejoins the pool instead of staying "assigned"
+forever. A request that hits a node answering `503` +
+`X-Aqueduct-Node-State: draining` before its ping arrives is re-routed
+once (another node, or the line); a drain that hits one puts the job back
+in line in its original place instead of storing the 503 as its result.
+Verified against a real Aquifer binary: register, serve through Canalis,
+`SIGTERM`, released, restart on the same port, serving again. Spillway's
+ping doesn't send `state` yet (treated as `active`).
+
+**Built: the waiting room.** A caller who has to wait in line gets an
+SSE stream instead of a blocking request, the same way Aquifer's own
+`/proxy` turns into a stream when it has to queue. Canalis's own events
+are prefixed so nobody mistakes Canalis's line for the node's queue:
+`canalis_queued` (`ahead`, `status` link), `canalis_position` as the line
+moves (one pass over the line per tick for every waiting caller,
+`CANALIS_POSITION_INTERVAL_MS`), `canalis_assigned`, then the node's own
+answer: a `/proxy` caller gets the node's `/proxy` response live (the
+upstream's answer as `canalis_result`, or the node's queue stream spliced
+in byte for byte); a `/jobs` caller gets `canalis_assigned` with the
+node's `job_id` and then stays on the line through the node's own
+`GET /jobs/{id}/stream` (`queued`, `position`, `dispatching`,
+`completed`). Past `CANALIS_POOL_WAIT_TIMEOUT_MS` the stream ends with
+`canalis_timeout`; the job stays in line. The line remembers which path
+the caller used, so the node gets the job the same way. Verified against
+two real Aquifer nodes started while both callers were waiting.
+
+Correction to the history below: Aquifer's `POST /jobs` answers `201`
+with a `job_id` acknowledgment, not a full SSE lifecycle; the lifecycle
+lives at `GET /jobs/{id}/stream`.
+
+**Still to do, in order:**
+
+1. **L8 at the gate, and Aquifer's shared assignment.** Canalis
+   implements L8 itself, including v0.2 `request_schemas`: requests that
+   don't match a backend's published schema are blocked before they reach
+   any node. And Canalis moves onto Aquifer's `aqueduct:` Valkey keys and
+   Lua claim script, so Canalis and Aquifer nodes share one assignment
+   table (capacity-based, idle release) instead of Canalis's separate
+   one-user-per-node pool. Verify registration pings
+   with L8: Aquifer only signs a delivery once the receiver has an L8
+   trust established, and Canalis doesn't implement the receiving side
+   yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
+   of L8, which overlaps the later trust-broker work. Support three node
+   kinds: drain-mode (exclusive, released when the node reports it's
+   free; how it reports that is an open question on the Aquifer side),
+   cluster (shared, using Aquifer's `aqueduct:` Valkey keys and the same
+   Lua claim script, with a contract test so the Go and Rust copies can't
+   drift), and reserved (an optional `reserved_for` user id in the
+   registration ping, e.g. from an `AQUIFER_REGISTRY_RESERVED_FOR`).
+2. **WebSocket forwarding**, routed by node role, with connection limits
+   and graceful drain.
+3. Later: line length as the signal to scale out more nodes.
+
+Everything below is the earlier design history, kept for the record.
+
+---
+
 Status: registration, assignment (community pool only), and request
 forwarding — both buffered and live-streamed — are built and verified
 end-to-end. `POST /proxy` and `POST /jobs` resolve the assignment,
@@ -12,6 +102,9 @@ Axum's `Body::from_stream` — genuinely proven, not assumed: a mock
 sending two chunks 2 seconds apart showed the client receiving them
 2.007s apart too, ruling out Canalis secretly buffering the whole
 response before relaying it.
+
+*(Superseded October 2026: the Valkey-backed queue described in the next
+few paragraphs was replaced by the local line, see "Direction" above.)*
 
 **Pool exhaustion now queues durably (`account_queue.rs`), not via an
 in-memory retry loop.** The retry-loop version (an earlier iteration of

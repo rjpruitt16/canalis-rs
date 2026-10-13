@@ -8,5 +8,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/canalis-rs .
+# The waiting line lives on local disk; mount a volume here so it
+# survives the container being replaced, not just the process restarting.
+ENV CANALIS_LINE_PATH=/data/canalis-line.redb
+VOLUME /data
 EXPOSE 8080
 CMD ["./canalis-rs"]
