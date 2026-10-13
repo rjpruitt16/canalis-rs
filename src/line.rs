@@ -73,11 +73,16 @@ impl LineLimits {
 /// The finished outcome of a drained job -- everything the still-waiting
 /// connection (or GET /jobs/{key}) needs to rebuild the response it would
 /// have gotten synchronously.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct CachedResult {
     pub status: u16,
     pub content_type: String,
     pub body: String,
+    /// The instance's own response headers worth passing on (Retry-After,
+    /// X-Aqueduct-*), other than the content type. Absent in results
+    /// stored before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -569,7 +574,7 @@ mod tests {
     #[test]
     fn a_finished_job_resubmitted_returns_its_cached_result() {
         let (line, _dir) = open(LineLimits::default());
-        let result = CachedResult { status: 200, content_type: "text/plain".into(), body: "ok".into() };
+        let result = CachedResult { status: 200, content_type: "text/plain".into(), body: "ok".into(), ..Default::default() };
         line.store_result("a", "k", &result).unwrap();
 
         match line.enqueue(&job("a", "k"), "/jobs").unwrap() {
@@ -626,7 +631,7 @@ mod tests {
         assert!(matches!(line.lookup("nobody", "1").unwrap(), Lookup::Unknown));
 
         line.pop_for("b").unwrap();
-        let result = CachedResult { status: 200, content_type: String::new(), body: "done".into() };
+        let result = CachedResult { status: 200, content_type: String::new(), body: "done".into(), ..Default::default() };
         line.store_result("b", "1", &result).unwrap();
         assert!(matches!(line.lookup("b", "1").unwrap(), Lookup::Done(_)));
     }
@@ -674,7 +679,7 @@ mod tests {
     fn expired_results_are_swept() {
         let limits = LineLimits { result_ttl_seconds: 0, ..LineLimits::default() };
         let (line, _dir) = open(limits);
-        let result = CachedResult { status: 200, content_type: String::new(), body: String::new() };
+        let result = CachedResult { status: 200, content_type: String::new(), body: String::new(), ..Default::default() };
         line.store_result("a", "1", &result).unwrap();
 
         assert!(line.get_result("a", "1").unwrap().is_none(), "a 0s TTL is expired immediately");

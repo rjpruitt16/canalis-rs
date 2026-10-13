@@ -665,6 +665,7 @@ async fn dispatch_drained_job(
                 content_type: "application/json".into(),
                 body: serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") })
                     .to_string(),
+                headers: Vec::new(),
             };
             let waiter = take_waiter(waiters, job);
             finish_drained_job(line, job, cached, waiter, false).await;
@@ -674,6 +675,7 @@ async fn dispatch_drained_job(
 
     let pacing = PacingSignal::from_headers(resp.headers());
     remember_fullness(&state.valkey, &state.aqueduct, &node.id, resp.headers());
+    let stored_headers = headers_to_store(resp.headers());
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
@@ -722,13 +724,19 @@ async fn dispatch_drained_job(
 
     let mut already_streamed = streams && read_failed.is_none();
     let cached = match read_failed {
-        None => line::CachedResult { status, content_type, body: String::from_utf8_lossy(&body).into_owned() },
+        None => line::CachedResult {
+            status,
+            content_type,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            headers: stored_headers,
+        },
         Some(err) => {
             tracing::error!("failed to read drained response body from {addr}: {err}");
             line::CachedResult {
                 status: 502,
                 content_type: "application/json".into(),
                 body: serde_json::json!({ "error": "failed to read upstream response" }).to_string(),
+                headers: Vec::new(),
             }
         }
     };
@@ -825,6 +833,7 @@ async fn finish_drained_job(
             serde_json::json!({
                 "status": cached.status,
                 "content_type": cached.content_type,
+                "headers": cached.headers.iter().cloned().collect::<HashMap<_, _>>(),
                 "body": cached.body,
             }),
         )
@@ -1127,16 +1136,16 @@ async fn forward_attempt(
         return response;
     }
 
-    let content_type = upstream
+    let streams = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
 
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_headers = upstream.headers().clone();
 
-    if content_type.starts_with("text/event-stream") {
+    if streams {
         // Live relay, not buffered: bytes_stream() yields chunks as they
         // arrive from the assigned instance, and Body::from_stream feeds
         // them to our own caller as they arrive too -- reqwest and axum
@@ -1151,9 +1160,8 @@ async fn forward_attempt(
         // unexpected close: reconnect, not treat it as a different kind
         // of failure needing special handling here.
         let stream = upstream.bytes_stream();
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
-            .header(axum::http::header::CONTENT_TYPE, content_type)
             .body(Body::from_stream(stream))
             .unwrap_or_else(|_| {
                 Response::builder()
@@ -1161,6 +1169,8 @@ async fn forward_attempt(
                     .body(Body::empty())
                     .expect("a hardcoded empty error response should always build")
             });
+        relay_headers(&upstream_headers, response.headers_mut());
+        return response;
     }
 
     let body = match upstream.bytes().await {
@@ -1174,16 +1184,66 @@ async fn forward_attempt(
         }
     };
 
-    let mut builder = Response::builder().status(status);
-    if !content_type.is_empty() {
-        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
-    }
-    builder.body(Body::from(body)).unwrap_or_else(|_| {
+    let mut response = Response::builder().status(status).body(Body::from(body)).unwrap_or_else(|_| {
         Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
             .body(Body::empty())
             .expect("a hardcoded empty error response should always build")
+    });
+    relay_headers(&upstream_headers, response.headers_mut());
+    response
+}
+
+// Hop-by-hop headers (RFC 9110 section 7.6.1) describe one connection,
+// not the response, so a proxy must not pass them on. Content-Length is
+// left to the body Canalis actually sends.
+const NOT_RELAYED: [&str; 10] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+];
+
+// The instance's response headers that should reach the caller as-is:
+// Retry-After on a 429, the X-Aqueduct-* load and pacing headers,
+// X-Aqueduct-Node-State, the content type -- everything except hop-by-hop
+// headers and anything the instance's Connection header names as
+// connection-specific.
+fn relayed_headers(
+    from: &reqwest::header::HeaderMap,
+) -> impl Iterator<Item = (&reqwest::header::HeaderName, &reqwest::header::HeaderValue)> {
+    let named_by_connection: Vec<String> = from
+        .get_all(reqwest::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|name| name.trim().to_ascii_lowercase())
+        .collect();
+    from.iter().filter(move |(name, _)| {
+        let name = name.as_str();
+        !NOT_RELAYED.contains(&name) && !named_by_connection.iter().any(|n| n == name)
     })
+}
+
+fn relay_headers(from: &reqwest::header::HeaderMap, to: &mut axum::http::HeaderMap) {
+    for (name, value) in relayed_headers(from) {
+        to.append(name.clone(), value.clone());
+    }
+}
+
+// The same headers, kept with a drained job's stored result (the content
+// type has its own field there).
+fn headers_to_store(from: &reqwest::header::HeaderMap) -> Vec<(String, String)> {
+    relayed_headers(from)
+        .filter(|(name, _)| *name != reqwest::header::CONTENT_TYPE)
+        .filter_map(|(name, value)| Some((name.as_str().to_string(), value.to_str().ok()?.to_string())))
+        .collect()
 }
 
 fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
@@ -1255,6 +1315,9 @@ fn cached_result_response(cached: line::CachedResult) -> Response {
     let mut builder = Response::builder().status(status);
     if !cached.content_type.is_empty() {
         builder = builder.header(axum::http::header::CONTENT_TYPE, cached.content_type);
+    }
+    for (name, value) in &cached.headers {
+        builder = builder.header(name.as_str(), value.as_str());
     }
     builder.body(Body::from(cached.body)).unwrap_or_else(|_| {
         Response::builder()
@@ -1344,6 +1407,7 @@ mod tests {
             Response::builder()
                 .status(200)
                 .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .header("X-Aqueduct-Queue-Depth", "3")
                 .body(Body::from_stream(ReceiverStream::new(rx)))
                 .expect("a hardcoded streaming response should always build")
         }
@@ -1373,6 +1437,7 @@ mod tests {
 
         let response = forward(state, job_for(&user_id), "/proxy").await;
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-aqueduct-queue-depth"], "3", "streamed responses relay headers too");
 
         let mut body = response.into_body();
         let start = Instant::now();
@@ -1453,6 +1518,74 @@ mod tests {
     // The order the waiting room's events (and the node's) arrived in.
     fn event_names(stream: &str) -> Vec<&str> {
         stream.lines().filter_map(|l| l.strip_prefix("event: ")).collect()
+    }
+
+    // Answers the way an overloaded Aquifer does, plus the headers a proxy
+    // must not pass on.
+    async fn start_rejecting_mock() -> String {
+        async fn handler() -> Response {
+            Response::builder()
+                .status(429)
+                .header("Retry-After", "7")
+                .header("X-Aqueduct-Rps", "2.00")
+                .header("X-Aqueduct-Fullness", "93")
+                .header("Connection", "close, X-Hop-Only")
+                .header("X-Hop-Only", "secret")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"admission rejected"}"#))
+                .expect("a hardcoded response should always build")
+        }
+        let app = Router::new().route("/proxy", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn an_instances_own_headers_reach_the_caller() {
+        let (state, _dir) = test_state().await;
+        let addr = start_rejecting_mock().await;
+        register_node(&state, &addr).await;
+
+        let response = forward_with_config(state.clone(), job_for("acme"), "/proxy", &short_retry_config()).await;
+        cleanup(&state).await;
+
+        let headers = response.headers();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(headers["retry-after"], "7", "the instance's own Retry-After reaches the caller");
+        assert_eq!(headers["x-aqueduct-rps"], "2.00");
+        assert_eq!(headers["x-aqueduct-fullness"], "93");
+        assert_eq!(headers["content-type"], "application/json");
+        assert!(headers.get("connection").is_none(), "hop-by-hop headers stay behind");
+        assert!(headers.get("x-hop-only").is_none(), "so does anything Connection names");
+        assert_eq!(headers.get_all("content-type").iter().count(), 1, "relayed once, not twice");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_caller_also_gets_the_instances_headers() {
+        let (state, _dir) = test_state().await;
+        let addr = start_rejecting_mock().await;
+        let job = job_for("acme");
+        let key = job.idempotent_key.clone();
+
+        let task_state = state.clone();
+        let task_addr = addr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            register_node(&task_state, &task_addr).await;
+            try_drain_one(task_state).await.unwrap();
+        });
+        let stream = read_all(forward_with_config(state.clone(), job, "/proxy", &generous_wait_retry_config()).await).await;
+        let later = job_status(State(state.clone()), Path(key), Query(StatusQuery { user_id: "acme".into() })).await;
+        cleanup(&state).await;
+
+        assert!(stream.contains(r#""retry-after":"7""#), "canalis_result carries the instance's headers: {stream}");
+        assert!(!stream.contains("x-hop-only"), "but not hop-by-hop ones");
+        assert_eq!(later.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(later.headers()["retry-after"], "7", "and so does the stored result");
     }
 
     #[tokio::test]
@@ -1777,7 +1910,7 @@ mod tests {
         assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["ahead"], 1);
 
         state.line.pop_for(&user_id).unwrap();
-        let result = line::CachedResult { status: 201, content_type: String::new(), body: "made".into() };
+        let result = line::CachedResult { status: 201, body: "made".into(), ..Default::default() };
         state.line.store_result(&user_id, &job.idempotent_key, &result).unwrap();
         assert_eq!(ask(state.clone()).await.status(), StatusCode::CREATED);
     }
