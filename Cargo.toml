@@ -6,6 +6,7 @@ license = "Apache-2.0"
 
 [dependencies]
 axum = "0.8.9"
+jsonschema = { version = "0.58.6", default-features = false }
 redb = "2.6.4"
 redis = { version = "1.6.0", features = ["connection-manager", "tokio-comp"] }
 reqwest = { version = "0.13.4", features = ["json", "stream"] }
