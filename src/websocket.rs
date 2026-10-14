@@ -52,6 +52,10 @@ impl Sockets {
         Self { open: AtomicUsize::new(0), max }
     }
 
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::SeqCst)
+    }
+
     fn try_open(self: &Arc<Self>) -> Option<OpenSocket> {
         let previous = self.open.fetch_add(1, Ordering::SeqCst);
         if previous >= self.max {
@@ -99,6 +103,9 @@ pub async fn handler(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if state.lifecycle.is_draining() {
+        return crate::lifecycle::draining_response();
+    }
     let Some(slot) = state.sockets.try_open() else {
         let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "too many WebSocket connections on this Canalis node");
         response.headers_mut().insert("Retry-After", HeaderValue::from(1u32));
@@ -227,29 +234,37 @@ async fn connect(node: &assign::Node, query: &str, headers: &HeaderMap) -> Resul
 
 // Moves frames both ways until either side closes, renewing the session's
 // assignment while it's open so it can't idle out from under a long-lived
-// socket.
+// socket. If this Canalis node starts draining, the client gets Aquifer's
+// own `server_draining` status, then a 1012 close after the grace period,
+// and reconnects through the gateway.
 async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assign::Node, user: String, _slot: OpenSocket) {
-    let (mut client_tx, mut client_rx) = client.split();
-    let (mut upstream_tx, mut upstream_rx) = upstream.split();
+    let (client_tx, mut client_rx) = client.split();
+    let (upstream_tx, mut upstream_rx) = upstream.split();
+    let client_tx = Arc::new(tokio::sync::Mutex::new(client_tx));
+    let upstream_tx = Arc::new(tokio::sync::Mutex::new(upstream_tx));
 
-    let to_upstream = async {
-        while let Some(Ok(message)) = client_rx.next().await {
-            let closing = matches!(message, ws::Message::Close(_));
-            if upstream_tx.send(to_tungstenite(message)).await.is_err() || closing {
-                break;
+    let to_upstream = {
+        let upstream_tx = upstream_tx.clone();
+        async move {
+            while let Some(Ok(message)) = client_rx.next().await {
+                let closing = matches!(message, ws::Message::Close(_));
+                if upstream_tx.lock().await.send(to_tungstenite(message)).await.is_err() || closing {
+                    break;
+                }
             }
         }
-        let _ = upstream_tx.close().await;
     };
-    let to_client = async {
-        while let Some(Ok(message)) = upstream_rx.next().await {
-            let Some(message) = to_axum(message) else { continue };
-            let closing = matches!(message, ws::Message::Close(_));
-            if client_tx.send(message).await.is_err() || closing {
-                break;
+    let to_client = {
+        let client_tx = client_tx.clone();
+        async move {
+            while let Some(Ok(message)) = upstream_rx.next().await {
+                let Some(message) = to_axum(message) else { continue };
+                let closing = matches!(message, ws::Message::Close(_));
+                if client_tx.lock().await.send(message).await.is_err() || closing {
+                    break;
+                }
             }
         }
-        let _ = client_tx.close().await;
     };
     let renew = async {
         let every = (state.aqueduct.assignment_ttl / 3).max(Duration::from_secs(1));
@@ -260,12 +275,33 @@ async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assi
             last = Instant::now();
         }
     };
+    let canalis_draining = {
+        let client_tx = client_tx.clone();
+        let lifecycle = state.lifecycle.clone();
+        async move {
+            lifecycle.drained().await;
+            let grace = lifecycle.config.ws_grace;
+            let notice = serde_json::json!({
+                "type": "status",
+                "state": "server_draining",
+                "reason": "reconnect through the gateway",
+                "retry_after_ms": grace.as_millis() as u64,
+            });
+            let _ = client_tx.lock().await.send(ws::Message::Text(notice.to_string().into())).await;
+            tokio::time::sleep(grace).await;
+            let close = ws::CloseFrame { code: 1012, reason: "canalis is draining; reconnect through the gateway".into() };
+            let _ = client_tx.lock().await.send(ws::Message::Close(Some(close))).await;
+        }
+    };
 
     tokio::select! {
         _ = to_upstream => {}
         _ = to_client => {}
         _ = renew => {}
+        _ = canalis_draining => {}
     }
+    let _ = client_tx.lock().await.close().await;
+    let _ = upstream_tx.lock().await.close().await;
     tracing::debug!("WebSocket session for {user} on {} closed", node.id);
 }
 

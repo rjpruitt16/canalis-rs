@@ -115,8 +115,12 @@ by Canalis.
    through the shared table, piped untouched, `503` when no instance has
    room, a draining instance skipped; the whole Aquifer/Spillway WebSocket
    contract passes through Canalis (aqueduct-runner `test-canalis-websocket`).
-   Not done: a waiting room for sockets (today it's `503` + `Retry-After`),
-   and draining Canalis's own sockets on shutdown.
+   Not done: a waiting room for sockets (today it's `503` + `Retry-After`).
+   Graceful shutdown is done (`src/lifecycle.rs`): SIGTERM refuses new
+   work with a draining 503, sends open sessions `server_draining` then a
+   1012 close, tells waiting callers `canalis_draining` (jobs stay on
+   disk), stops taking jobs out of the line, and lets handoffs and
+   in-flight requests finish, within CANALIS_SHUTDOWN_TIMEOUT_SECONDS.
 4. Later: line length as the signal to scale out more nodes.
 
 Everything below is the earlier design history, kept for the record.
