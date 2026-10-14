@@ -26,6 +26,8 @@ jobs:
         run: cargo test
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Every setting is documented
+        run: ./scripts/check-config-docs.sh
 
   # Canalis against the real nodes it routes to, through aqueduct-runner:
   # Aquifer and Spillway registering, both signing their pings to a Canalis
