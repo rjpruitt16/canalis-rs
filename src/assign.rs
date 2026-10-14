@@ -320,6 +320,27 @@ pub async fn record_fullness(valkey: &mut Valkey, aq: &Aqueduct, id: &str, perce
     valkey.set_ex(aq.fullness_key(id), percent, aq.instance_ttl.as_secs().max(1)).await
 }
 
+/// How many instances are live, and how many of those would take a new
+/// user right now (active and under CANALIS_QUEUE_AT_PERCENT), for
+/// GET /health and the scale-up signal. Capacity isn't counted: a full
+/// instance at capacity still shows as accepting until it reports fullness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+pub struct Fleet {
+    pub total: usize,
+    pub accepting: usize,
+}
+
+pub async fn fleet(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Fleet> {
+    let all = members(valkey, aq).await?;
+    let keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
+    let fullness: Vec<Option<u8>> = if keys.is_empty() { Vec::new() } else { valkey.mget(&keys).await? };
+    let active: Vec<(&Member, &Option<u8>)> = all.iter().zip(fullness.iter()).filter(|(m, _)| m.is_active()).collect();
+    Ok(Fleet {
+        total: active.len(),
+        accepting: active.iter().filter(|(_, f)| f.is_none_or(|f| f < aq.queue_at_percent)).count(),
+    })
+}
+
 /// Resolves user_id's instance: their live assignment if they have one
 /// (renewed), otherwise a claim on the best eligible instance for this kind
 /// of traffic, otherwise PoolExhausted -- every eligible instance is full,
@@ -544,6 +565,21 @@ pub(crate) mod tests {
         assert_eq!(newcomer, None, "85% >= the 80% threshold: queue the newcomer");
         assert_eq!(existing.as_deref(), Some("busy"), "users already there stay");
         assert_eq!(newcomer_later.as_deref(), Some("spare"));
+    }
+
+    #[tokio::test]
+    async fn fleet_counts_live_instances_and_those_still_taking_new_users() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("roomy")).await.unwrap();
+        heartbeat(&mut v, &aq, &node("full")).await.unwrap();
+        heartbeat(&mut v, &aq, &Member { state: Some("draining".into()), ..node("leaving") }).await.unwrap();
+        record_fullness(&mut v, &aq, "full", 95).await.unwrap();
+
+        let fleet = fleet(&mut v, &aq).await.unwrap();
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(fleet, Fleet { total: 2, accepting: 1 }, "a draining instance doesn't count at all");
     }
 
     #[tokio::test]

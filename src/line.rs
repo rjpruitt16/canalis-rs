@@ -98,6 +98,9 @@ pub struct QueuedJob {
     pub seq: u64,
     pub job: JobRequest,
     pub path: String,
+    /// When it joined the line (unix seconds; 0 if stored before this
+    /// was recorded). Kept across a requeue.
+    pub enqueued_at: u64,
 }
 
 // What's stored per job. `job` is flattened so an entry written before
@@ -106,6 +109,8 @@ pub struct QueuedJob {
 struct StoredJob {
     #[serde(default = "default_path")]
     path: String,
+    #[serde(default)]
+    enqueued_at: u64,
     #[serde(flatten)]
     job: JobRequest,
 }
@@ -212,7 +217,7 @@ impl Line {
     /// The dedup check runs before the limits, so retrying a job that's
     /// already waiting never gets a 429 for it.
     pub fn enqueue(&self, job: &JobRequest, path: &str) -> Result<Enqueued, LineError> {
-        let payload = serde_json::to_vec(&StoredJob { path: path.into(), job: job.clone() })?;
+        let payload = serde_json::to_vec(&StoredJob { path: path.into(), enqueued_at: now_unix(), job: job.clone() })?;
         let idem = (job.user_id.as_str(), job.idempotent_key.as_str());
         let txn = self.db.begin_write()?;
         let outcome = {
@@ -289,7 +294,7 @@ impl Line {
         };
         let job = remove_job(&txn, &user_id, seq)?;
         txn.commit()?;
-        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, enqueued_at: stored.enqueued_at }))
     }
 
     /// Takes `user_id`'s own oldest job out of line, if they have one.
@@ -308,7 +313,7 @@ impl Line {
         };
         let job = remove_job(&txn, user_id, seq)?;
         txn.commit()?;
-        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, enqueued_at: stored.enqueued_at }))
     }
 
     /// Puts a job back at its original place in line -- used when a job was
@@ -316,7 +321,11 @@ impl Line {
     /// subject to the limits: it was already admitted once.
     pub fn requeue(&self, queued: &QueuedJob) -> Result<(), LineError> {
         let payload =
-            serde_json::to_vec(&StoredJob { path: queued.path.clone(), job: queued.job.clone() })?;
+            serde_json::to_vec(&StoredJob {
+                path: queued.path.clone(),
+                enqueued_at: queued.enqueued_at,
+                job: queued.job.clone(),
+            })?;
         let user_id = queued.job.user_id.as_str();
         let txn = self.db.begin_write()?;
         {
@@ -424,6 +433,22 @@ impl Line {
             }
         }
         Ok(ranks)
+    }
+
+    /// How long the longest-waiting job has been in line, in seconds. None
+    /// when the line is empty (or its oldest job predates this being
+    /// recorded).
+    pub fn oldest_wait_seconds(&self) -> Result<Option<u64>, LineError> {
+        let txn = self.db.begin_read()?;
+        let first = txn.open_table(ORDER)?.first()?.map(|(seq, user)| (seq.value(), user.value().to_string()));
+        let Some((seq, user_id)) = first else {
+            return Ok(None);
+        };
+        let Some(payload) = txn.open_table(TENANT_JOBS)?.get((user_id.as_str(), seq))? else {
+            return Ok(None);
+        };
+        let stored: StoredJob = serde_json::from_slice(payload.value())?;
+        Ok((stored.enqueued_at > 0).then(|| now_unix().saturating_sub(stored.enqueued_at)))
     }
 
     /// Jobs currently in line.
@@ -673,6 +698,21 @@ mod tests {
         let line = Line::open(&path, LineLimits::default()).unwrap();
         assert_eq!(line.len().unwrap(), 0);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn the_oldest_wait_follows_the_front_of_the_line_and_survives_a_requeue() {
+        let (line, _dir) = open(LineLimits::default());
+        assert_eq!(line.oldest_wait_seconds().unwrap(), None, "empty line");
+
+        line.enqueue(&job("a", "1"), "/jobs").unwrap();
+        line.enqueue(&job("b", "1"), "/jobs").unwrap();
+        assert_eq!(line.oldest_wait_seconds().unwrap(), Some(0));
+
+        let taken = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        assert!(taken.enqueued_at > 0);
+        line.requeue(&taken).unwrap();
+        assert_eq!(line.pop_for("a").unwrap().unwrap().enqueued_at, taken.enqueued_at, "a requeue keeps its arrival time");
     }
 
     #[test]

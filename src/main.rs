@@ -2,6 +2,7 @@ mod assign;
 mod l8;
 mod lifecycle;
 mod line;
+mod scale;
 mod schemas;
 mod websocket;
 
@@ -64,6 +65,9 @@ pub struct AppState {
     sockets: Arc<websocket::Sockets>,
     // Whether this node is shutting down -- see lifecycle.rs.
     lifecycle: Arc<lifecycle::Lifecycle>,
+    // Tells whatever adds instances that the line is backing up -- see
+    // scale.rs.
+    scale: Arc<scale::ScaleSignal>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -162,6 +166,7 @@ async fn main() {
         l8: Arc::new(l8::L8::from_env().unwrap_or_else(|err| panic!("L8 setup failed: {err}"))),
         sockets: Arc::new(websocket::Sockets::from_env()),
         lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig::from_env())),
+        scale: Arc::new(scale::ScaleSignal::from_env()),
     };
 
     let position_every =
@@ -188,6 +193,7 @@ async fn main() {
             if let Err(err) = sweep_once(sweeper_state.clone()).await {
                 tracing::error!("line sweep failed: {err}");
             }
+            check_scale(&sweeper_state).await;
             tokio::time::sleep(sweep_every).await;
         }
     });
@@ -299,8 +305,39 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+// Line, fleet, and socket numbers -- the same ones the scale-up signal
+// uses, for anything that polls instead.
+async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let fleet = assign::fleet(&mut state.valkey.clone(), &state.aqueduct).await.unwrap_or_default();
+    let line = state.line.clone();
+    let (jobs, oldest) = tokio::task::spawn_blocking(move || {
+        (line.len().unwrap_or(0), line.oldest_wait_seconds().ok().flatten())
+    })
+    .await
+    .unwrap_or((0, None));
+    Json(serde_json::json!({
+        "status": "ok",
+        "line": { "jobs": jobs, "oldest_wait_seconds": oldest },
+        "instances": fleet,
+        "websocket": { "open": state.sockets.open() },
+    }))
+}
+
+async fn check_scale(state: &AppState) {
+    let line = state.line.clone();
+    let (jobs, oldest) = match tokio::task::spawn_blocking(move || {
+        (line.len().unwrap_or(0), line.oldest_wait_seconds().ok().flatten())
+    })
+    .await
+    {
+        Ok(numbers) => numbers,
+        Err(_) => return,
+    };
+    if jobs == 0 {
+        return;
+    }
+    let fleet = assign::fleet(&mut state.valkey.clone(), &state.aqueduct).await.unwrap_or_default();
+    state.scale.check(jobs, oldest, fleet).await;
 }
 
 // 503 while draining, so whatever routes traffic here stops sending more.
@@ -1561,6 +1598,7 @@ mod tests {
                 quiesce: Duration::ZERO,
                 ws_grace: Duration::from_millis(200),
             })),
+            scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
         };
         (state, dir)
     }
@@ -1979,6 +2017,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_reports_the_line_and_the_fleet() {
+        let (state, _dir) = test_state().await;
+        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        register_node(&state, &start_plain_ok_mock().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        let health: serde_json::Value =
+            reqwest::get(format!("http://{canalis}/health")).await.unwrap().json().await.unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["line"]["jobs"], 1);
+        assert_eq!(health["line"]["oldest_wait_seconds"], 0);
+        assert_eq!(health["instances"]["total"], 1);
+        assert_eq!(health["instances"]["accepting"], 1);
+        assert_eq!(health["websocket"]["open"], 0);
+    }
+
+    #[tokio::test]
     async fn no_websocket_capable_instance_means_503_with_retry_after() {
         let (state, _dir) = test_state().await;
         let http_only = assign::Member { role: Some("http".into()), ..assign::tests::node(&start_plain_ok_mock().await) };
@@ -2364,6 +2421,7 @@ mod tests {
                 quiesce: Duration::ZERO,
                 ws_grace: Duration::from_millis(200),
             })),
+            scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
