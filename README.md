@@ -58,6 +58,14 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 **Shutting down.** On SIGTERM Canalis drains, the way Aquifer does: new `/proxy`, `/jobs`, and WebSocket handshakes get `503` + `Retry-After` + `X-Aqueduct-Node-State: draining` and `GET /ready` turns `503`, so whatever is in front retries another Canalis node; open WebSocket sessions get Aquifer's `server_draining` status and then a `1012` close; callers waiting in line get `canalis_draining` and their jobs stay in the line, on disk, until this node starts again; handoffs already under way finish and nothing more leaves the line.
 **Asking for more capacity.** The line is for the gap until more instances are running, not a substitute for them. Once a job has waited `CANALIS_SCALE_AFTER_SECONDS`, Canalis POSTs a `canalis_scale_up` signal to `CANALIS_SCALE_WEBHOOK_URL`, and whatever starts instances decides what to do; Canalis doesn't start infrastructure itself. `GET /health` reports the same numbers for anything that polls: `{"status":"ok","line":{"jobs":42,"oldest_wait_seconds":17},"instances":{"total":3,"accepting":0},"websocket":{"open":12}}`.
 
+**When things fail.** Each of these was tested by killing real processes:
+
+| What fails | What Canalis does |
+| --- | --- |
+| An instance dies (connection refused) | It takes the instance out of rotation, which releases its users, and sends the request to another instance or into the line. Only failed connections are re-routed, because those requests never reached the instance. A timeout partway through a request is answered with a 502. If the instance is still alive, its next registration ping brings it back. |
+| Valkey is unreachable | New HTTP jobs wait in the line, which is on local disk and doesn't need Valkey. The `canalis_queued` reason is `assignment_store_unavailable`, and jobs are handed out once Valkey is back. New WebSockets get a 503 with `Retry-After`. `/health` reports `"status":"degraded","valkey":"down"` and `/metrics` reports `canalis_valkey_up 0`. Recovery needs no restart. |
+| Canalis is killed (`kill -9`) | Jobs in line are still there after the restart. A job that was in the middle of a handoff goes back in line too, so delivery is at-least-once and an instance may see the same idempotency key twice. Aquifer and Spillway answer the repeat from what they already have. |
+
 **Metrics.** `GET /metrics` is Prometheus text. It covers:
 
 - every response by route and status (`canalis_http_responses_total`), which includes 429s for a full line, 422s from the schema gate, 401s for refused registrations and draining 503s;

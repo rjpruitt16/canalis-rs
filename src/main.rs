@@ -325,7 +325,11 @@ fn router(state: AppState) -> Router {
 // Line, fleet, and socket numbers -- the same ones the scale-up signal
 // uses, for anything that polls instead.
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let fleet = assign::fleet(&mut state.valkey.clone(), &state.aqueduct).await.unwrap_or_default();
+    // Without Valkey nothing can be assigned, though the line still takes
+    // jobs and holds them.
+    let fleet = assign::fleet(&mut state.valkey.clone(), &state.aqueduct).await;
+    let valkey_up = fleet.is_ok();
+    let fleet = fleet.unwrap_or_default();
     let line = state.line.clone();
     let (jobs, oldest) = tokio::task::spawn_blocking(move || {
         (line.len().unwrap_or(0), line.oldest_wait_seconds().ok().flatten())
@@ -333,7 +337,8 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
     .await
     .unwrap_or((0, None));
     Json(serde_json::json!({
-        "status": "ok",
+        "status": if valkey_up { "ok" } else { "degraded" },
+        "valkey": if valkey_up { "up" } else { "down" },
         "line": { "jobs": jobs, "oldest_wait_seconds": oldest },
         "instances": fleet,
         "websocket": { "open": state.sockets.open() },
@@ -864,6 +869,17 @@ async fn dispatch_drained_job(
             return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
         }
         Ok(resp) => resp,
+        // Never reached the instance: it's gone. Take it out of rotation
+        // and put the job back in line rather than answering with a 502
+        // that would be cached against the caller's idempotency key.
+        Err(err) if err.is_connect() => {
+            tracing::warn!("{addr} is unreachable; removed it until it registers again, job back in line: {err}");
+            if let Err(err) = assign::remove_instance(&mut state.valkey.clone(), &state.aqueduct, addr).await {
+                tracing::error!("failed to remove unreachable instance {addr}: {err}");
+            }
+            state.metrics.inc("canalis_reroutes_total", &[]);
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
+        }
         Err(err) => {
             tracing::error!("failed to dispatch drained job to {addr}: {err}");
             let cached = line::CachedResult {
@@ -874,7 +890,7 @@ async fn dispatch_drained_job(
                 headers: Vec::new(),
             };
             let waiter = take_waiter(waiters, job);
-            finish_drained_job(line, job, cached, waiter, false).await;
+            finish_drained_job(line, queued.seq, job, cached, waiter, false).await;
             return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: None };
         }
     };
@@ -971,7 +987,7 @@ async fn dispatch_drained_job(
         }
     }
 
-    finish_drained_job(line, job, cached, waiter, already_streamed).await;
+    finish_drained_job(line, queued.seq, job, cached, waiter, already_streamed).await;
     DispatchOutcome { pacing, back_in_line: None }
 }
 
@@ -1029,6 +1045,7 @@ fn take_waiter(
 // and a caller who checks GET /jobs/{key} right after must find the result.
 async fn finish_drained_job(
     line: &Arc<line::Line>,
+    seq: u64,
     job: &JobRequest,
     cached: line::CachedResult,
     waiter: Option<mpsc::Sender<Bytes>>,
@@ -1046,7 +1063,12 @@ async fn finish_drained_job(
         )
     });
     let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
-    if let Err(err) = on_line(line, move |l| l.store_result(&user_id, &key, &cached)).await {
+    if let Err(err) = on_line(line, move |l| {
+        l.store_result(&user_id, &key, &cached)?;
+        l.finish(seq)
+    })
+    .await
+    {
         tracing::error!("failed to cache drained result for {}: {err}", job.idempotent_key);
     }
     if let (Some(tx), Some(event)) = (waiter, event) {
@@ -1142,7 +1164,7 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Respons
 // room's stream. The caller is registered as a waiter *before* the job is
 // enqueued, so a drain that picks the job up immediately still finds
 // someone to stream to.
-async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Duration) -> Response {
+async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Duration, reason: &str) -> Response {
     let key = (job.user_id.clone(), job.idempotent_key.clone());
     let id = state.next_waiter_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel::<Bytes>(64);
@@ -1193,7 +1215,7 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Dur
     let status_url = format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id);
     let _ = tx.try_send(sse_event(
         "canalis_queued",
-        serde_json::json!({ "reason": "no_instance_free", "ahead": ahead, "status": status_url }),
+        serde_json::json!({ "reason": reason, "ahead": ahead, "status": status_url }),
     ));
 
     // Only this task and the drain hold senders; once both are gone the
@@ -1228,10 +1250,14 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Dur
         .unwrap_or_else(|_| json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" })))
 }
 
-// Marks a response as "the assigned instance said it's draining", so
-// forward_with_config can re-route instead of relaying it.
+// Marks a response as one forward_with_config should re-route instead of
+// relaying: the assigned instance said it's draining, or it couldn't be
+// connected to at all (so the request never reached it).
 #[derive(Clone)]
-struct NodeDraining(String);
+enum Reroute {
+    Draining(String),
+    Unreachable(String),
+}
 
 async fn forward_with_config(
     state: AppState,
@@ -1248,21 +1274,36 @@ async fn forward_with_config(
     let mut valkey = state.valkey.clone();
     let user_id = job.user_id.clone();
     let first = forward_attempt(state.clone(), job.clone(), target_path, config).await;
-    let Some(NodeDraining(node_id)) = first.extensions().get::<NodeDraining>().cloned() else {
+    let Some(reroute) = first.extensions().get::<Reroute>().cloned() else {
         return first;
     };
 
-    // The assigned instance is shutting down: mark it so, hand this user
-    // back, and try once more -- a different instance, or the line. Once,
-    // not in a loop: a second draining answer is relayed as-is.
-    if let Err(err) = assign::mark_draining(&mut valkey, &state.aqueduct, &node_id).await {
-        tracing::warn!("failed to mark {node_id} draining: {err}");
+    // The assigned instance is shutting down, or gone: take it out of
+    // rotation, hand this user back, and try once more -- a different
+    // instance, or the line. Once, not in a loop: a second refusal is
+    // relayed as-is.
+    match &reroute {
+        Reroute::Draining(node_id) => {
+            if let Err(err) = assign::mark_draining(&mut valkey, &state.aqueduct, node_id).await {
+                tracing::warn!("failed to mark {node_id} draining: {err}");
+            }
+            if let Err(err) = assign::release_user(&mut valkey, &state.aqueduct, &user_id, node_id).await {
+                tracing::error!("failed to release {user_id} from draining instance {node_id}: {err}");
+                return first;
+            }
+            tracing::info!("{node_id} is draining; re-routing {user_id}");
+        }
+        Reroute::Unreachable(node_id) => {
+            // Removing it releases everyone assigned to it, not just this
+            // user. If it was only briefly unreachable, its next
+            // registration ping puts it back.
+            if let Err(err) = assign::remove_instance(&mut valkey, &state.aqueduct, node_id).await {
+                tracing::error!("failed to remove unreachable instance {node_id}: {err}");
+                return first;
+            }
+            tracing::warn!("{node_id} is unreachable; removed it until it registers again, re-routing {user_id}");
+        }
     }
-    if let Err(err) = assign::release_user(&mut valkey, &state.aqueduct, &user_id, &node_id).await {
-        tracing::error!("failed to release {user_id} from draining instance {node_id}: {err}");
-        return first;
-    }
-    tracing::info!("{node_id} is draining; re-routing {user_id}");
     state.metrics.inc("canalis_reroutes_total", &[]);
     forward_attempt(state, job, target_path, config).await
 }
@@ -1294,14 +1335,14 @@ async fn forward_attempt(
     let node = match assign::assign(&mut state.valkey, &state.aqueduct, &job.user_id, assign::Traffic::Http).await {
         Ok(assign::AssignOutcome::Assigned(node)) => node,
         Ok(assign::AssignOutcome::PoolExhausted) => {
-            return wait_in_line(state, job, target_path, config.pool_wait_timeout).await;
+            return wait_in_line(state, job, target_path, config.pool_wait_timeout, "no_instance_free").await;
         }
+        // Valkey (where assignments live) can't be reached. The line is on
+        // local disk and doesn't need it, so the job waits there and the
+        // sweep hands it out once Valkey is back.
         Err(err) => {
-            tracing::error!("assign failed: {err}");
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                serde_json::json!({ "error": "internal error" }),
-            );
+            tracing::error!("assign failed, holding the job in line: {err}");
+            return wait_in_line(state, job, target_path, config.pool_wait_timeout, "assignment_store_unavailable").await;
         }
     };
 
@@ -1309,6 +1350,9 @@ async fn forward_attempt(
     let target_url = format!("{}{target_path}", node.base_url);
     let mut last_err = None;
     let mut upstream = None;
+    // Whether every failure was a failed connect, which means the request
+    // never reached the instance and is safe to send somewhere else.
+    let mut never_reached = true;
     for attempt in 0..config.instance_retry_attempts {
         if attempt > 0 {
             tokio::time::sleep(config.instance_retry_base_delay * 2u32.pow(attempt - 1)).await;
@@ -1324,6 +1368,7 @@ async fn forward_attempt(
                     attempt + 1,
                     config.instance_retry_attempts
                 );
+                never_reached &= err.is_connect();
                 last_err = Some(err);
             }
         }
@@ -1337,10 +1382,14 @@ async fn forward_attempt(
                 "gave up reaching assigned instance {addr} after {} attempts: {err}",
                 config.instance_retry_attempts
             );
-            return json_response(
+            let mut response = json_response(
                 StatusCode::BAD_GATEWAY,
                 serde_json::json!({ "error": format!("failed to reach assigned instance: {err}") }),
             );
+            if never_reached {
+                response.extensions_mut().insert(Reroute::Unreachable(node.id.clone()));
+            }
+            return response;
         }
     };
 
@@ -1354,7 +1403,7 @@ async fn forward_attempt(
         response
             .headers_mut()
             .insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(1u32));
-        response.extensions_mut().insert(NodeDraining(node.id.clone()));
+        response.extensions_mut().insert(Reroute::Draining(node.id.clone()));
         return response;
     }
 
@@ -1945,6 +1994,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_websocket_session_assigned_to_a_dead_instance_is_moved_to_a_live_one() {
+        let (state, _dir) = test_state().await;
+        register_ws_node(&state, "127.0.0.1:1").await;
+        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, "acme", assign::Traffic::WebSocket).await.unwrap();
+        assert!(matches!(first, assign::AssignOutcome::Assigned(ref n) if n.id == "127.0.0.1:1"));
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        let connected = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await;
+        let members = assign::members(&mut state.valkey.clone(), &state.aqueduct).await.unwrap();
+        cleanup(&state).await;
+
+        assert!(connected.is_ok(), "expected the session to reach the live instance: {:?}", connected.err());
+        assert!(members.iter().all(|m| m.id != "127.0.0.1:1"), "the dead instance is out of rotation");
+    }
+
+    #[tokio::test]
     async fn a_draining_node_refuses_new_work_but_keeps_registrations_and_status() {
         let (state, _dir) = test_state().await;
         let canalis = serve_canalis(state.clone()).await;
@@ -2491,27 +2557,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_assigned_instance_retries_then_gives_a_clean_error_not_a_hang() {
+    async fn a_dead_instance_leaves_rotation_and_the_job_waits_in_line() {
         let (state, _dir) = test_state().await;
         let cleanup_state = state.clone();
         let user_id = unique("user-dead-instance");
 
-        // Nothing listens on port 1: an immediate connection-refused.
+        // Nothing listens on port 1: an immediate connection-refused, so
+        // the request never reached it.
         let dead_addr = "127.0.0.1:1".to_string();
         register_node(&state, &dead_addr).await;
 
         let start = Instant::now();
         let response =
-            forward_with_config(state, job_for(&user_id), "/proxy", &short_retry_config()).await;
+            forward_with_config(state.clone(), job_for(&user_id), "/proxy", &short_retry_config()).await;
         let elapsed = start.elapsed();
-        let status = response.status();
+        let members = assign::members(&mut state.valkey.clone(), &state.aqueduct).await.unwrap();
+        let queued = state.line.len().unwrap();
         cleanup(&cleanup_state).await;
 
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "expected the instance retries to give up quickly, took {elapsed:?}"
-        );
+        assert_eq!(response.status(), StatusCode::OK, "the caller gets the waiting-room stream, not a 502");
+        assert!(members.iter().all(|m| m.id != dead_addr), "the dead instance is out of rotation");
+        assert_eq!(queued, 1, "the job waits in line for an instance that's up");
+        assert!(elapsed < Duration::from_secs(2), "expected the instance retries to give up quickly, took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_user_on_a_dead_instance_is_moved_to_a_live_one() {
+        let (state, _dir) = test_state().await;
+        let user_id = unique("user-moved");
+        register_node(&state, "127.0.0.1:1").await;
+        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, &user_id, assign::Traffic::Http).await.unwrap();
+        assert!(matches!(first, assign::AssignOutcome::Assigned(ref n) if n.id == "127.0.0.1:1"));
+        register_node(&state, &start_plain_ok_mock().await).await;
+
+        let response = forward_with_config(state.clone(), job_for(&user_id), "/proxy", &short_retry_config()).await;
+        cleanup(&state).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(state.line.len().unwrap(), 0, "served right away, not queued");
     }
 
     #[tokio::test]

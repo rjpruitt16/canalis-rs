@@ -29,7 +29,7 @@ const BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 
 const COUNTERS: [(&str, &str); 5] = [
     ("canalis_http_responses_total", "Responses sent, by route and status."),
     ("canalis_line_rejected_total", "Jobs turned away because the line was at a limit, by limit."),
-    ("canalis_reroutes_total", "Requests re-routed because their instance answered that it was draining."),
+    ("canalis_reroutes_total", "Requests and sessions re-routed because their instance was draining or unreachable."),
     ("canalis_scale_signals_total", "canalis_scale_up webhooks sent."),
     ("canalis_websocket_wait_timeouts_total", "WebSocket sessions closed with 1013 after waiting too long for an instance."),
 ];
@@ -123,12 +123,13 @@ pub async fn handler(State(state): State<AppState>) -> Response {
     state.metrics.write_counters(&mut out);
 
     let line = state.line.clone();
-    let (jobs, oldest) = tokio::task::spawn_blocking(move || {
-        (line.len().unwrap_or(0), line.oldest_wait_seconds().ok().flatten())
+    let (jobs, oldest, leased) = tokio::task::spawn_blocking(move || {
+        (line.len().unwrap_or(0), line.oldest_wait_seconds().ok().flatten(), line.leased().unwrap_or(0))
     })
     .await
-    .unwrap_or((0, None));
+    .unwrap_or((0, None, 0));
     gauge(&mut out, "canalis_line_jobs", "Jobs waiting in this node's line.", &[(vec![], jobs as f64)]);
+    gauge(&mut out, "canalis_line_in_flight", "Jobs taken out of line and not yet handed off.", &[(vec![], leased as f64)]);
     gauge(&mut out, "canalis_line_oldest_wait_seconds", "How long the oldest job in line has waited (0 when empty).", &[(vec![], oldest.unwrap_or(0) as f64)]);
     let waiters = state.waiters.lock().map(|w| w.len()).unwrap_or(0);
     gauge(&mut out, "canalis_line_streams", "Callers holding a waiting-room stream open.", &[(vec![], waiters as f64)]);
