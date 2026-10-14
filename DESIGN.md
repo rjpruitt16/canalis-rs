@@ -132,6 +132,19 @@ by Canalis.
 5. **Metrics.** Done (`src/metrics.rs`): Prometheus text at `GET /metrics`.
    Counters are bumped where things happen. Gauges are read fresh from
    the line, Valkey and the socket counts on every scrape.
+6. **Failure handling.** Tested with real processes: instance `kill -9`,
+   Valkey paused and stopped, Canalis `kill -9` with jobs queued and with
+   a job mid-handoff. Three fixes came out of it:
+   - An unreachable instance is removed from rotation and the request is
+     re-routed. Only failed connections are re-routed, never timeouts.
+     Before, its users got 502s until its registration expired, about 45s
+     at the default heartbeat. On the line's path a job could also get a
+     502 cached against its idempotency key.
+   - When Valkey is down, jobs wait in the line instead of failing with
+     a 500.
+   - Taking a job out of the line is now a lease (the `leased` table),
+     ended by `finish`/`requeue` and restored on open. Before, a crash
+     between taking a job and handing it off lost the job.
 
 Everything below is the earlier design history, kept for the record.
 

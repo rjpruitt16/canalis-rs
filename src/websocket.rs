@@ -266,10 +266,16 @@ async fn wait_for_instance(
                 close(&mut client, 1011, &reason).await;
                 return;
             }
+            // Nothing was established, so it's safe to try another
+            // instance: take this one out of rotation (its next ping puts
+            // it back) and wait at the front again.
             Err(Refused::Unreachable(err)) => {
-                tracing::error!("failed to reach {} for a waiting WebSocket session: {err}", node.id);
-                close(&mut client, 1011, "failed to reach the assigned instance").await;
-                return;
+                tracing::warn!("{} is unreachable for a waiting WebSocket session; removed it until it registers again: {err}", node.id);
+                let _ = assign::remove_instance(&mut state.valkey.clone(), &state.aqueduct, &node.id).await;
+                state.metrics.inc("canalis_reroutes_total", &[]);
+                let Some((new_id, new_ready)) = state.ws_room.join(&pending.user, true) else { return };
+                (id, ready) = (new_id, new_ready);
+                told = None;
             }
         }
     }
@@ -329,7 +335,9 @@ pub async fn handler(
         return error(StatusCode::BAD_REQUEST, "need an X-Aqueduct-User-ID header or a session_id query parameter");
     };
 
-    let mut tried_draining = None;
+    // An instance that turned this session away (draining or unreachable)
+    // isn't offered it again.
+    let mut skip = None;
     for _ in 0..2 {
         // While anyone is already waiting, a new session waits behind them
         // instead of taking room that frees up first.
@@ -339,7 +347,7 @@ pub async fn handler(
             Ok(assign::AssignOutcome::PoolExhausted)
         };
         let node = match outcome {
-            Ok(assign::AssignOutcome::Assigned(node)) if Some(&node.id) != tried_draining.as_ref() => node,
+            Ok(assign::AssignOutcome::Assigned(node)) if Some(&node.id) != skip.as_ref() => node,
             Ok(_) => {
                 if let Some((id, ready)) = state.ws_room.join(&user, false) {
                     let pending = Pending { user, query, headers: headers.clone() };
@@ -358,7 +366,9 @@ pub async fn handler(
             }
             Err(err) => {
                 tracing::error!("assign failed for a WebSocket session: {err}");
-                return error(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "assignment store unavailable; retry through the gateway");
+                response.headers_mut().insert("Retry-After", HeaderValue::from(1u32));
+                return response;
             }
         };
 
@@ -377,16 +387,19 @@ pub async fn handler(
                 let _ = assign::mark_draining(&mut valkey, &state.aqueduct, &node.id).await;
                 let _ = assign::release_ws_user(&mut valkey, &state.aqueduct, &user, &node.id).await;
                 tracing::info!("{} is draining; trying another instance for a WebSocket session", node.id);
-                tried_draining = Some(node.id);
+                state.metrics.inc("canalis_reroutes_total", &[]);
+                skip = Some(node.id);
             }
             Err(Refused::Answered(response)) => return response,
             Err(Refused::Unreachable(err)) => {
-                tracing::error!("failed to reach {} for a WebSocket session: {err}", node.id);
-                return error(StatusCode::BAD_GATEWAY, "failed to reach the assigned instance");
+                tracing::warn!("{} is unreachable for a WebSocket session; removed it until it registers again: {err}", node.id);
+                let _ = assign::remove_instance(&mut state.valkey.clone(), &state.aqueduct, &node.id).await;
+                state.metrics.inc("canalis_reroutes_total", &[]);
+                skip = Some(node.id);
             }
         }
     }
-    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "the assigned instances are draining; retry through the gateway");
+    let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "the assigned instances are draining or unreachable; retry through the gateway");
     response.headers_mut().insert("Retry-After", HeaderValue::from(1u32));
     response
 }

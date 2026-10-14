@@ -25,6 +25,10 @@ const QUEUED_KEYS: TableDefinition<(&str, &str), u64> = TableDefinition::new("qu
 // (user_id, idempotent_key) -> CachedResult JSON, kept for RESULT_TTL.
 const RESULTS: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("results");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+// Jobs taken out of line but not yet handed off (seq -> StoredJob), in the
+// same transaction that took them. A crash in between leaves them here, and
+// the next open puts them back in line instead of losing them.
+const LEASED: TableDefinition<u64, &[u8]> = TableDefinition::new("leased");
 
 const NEXT_SEQ: &str = "next_seq";
 const TOTAL_JOBS: &str = "total_jobs";
@@ -204,9 +208,53 @@ impl Line {
             txn.open_table(QUEUED_KEYS)?;
             txn.open_table(RESULTS)?;
             txn.open_table(META)?;
+            txn.open_table(LEASED)?;
         }
         txn.commit()?;
-        Ok(Self { db, limits })
+        let line = Self { db, limits };
+        line.restore_leases()?;
+        Ok(line)
+    }
+
+    // Back in line, at their original places: jobs that were taken out when
+    // the process last died and never reached an instance (or never had
+    // their result recorded). An instance that did get one sees the same
+    // idempotency key again and answers from what it already has.
+    fn restore_leases(&self) -> Result<(), LineError> {
+        let leased: Vec<QueuedJob> = {
+            let txn = self.db.begin_read()?;
+            let table = txn.open_table(LEASED)?;
+            let mut leased = Vec::new();
+            for entry in table.range::<u64>(..)? {
+                let (seq, payload) = entry?;
+                let stored: StoredJob = serde_json::from_slice(payload.value())?;
+                leased.push(QueuedJob { seq: seq.value(), job: stored.job, path: stored.path, enqueued_at: stored.enqueued_at });
+            }
+            leased
+        };
+        if !leased.is_empty() {
+            tracing::warn!("putting {} jobs that were in flight at the last shutdown back in line", leased.len());
+        }
+        for queued in &leased {
+            self.requeue(queued)?;
+        }
+        Ok(())
+    }
+
+    /// A job taken out of line is done with: handed to an instance and its
+    /// outcome recorded. Until then a restart puts it back in line.
+    pub fn finish(&self, seq: u64) -> Result<(), LineError> {
+        let txn = self.db.begin_write()?;
+        txn.open_table(LEASED)?.remove(seq)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Jobs taken out of line and not yet finished.
+    pub fn leased(&self) -> Result<u64, LineError> {
+        use redb::ReadableTableMetadata as _;
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(LEASED)?.len()?)
     }
 
     pub fn limits(&self) -> &LineLimits {
@@ -293,6 +341,7 @@ impl Line {
             return Ok(None);
         };
         let job = remove_job(&txn, &user_id, seq)?;
+        lease(&txn, seq, job.as_ref())?;
         txn.commit()?;
         Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, enqueued_at: stored.enqueued_at }))
     }
@@ -312,6 +361,7 @@ impl Line {
             return Ok(None);
         };
         let job = remove_job(&txn, user_id, seq)?;
+        lease(&txn, seq, job.as_ref())?;
         txn.commit()?;
         Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, enqueued_at: stored.enqueued_at }))
     }
@@ -344,6 +394,7 @@ impl Line {
             order.insert(queued.seq, user_id)?;
             tenant_jobs.insert((user_id, queued.seq), payload.as_slice())?;
             queued_keys.insert((user_id, queued.job.idempotent_key.as_str()), queued.seq)?;
+            txn.open_table(LEASED)?.remove(queued.seq)?;
         }
         txn.commit()?;
         Ok(())
@@ -461,6 +512,13 @@ impl Line {
 // Removes one job from every table that references it, inside the caller's
 // transaction. Returns None (and drops the entry) if the stored payload is
 // unparseable -- a corrupt entry shouldn't jam the line forever.
+fn lease(txn: &redb::WriteTransaction, seq: u64, job: Option<&StoredJob>) -> Result<(), LineError> {
+    if let Some(job) = job {
+        txn.open_table(LEASED)?.insert(seq, serde_json::to_vec(job)?.as_slice())?;
+    }
+    Ok(())
+}
+
 fn remove_job(
     txn: &redb::WriteTransaction,
     user_id: &str,
@@ -753,5 +811,36 @@ mod tests {
         assert_eq!(line.len().unwrap(), 2);
         assert_eq!(line.pop_oldest(&HashSet::new()).unwrap().unwrap().job.user_id, "a");
         assert_eq!(line.pop_oldest(&HashSet::new()).unwrap().unwrap().job.user_id, "b");
+    }
+
+    #[test]
+    fn a_job_taken_out_but_never_finished_is_back_in_line_after_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line.redb");
+        {
+            let line = Line::open(&path, LineLimits::default()).unwrap();
+            line.enqueue(&job("acme", "lost"), "/jobs").unwrap();
+            line.enqueue(&job("acme", "done"), "/jobs").unwrap();
+            let lost = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+            let done = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+            line.finish(done.seq).unwrap();
+            assert_eq!((line.len().unwrap(), line.leased().unwrap()), (0, 1));
+            assert_eq!(lost.job.idempotent_key, "lost");
+            // Dropped here without finishing `lost`: the crash.
+        }
+        let line = Line::open(&path, LineLimits::default()).unwrap();
+        assert_eq!((line.len().unwrap(), line.leased().unwrap()), (1, 0));
+        let back = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        assert_eq!(back.job.idempotent_key, "lost");
+    }
+
+    #[test]
+    fn requeue_ends_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = Line::open(dir.path().join("line.redb"), LineLimits::default()).unwrap();
+        line.enqueue(&job("acme", "k"), "/jobs").unwrap();
+        let taken = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        line.requeue(&taken).unwrap();
+        assert_eq!((line.len().unwrap(), line.leased().unwrap()), (1, 0));
     }
 }
