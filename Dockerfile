@@ -11,6 +11,8 @@ COPY --from=builder /app/target/release/canalis-rs .
 # The waiting line lives on local disk; mount a volume here so it
 # survives the container being replaced, not just the process restarting.
 ENV CANALIS_LINE_PATH=/data/canalis-line.redb
+# Canalis's own L8 key, kept with the line so it survives a new container.
+ENV CANALIS_L8_KEY_PATH=/data/.l8-key
 # Created here, not left to VOLUME: plain `docker run` makes the mount
 # point, but not every runtime does (Dagger, which the contract tests use,
 # doesn't), and the line can't open in a directory that isn't there.

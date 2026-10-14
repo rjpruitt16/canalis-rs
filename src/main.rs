@@ -1,4 +1,5 @@
 mod assign;
+mod l8;
 mod line;
 mod schemas;
 
@@ -53,6 +54,9 @@ pub struct AppState {
     // L8 v0.2 request schemas, checked before a job goes anywhere -- see
     // schemas.rs. Off unless CANALIS_L8_SCHEMA_VALIDATION=true.
     schemas: Arc<schemas::SchemaGate>,
+    // L8 receiver side: Canalis's own key, and which node keys may register
+    // (see l8.rs).
+    l8: Arc<l8::L8>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -148,6 +152,7 @@ async fn main() {
         next_waiter_id: Arc::default(),
         aqueduct: Arc::new(assign::Aqueduct::from_env()),
         schemas: Arc::new(schemas::SchemaGate::from_env()),
+        l8: Arc::new(l8::L8::from_env().unwrap_or_else(|err| panic!("L8 setup failed: {err}"))),
     };
 
     let position_every =
@@ -182,6 +187,8 @@ async fn main() {
         .route("/health", get(health))
         .route("/valkey-check", get(valkey_check))
         .route("/register", post(register))
+        .route("/.well-known/l8", get(l8_well_known))
+        .route("/l8/challenge", post(l8_challenge))
         .route("/proxy", post(proxy))
         .route("/jobs", post(jobs))
         .route("/jobs/{idempotent_key}", get(job_status))
@@ -254,17 +261,55 @@ struct RegisterRequest {
     fullness: Option<u8>,
 }
 
+// Reads the raw body first: an L8 signature covers the exact bytes sent,
+// so it's checked before the JSON is parsed. A signed ping that doesn't
+// verify is refused; an unsigned one is refused only with
+// CANALIS_REQUIRE_SIGNED_REGISTRATION (see l8.rs).
 async fn register(
     State(state): State<AppState>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
-    Json(payload): Json<RegisterRequest>,
-) -> StatusCode {
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let refuse = |why: String| {
+        tracing::warn!("refused registration from {}: {why}", remote.ip());
+        json_response(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": why }))
+    };
+    match state.l8.verify(&headers, &body) {
+        l8::Verdict::Valid { .. } => {}
+        l8::Verdict::Invalid(why) => return refuse(why),
+        l8::Verdict::Unsigned if state.l8.require_signed => {
+            return refuse("registration must be L8-signed by a trusted node key".into());
+        }
+        l8::Verdict::Unsigned => {}
+    }
+    let payload: RegisterRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(err) => {
+            return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": format!("invalid registration: {err}") }));
+        }
+    };
+
     let address = format!("{}:{}", remote.ip(), payload.port);
     match handle_registration(state, &address, &payload).await {
-        Ok(()) => StatusCode::OK,
+        Ok(()) => StatusCode::OK.into_response(),
         Err(err) => {
             tracing::error!("failed to register instance {address}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn l8_well_known(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(state.l8.meta())
+}
+
+async fn l8_challenge(State(state): State<AppState>, Json(req): Json<l8::ChallengeRequest>) -> Response {
+    match state.l8.handle_challenge(&req) {
+        Ok(resp) => Json(resp).into_response(),
+        Err(err) => {
+            tracing::warn!("refused L8 challenge from key {}: {err}", req.sender_public_key);
+            json_response(StatusCode::FORBIDDEN, serde_json::json!({ "error": err }))
         }
     }
 }
@@ -1403,6 +1448,7 @@ mod tests {
             next_waiter_id: Arc::default(),
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
             schemas: Arc::new(schemas::SchemaGate::new(false)),
+            l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
         };
         (state, dir)
     }
@@ -1952,6 +1998,7 @@ mod tests {
             next_waiter_id: Arc::default(),
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
             schemas: Arc::new(schemas::SchemaGate::new(false)),
+            l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
@@ -2032,6 +2079,50 @@ mod tests {
             assign::AssignOutcome::Assigned(node) => Some(node.id),
             assign::AssignOutcome::PoolExhausted => None,
         }
+    }
+
+    async fn ping_via_handler(state: &AppState, headers: axum::http::HeaderMap, body: &'static [u8]) -> StatusCode {
+        let remote: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        register(State(state.clone()), ConnectInfo(remote), headers, Bytes::from_static(body)).await.status()
+    }
+
+    async fn is_registered(state: &AppState, id: &str) -> bool {
+        assign::member(&mut state.valkey.clone(), &state.aqueduct, id).await.unwrap().is_some()
+    }
+
+    #[tokio::test]
+    async fn with_signing_required_only_a_trusted_nodes_signed_ping_registers() {
+        let (mut state, _dir) = test_state().await;
+        let node = l8::tests::new_key();
+        let trusted = std::collections::HashSet::from([node.verifying_key().to_bytes()]);
+        state.l8 = Arc::new(l8::L8::new(l8::tests::new_key(), Some(trusted), true));
+        let body: &'static [u8] = br#"{"port":"7001","state":"active"}"#;
+
+        let unsigned = ping_via_handler(&state, axum::http::HeaderMap::new(), body).await;
+        let stranger = ping_via_handler(&state, l8::tests::signed_headers(&l8::tests::new_key(), "d1", body), body).await;
+        let registered_before = is_registered(&state, "127.0.0.1:7001").await;
+        let signed = ping_via_handler(&state, l8::tests::signed_headers(&node, "d2", body), body).await;
+        let registered_after = is_registered(&state, "127.0.0.1:7001").await;
+        cleanup(&state).await;
+
+        assert_eq!(unsigned, StatusCode::UNAUTHORIZED);
+        assert_eq!(stranger, StatusCode::UNAUTHORIZED);
+        assert!(!registered_before, "a refused ping must leave no record");
+        assert_eq!(signed, StatusCode::OK);
+        assert!(registered_after);
+    }
+
+    #[tokio::test]
+    async fn without_signing_required_unsigned_pings_still_work_but_a_bad_signature_never_does() {
+        let (state, _dir) = test_state().await;
+        let body: &'static [u8] = br#"{"port":"7002"}"#;
+
+        let unsigned = ping_via_handler(&state, axum::http::HeaderMap::new(), body).await;
+        let forged = ping_via_handler(&state, l8::tests::signed_headers(&l8::tests::new_key(), "d1", body), body).await;
+        cleanup(&state).await;
+
+        assert_eq!(unsigned, StatusCode::OK, "existing deployments keep working");
+        assert_eq!(forged, StatusCode::UNAUTHORIZED, "signed but unverifiable is refused either way");
     }
 
     #[tokio::test]

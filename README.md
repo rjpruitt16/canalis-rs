@@ -57,7 +57,7 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 
 `/proxy` and `/jobs` mirror Aquifer's own request body shape exactly, so a caller already speaking Aquifer's API can point at Canalis with no translation layer.
 
-Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`.
+Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`. Canalis speaks the receiving side of [L8](https://rjpruitt16.github.io/l8-protocol/) (`GET /.well-known/l8`, `POST /l8/challenge`), so those pings arrive signed with no change on the node's side; set `CANALIS_L8_TRUSTED_NODE_KEYS` and `CANALIS_REQUIRE_SIGNED_REGISTRATION=true` to accept only the nodes you run.
 
 When no instance is free, the caller's connection becomes a stream from Canalis's line. Canalis's own events are prefixed `canalis_` so they're never confused with the node's queue:
 
@@ -89,4 +89,7 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long an idle user keeps their instance before it's released |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Valkey key prefix for the shared assignment table; must match `AQUIFER_CLUSTER_VALKEY_PREFIX` |
 | `CANALIS_L8_SCHEMA_VALIDATION` | `false` | Check each job's body against the JSON Schema its upstream publishes for that route ([L8 v0.2 `request_schemas`](https://rjpruitt16.github.io/l8-protocol/)) and answer `422` on a mismatch, before the job reaches the line or any instance. External `$ref`s are refused. Off by default because it fetches `/.well-known/l8` from each job's upstream |
+| `CANALIS_L8_TRUSTED_NODE_KEYS` | *(none)* | Comma-separated base64 Ed25519 public keys of the nodes allowed to register (each Aquifer logs its own as `[L8] public key: ...`). When set, only these keys can complete the L8 handshake or sign a registration |
+| `CANALIS_REQUIRE_SIGNED_REGISTRATION` | `false` | Refuse unsigned registration pings. A ping that is signed but doesn't verify is refused either way |
+| `L8_PRIVATE_KEY` / `CANALIS_L8_KEY_PATH` | *(none)* / `.l8-key` | Canalis's own L8 key: base64 in the env var (Go's 64-byte format or a 32-byte seed), else a key file generated on first start (`/data/.l8-key` in the image) |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |
