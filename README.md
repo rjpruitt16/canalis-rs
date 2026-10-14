@@ -70,6 +70,8 @@ event: canalis_result      data: {"status":200,"body":"..."}  (a /proxy answer t
 event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in line; stream closing)
 ```
 
+**WebSockets.** `GET /websocket` is routed to an instance and piped, frames untouched, both ways. Aquifer's and Spillway's own `/websocket` (an `aqueduct.v1` session over a Valkey transcript) does the ordering, replay, and reconnecting, and since the transcript is in shared Valkey, a client that reconnects through Canalis to a different instance replays what it missed. Canalis picks an instance with `role: ws` (or no role) for the gateway's `X-Aqueduct-User-ID`, else the `session_id`; an instance that can't do WebSockets (an Aquifer without Valkey answers 404) should register with `role: http`. No instance with room means `503` + `Retry-After` at the handshake; an instance's own refusal (a `409` replay gap, say) is relayed; a draining one is skipped. Aquifer's and Spillway's full WebSocket contract passes through Canalis in CI.
+
 `GET /jobs/{idempotent_key}?user_id=...` answers with the finished result, `202 {"status":"queued","ahead":N}`, or `404`. The line is per Canalis node, so ask the node that queued it.
 
 | Env var | Default | Description |
@@ -92,4 +94,5 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 | `CANALIS_L8_TRUSTED_NODE_KEYS` | *(none)* | Comma-separated base64 Ed25519 public keys of the nodes allowed to register (each Aquifer logs its own as `[L8] public key: ...`). When set, only these keys can complete the L8 handshake or sign a registration |
 | `CANALIS_REQUIRE_SIGNED_REGISTRATION` | `false` | Refuse unsigned registration pings. A ping that is signed but doesn't verify is refused either way |
 | `L8_PRIVATE_KEY` / `CANALIS_L8_KEY_PATH` | *(none)* / `.l8-key` | Canalis's own L8 key: base64 in the env var (Go's 64-byte format or a 32-byte seed), else a key file generated on first start (`/data/.l8-key` in the image) |
+| `CANALIS_WS_MAX_CONNECTIONS` | `10000` | WebSocket sessions open through this Canalis node; past it, new handshakes get `503` |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |

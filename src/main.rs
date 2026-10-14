@@ -2,6 +2,7 @@ mod assign;
 mod l8;
 mod line;
 mod schemas;
+mod websocket;
 
 use axum::{
     body::Body,
@@ -57,6 +58,9 @@ pub struct AppState {
     // L8 receiver side: Canalis's own key, and which node keys may register
     // (see l8.rs).
     l8: Arc<l8::L8>,
+    // WebSocket sockets open through this node, capped by
+    // CANALIS_WS_MAX_CONNECTIONS (see websocket.rs).
+    sockets: Arc<websocket::Sockets>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -153,6 +157,7 @@ async fn main() {
         aqueduct: Arc::new(assign::Aqueduct::from_env()),
         schemas: Arc::new(schemas::SchemaGate::from_env()),
         l8: Arc::new(l8::L8::from_env().unwrap_or_else(|err| panic!("L8 setup failed: {err}"))),
+        sockets: Arc::new(websocket::Sockets::from_env()),
     };
 
     let position_every =
@@ -183,16 +188,7 @@ async fn main() {
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/valkey-check", get(valkey_check))
-        .route("/register", post(register))
-        .route("/.well-known/l8", get(l8_well_known))
-        .route("/l8/challenge", post(l8_challenge))
-        .route("/proxy", post(proxy))
-        .route("/jobs", post(jobs))
-        .route("/jobs/{idempotent_key}", get(job_status))
-        .with_state(state);
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
         .await
@@ -210,6 +206,20 @@ async fn main() {
     )
     .await
     .expect("server error");
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/valkey-check", get(valkey_check))
+        .route("/register", post(register))
+        .route("/.well-known/l8", get(l8_well_known))
+        .route("/l8/challenge", post(l8_challenge))
+        .route("/proxy", post(proxy))
+        .route("/jobs", post(jobs))
+        .route("/jobs/{idempotent_key}", get(job_status))
+        .route("/websocket", get(websocket::handler))
+        .with_state(state)
 }
 
 async fn health() -> &'static str {
@@ -520,7 +530,7 @@ async fn claim_next(
     }
     let guard = DrainGuard { draining: state.draining.clone(), user_id: user_id.clone() };
 
-    match assign::assign(&mut state.valkey, &state.aqueduct, &user_id).await {
+    match assign::assign(&mut state.valkey, &state.aqueduct, &user_id, assign::Traffic::Http).await {
         Ok(assign::AssignOutcome::Assigned(node)) => Ok(Some((queued, node, guard))),
         Ok(assign::AssignOutcome::PoolExhausted) => {
             on_line(&state.line, move |l| l.requeue(&queued)).await?;
@@ -627,7 +637,7 @@ async fn drain_tenant_backlog(
             }
             last_dispatch_at = Some(Instant::now());
             if last_renewed.elapsed() > state.aqueduct.assignment_ttl / 3 {
-                let _ = assign::assign(&mut state.valkey, &state.aqueduct, &user_id).await;
+                let _ = assign::assign(&mut state.valkey, &state.aqueduct, &user_id, assign::Traffic::Http).await;
                 last_renewed = Instant::now();
             }
 
@@ -1127,7 +1137,7 @@ async fn forward_attempt(
     target_path: &str,
     config: &RetryConfig,
 ) -> Response {
-    let node = match assign::assign(&mut state.valkey, &state.aqueduct, &job.user_id).await {
+    let node = match assign::assign(&mut state.valkey, &state.aqueduct, &job.user_id, assign::Traffic::Http).await {
         Ok(assign::AssignOutcome::Assigned(node)) => node,
         Ok(assign::AssignOutcome::PoolExhausted) => {
             return wait_in_line(state, job, target_path, config.pool_wait_timeout).await;
@@ -1449,6 +1459,7 @@ mod tests {
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
             schemas: Arc::new(schemas::SchemaGate::new(false)),
             l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
+            sockets: Arc::new(websocket::Sockets::with_max(100)),
         };
         (state, dir)
     }
@@ -1666,6 +1677,158 @@ mod tests {
         assert_eq!(body["schema_hash"], "sha256:v1");
         assert!(body["schema_errors"].as_str().unwrap().contains("model"));
         assert_eq!(state.line.len().unwrap(), 0, "a rejected job never takes a spot in line");
+    }
+
+    // A real Canalis on an ephemeral port, for clients that need a socket.
+    async fn serve_canalis(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .unwrap();
+        });
+        addr.to_string()
+    }
+
+    // An instance's /websocket: tells the client what reached it, echoes,
+    // closes with 1012 (what a draining Aquifer sends) on "bye", and
+    // refuses a bad cursor with 409 the way Aquifer does.
+    async fn start_ws_instance() -> String {
+        use axum::extract::ws::{CloseFrame, Message, WebSocketUpgrade};
+        use axum::extract::RawQuery;
+        async fn handler(RawQuery(query): RawQuery, headers: axum::http::HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+            let query = query.unwrap_or_default();
+            if query.contains("after=gone") {
+                return (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "replay gap" }))).into_response();
+            }
+            let seen = serde_json::json!({
+                "query": query,
+                "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
+                "upstream_url": headers.get("x-aqueduct-upstream-url").and_then(|v| v.to_str().ok()),
+            });
+            upgrade.protocols(["aqueduct.v1"]).on_upgrade(move |mut socket| async move {
+                let _ = socket.send(Message::Text(seen.to_string().into())).await;
+                while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                    if text.as_str() == "bye" {
+                        let frame = CloseFrame { code: 1012, reason: "server_draining".into() };
+                        let _ = socket.send(Message::Close(Some(frame))).await;
+                        break;
+                    }
+                    let _ = socket.send(Message::Text(format!("echo:{}", text.as_str()).into())).await;
+                }
+            })
+        }
+        let app = Router::new().route("/websocket", get(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr.to_string()
+    }
+
+    async fn register_ws_node(state: &AppState, addr: &str) {
+        let member = assign::Member { role: Some("ws".into()), ..assign::tests::node(addr) };
+        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &member).await.unwrap();
+    }
+
+    fn ws_request(canalis: &str, query: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = format!("ws://{canalis}/websocket?{query}").into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert("Sec-WebSocket-Protocol", "aqueduct.v1".parse().unwrap());
+        headers.insert("Authorization", "Bearer gateway-identity".parse().unwrap());
+        headers.insert("X-Aqueduct-Upstream-URL", "wss://backend.internal/socket".parse().unwrap());
+        headers.insert("X-Aqueduct-User-ID", "acme".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn a_websocket_session_is_routed_to_a_ws_instance_and_piped_both_ways() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (state, _dir) = test_state().await;
+        let instance = start_ws_instance().await;
+        register_ws_node(&state, &instance).await;
+        // An HTTP-only instance alongside: a role-less instance takes both
+        // kinds of traffic, so it has to say `http` to be kept out of this.
+        let http_only = assign::Member { role: Some("http".into()), ..assign::tests::node(&start_plain_ok_mock().await) };
+        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &http_only).await.unwrap();
+        let canalis = serve_canalis(state.clone()).await;
+
+        let (mut socket, response) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1&after=0-0"))
+            .await
+            .unwrap();
+        let protocol = response.headers().get("Sec-WebSocket-Protocol").cloned();
+        let seen: serde_json::Value = match futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap() {
+            Message::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+            other => panic!("expected the instance's first message, got {other:?}"),
+        };
+        socket.send(Message::text("hi")).await.unwrap();
+        let echo = futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap();
+        socket.send(Message::text("bye")).await.unwrap();
+        let close = futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(protocol.unwrap(), "aqueduct.v1", "the instance's subprotocol reaches the client");
+        assert_eq!(seen["query"], "session_id=s1&after=0-0", "session and cursor reach the instance");
+        assert_eq!(seen["authorization"], "Bearer gateway-identity");
+        assert_eq!(seen["upstream_url"], "wss://backend.internal/socket");
+        assert_eq!(echo, Message::text("echo:hi"));
+        match close {
+            Message::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1012, "a draining close passes straight through"),
+            other => panic!("expected the instance's close, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn no_websocket_capable_instance_means_503_with_retry_after() {
+        let (state, _dir) = test_state().await;
+        let http_only = assign::Member { role: Some("http".into()), ..assign::tests::node(&start_plain_ok_mock().await) };
+        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &http_only).await.unwrap();
+        let canalis = serve_canalis(state.clone()).await;
+
+        let err = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap_err();
+        cleanup(&state).await;
+
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 503);
+                assert!(response.headers().get("retry-after").is_some());
+            }
+            other => panic!("expected an HTTP refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_instances_handshake_refusal_reaches_the_client() {
+        let (state, _dir) = test_state().await;
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        let err = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1&after=gone")).await.unwrap_err();
+        cleanup(&state).await;
+
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                assert_eq!(response.status(), 409, "a replay gap is the instance's answer, relayed as-is");
+            }
+            other => panic!("expected an HTTP refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_websocket_connection_cap_is_enforced() {
+        let (mut state, _dir) = test_state().await;
+        state.sockets = Arc::new(websocket::Sockets::with_max(0));
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        let err = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap_err();
+        cleanup(&state).await;
+
+        assert!(matches!(err, tokio_tungstenite::tungstenite::Error::Http(r) if r.status() == 503));
     }
 
     #[tokio::test]
@@ -1999,6 +2162,7 @@ mod tests {
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
             schemas: Arc::new(schemas::SchemaGate::new(false)),
             l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
+            sockets: Arc::new(websocket::Sockets::with_max(100)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
@@ -2075,7 +2239,7 @@ mod tests {
     }
 
     async fn claim(state: &AppState, user_id: &str) -> Option<String> {
-        match assign::assign(&mut state.valkey.clone(), &state.aqueduct, user_id).await.unwrap() {
+        match assign::assign(&mut state.valkey.clone(), &state.aqueduct, user_id, assign::Traffic::Http).await.unwrap() {
             assign::AssignOutcome::Assigned(node) => Some(node.id),
             assign::AssignOutcome::PoolExhausted => None,
         }

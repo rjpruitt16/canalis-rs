@@ -131,6 +131,21 @@ pub enum AssignOutcome {
     PoolExhausted,
 }
 
+/// Which kind of traffic a claim is for. An instance registered with
+/// `role: ws` only gets WebSocket sessions and one with `role: http` only
+/// gets HTTP jobs; one with no role gets both.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Traffic {
+    Http,
+    WebSocket,
+}
+
+impl Traffic {
+    fn accepts(self, role: Option<&str>) -> bool {
+        !matches!((self, role), (Traffic::Http, Some("ws")) | (Traffic::WebSocket, Some("http")))
+    }
+}
+
 /// Same hash Aquifer uses for assignment keys (store.go's hashKey), so
 /// Canalis and Aquifer find each other's assignments.
 pub fn scope_hash(user_id: &str) -> String {
@@ -306,9 +321,15 @@ pub async fn record_fullness(valkey: &mut Valkey, aq: &Aqueduct, id: &str, perce
 }
 
 /// Resolves user_id's instance: their live assignment if they have one
-/// (renewed), otherwise a claim on the best eligible instance, otherwise
-/// PoolExhausted -- every eligible instance is full, and the caller queues.
-pub async fn assign(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str) -> redis::RedisResult<AssignOutcome> {
+/// (renewed), otherwise a claim on the best eligible instance for this kind
+/// of traffic, otherwise PoolExhausted -- every eligible instance is full,
+/// and the caller queues (HTTP) or refuses (WebSocket).
+pub async fn assign(
+    valkey: &mut Valkey,
+    aq: &Aqueduct,
+    user_id: &str,
+    traffic: Traffic,
+) -> redis::RedisResult<AssignOutcome> {
     let all = members(valkey, aq).await?;
     let fullness_keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
     let fullness: Vec<Option<u8>> = if fullness_keys.is_empty() {
@@ -322,7 +343,7 @@ pub async fn assign(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str) -> redis:
         .zip(fullness.iter())
         .filter(|(m, full)| {
             m.is_active()
-                && m.role.as_deref().is_none_or(|role| role != "ws")
+                && traffic.accepts(m.role.as_deref())
                 && m.reserved_for.as_deref().is_none_or(|owner| owner == user_id)
                 && full.is_none_or(|f| f < aq.queue_at_percent)
         })
@@ -338,8 +359,13 @@ pub async fn assign(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str) -> redis:
     });
 
     // Runs even with no candidates: a user who already has a live
-    // assignment keeps it, full or not.
-    let hash = scope_hash(user_id);
+    // assignment keeps it, full or not. A user's WebSocket sessions are
+    // assigned separately from their HTTP jobs (a different scope), since
+    // they may need a different kind of instance.
+    let hash = match traffic {
+        Traffic::Http => scope_hash(user_id),
+        Traffic::WebSocket => scope_hash(&format!("ws\x00{user_id}")),
+    };
     let assign_script = redis::Script::new(ASSIGN_LUA);
     let mut script = assign_script.prepare_invoke();
     script.key(aq.assignment_key(&hash));
@@ -368,6 +394,12 @@ pub async fn assign(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str) -> redis:
 /// Their next request resolves a fresh assignment, or waits in line.
 pub async fn release_user(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str, node_id: &str) -> redis::RedisResult<bool> {
     let hash = scope_hash(user_id);
+    release_scope(valkey, aq, &hash, node_id).await
+}
+
+/// release_user for a user's WebSocket assignment.
+pub async fn release_ws_user(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str, node_id: &str) -> redis::RedisResult<bool> {
+    let hash = scope_hash(&format!("ws\x00{user_id}"));
     release_scope(valkey, aq, &hash, node_id).await
 }
 
@@ -445,7 +477,7 @@ pub(crate) mod tests {
     }
 
     async fn assigned(valkey: &mut Valkey, aq: &Aqueduct, user: &str) -> Option<String> {
-        match assign(valkey, aq, user).await.unwrap() {
+        match assign(valkey, aq, user, Traffic::Http).await.unwrap() {
             AssignOutcome::Assigned(node) => Some(node.id),
             AssignOutcome::PoolExhausted => None,
         }
@@ -553,6 +585,24 @@ pub(crate) mod tests {
         cleanup(&mut v, &aq).await;
 
         assert_eq!(user, None);
+    }
+
+    #[tokio::test]
+    async fn websocket_sessions_go_to_ws_instances_and_http_jobs_to_http_ones() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { role: Some("ws".into()), ..node("ws-node") }).await.unwrap();
+        heartbeat(&mut v, &aq, &Member { role: Some("http".into()), ..node("http-node") }).await.unwrap();
+
+        let ws = match assign(&mut v, &aq, "acme", Traffic::WebSocket).await.unwrap() {
+            AssignOutcome::Assigned(n) => Some(n.id),
+            AssignOutcome::PoolExhausted => None,
+        };
+        let http = assigned(&mut v, &aq, "acme").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(ws.as_deref(), Some("ws-node"), "the same user's socket and jobs can live on different instances");
+        assert_eq!(http.as_deref(), Some("http-node"));
     }
 
     #[tokio::test]
