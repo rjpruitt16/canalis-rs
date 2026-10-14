@@ -55,6 +55,8 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 
 `/register` takes the port an instance listens on (its address is derived from the caller's connecting IP plus that port) and re-sends on every heartbeat; a registration expires on its own if pings stop, with no explicit deregistration call.
 
+**Shutting down.** On SIGTERM Canalis drains, the way Aquifer does: new `/proxy`, `/jobs`, and WebSocket handshakes get `503` + `Retry-After` + `X-Aqueduct-Node-State: draining` and `GET /ready` turns `503`, so whatever is in front retries another Canalis node; open WebSocket sessions get Aquifer's `server_draining` status and then a `1012` close; callers waiting in line get `canalis_draining` and their jobs stay in the line, on disk, until this node starts again; handoffs already under way finish and nothing more leaves the line.
+
 `/proxy` and `/jobs` mirror Aquifer's own request body shape exactly, so a caller already speaking Aquifer's API can point at Canalis with no translation layer.
 
 Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`. Canalis speaks the receiving side of [L8](https://rjpruitt16.github.io/l8-protocol/) (`GET /.well-known/l8`, `POST /l8/challenge`), so those pings arrive signed with no change on the node's side; set `CANALIS_L8_TRUSTED_NODE_KEYS` and `CANALIS_REQUIRE_SIGNED_REGISTRATION=true` to accept only the nodes you run.
@@ -68,6 +70,7 @@ event: canalis_assigned    data: {"job_id":"..."}        (job_id for /jobs calle
 event: queued / completed  ...                           (the node's own stream, /jobs callers)
 event: canalis_result      data: {"status":200,"body":"..."}  (a /proxy answer that isn't a stream)
 event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in line; stream closing)
+event: canalis_draining    data: {"status":"/jobs/k1?user_id=acme"}  (this Canalis node is restarting; still in line)
 ```
 
 **WebSockets.** `GET /websocket` is routed to an instance and piped, frames untouched, both ways. Aquifer's and Spillway's own `/websocket` (an `aqueduct.v1` session over a Valkey transcript) does the ordering, replay, and reconnecting, and since the transcript is in shared Valkey, a client that reconnects through Canalis to a different instance replays what it missed. Canalis picks an instance with `role: ws` (or no role) for the gateway's `X-Aqueduct-User-ID`, else the `session_id`; an instance that can't do WebSockets (an Aquifer without Valkey answers 404) should register with `role: http`. No instance with room means `503` + `Retry-After` at the handshake; an instance's own refusal (a `409` replay gap, say) is relayed; a draining one is skipped. Aquifer's and Spillway's full WebSocket contract passes through Canalis in CI.
@@ -95,4 +98,7 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 | `CANALIS_REQUIRE_SIGNED_REGISTRATION` | `false` | Refuse unsigned registration pings. A ping that is signed but doesn't verify is refused either way |
 | `L8_PRIVATE_KEY` / `CANALIS_L8_KEY_PATH` | *(none)* / `.l8-key` | Canalis's own L8 key: base64 in the env var (Go's 64-byte format or a 32-byte seed), else a key file generated on first start (`/data/.l8-key` in the image) |
 | `CANALIS_WS_MAX_CONNECTIONS` | `10000` | WebSocket sessions open through this Canalis node; past it, new handshakes get `503` |
+| `CANALIS_SHUTDOWN_TIMEOUT_SECONDS` | `30` | On SIGTERM, how long Canalis drains before exiting regardless |
+| `CANALIS_SHUTDOWN_QUIESCE_MS` | `500` | On SIGTERM, how long it keeps answering (with 503s) before closing anything, so load balancers notice |
+| `CANALIS_WS_DRAIN_GRACE_SECONDS` | `5` | On SIGTERM, time an open WebSocket session gets between `server_draining` and its 1012 close |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |

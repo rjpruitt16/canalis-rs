@@ -1,5 +1,6 @@
 mod assign;
 mod l8;
+mod lifecycle;
 mod line;
 mod schemas;
 mod websocket;
@@ -61,6 +62,8 @@ pub struct AppState {
     // WebSocket sockets open through this node, capped by
     // CANALIS_WS_MAX_CONNECTIONS (see websocket.rs).
     sockets: Arc<websocket::Sockets>,
+    // Whether this node is shutting down -- see lifecycle.rs.
+    lifecycle: Arc<lifecycle::Lifecycle>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -158,6 +161,7 @@ async fn main() {
         schemas: Arc::new(schemas::SchemaGate::from_env()),
         l8: Arc::new(l8::L8::from_env().unwrap_or_else(|err| panic!("L8 setup failed: {err}"))),
         sockets: Arc::new(websocket::Sockets::from_env()),
+        lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig::from_env())),
     };
 
     let position_every =
@@ -188,6 +192,7 @@ async fn main() {
         }
     });
 
+    let state_for_shutdown = state.clone();
     let app = router(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
@@ -200,17 +205,89 @@ async fn main() {
     // ConnectInfo<SocketAddr> extractor available in handlers below --
     // without it, register()'s signature wouldn't compile (there'd be
     // nothing supplying that extractor).
+    //
+    // On SIGTERM / Ctrl-C, drain (see lifecycle.rs) and then let the
+    // server stop, after it finishes the requests it already has. A
+    // watchdog makes sure the process exits by CANALIS_SHUTDOWN_TIMEOUT_SECONDS
+    // whatever is still running.
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_state = state_for_shutdown;
+    tokio::spawn(async move {
+        lifecycle::shutdown_signal().await;
+        let timeout = shutdown_state.lifecycle.config.timeout;
+        tracing::info!("shutting down: draining for up to {timeout:?}");
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            tracing::warn!("shutdown timeout reached; exiting with work still in flight");
+            std::process::exit(0);
+        });
+        drain(shutdown_state).await;
+        let _ = stopped_tx.send(());
+    });
+
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(async {
+        let _ = stopped_rx.await;
+    })
     .await
     .expect("server error");
+    tracing::info!("canalis-rs stopped");
+}
+
+// Everything a shutdown does before the HTTP server stops: refuse new work,
+// tell open sessions and waiting callers, give load balancers a moment to
+// notice, then wait for line handoffs and WebSocket grace periods already
+// under way. Bounded by the caller's watchdog.
+async fn drain(state: AppState) {
+    state.lifecycle.begin();
+    let closed = close_waiting_room(&state);
+    tracing::info!("draining: refusing new work; told {closed} waiting callers to reconnect later");
+
+    tokio::time::sleep(state.lifecycle.config.quiesce).await;
+
+    // Open WebSocket sessions close themselves after their grace period
+    // (websocket.rs); line handoffs already under way finish, and nothing
+    // new is taken out of the line.
+    let deadline = Instant::now() + state.lifecycle.config.ws_grace + Duration::from_secs(1);
+    loop {
+        let handoffs = state.draining.lock().map(|d| d.len()).unwrap_or(0);
+        let sockets = state.sockets.open();
+        if handoffs == 0 && (sockets == 0 || Instant::now() >= deadline) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let left = state.line.len().unwrap_or(0);
+    tracing::info!("drained; {left} jobs stay in the line for this node's next start");
+}
+
+// Tells every caller waiting in line with an open stream that this node is
+// going away, and closes their streams. Their jobs stay in the line on
+// disk. Returns how many there were.
+fn close_waiting_room(state: &AppState) -> usize {
+    let waiting: Vec<((String, String), Waiter)> = match state.waiters.lock() {
+        Ok(mut waiters) => waiters.drain().collect(),
+        Err(_) => return 0,
+    };
+    for ((user_id, key), waiter) in &waiting {
+        let _ = waiter.tx.try_send(sse_event(
+            "canalis_draining",
+            serde_json::json!({
+                "note": "this Canalis node is restarting; the job is still in line",
+                "status": format!("/jobs/{key}?user_id={user_id}"),
+            }),
+        ));
+    }
+    waiting.len()
 }
 
 fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/valkey-check", get(valkey_check))
         .route("/register", post(register))
         .route("/.well-known/l8", get(l8_well_known))
@@ -224,6 +301,14 @@ fn router(state: AppState) -> Router {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+// 503 while draining, so whatever routes traffic here stops sending more.
+async fn ready(State(state): State<AppState>) -> Response {
+    if state.lifecycle.is_draining() {
+        return lifecycle::draining_response();
+    }
+    "ready".into_response()
 }
 
 // Real round trip against Valkey: SET a key, then GET it back, so this
@@ -515,6 +600,11 @@ impl Drop for DrainGuard {
 async fn claim_next(
     state: &mut AppState,
 ) -> Result<Option<(line::QueuedJob, assign::Node, DrainGuard)>, BoxError> {
+    // A draining node takes nothing more out of the line: whatever is still
+    // in it waits there, on disk, for this node's next start.
+    if state.lifecycle.is_draining() {
+        return Ok(None);
+    }
     let skip = state.draining.lock().map_err(|e| e.to_string())?.clone();
     let Some(queued) = on_line(&state.line, move |l| l.pop_oldest(&skip)).await? else {
         return Ok(None);
@@ -616,7 +706,7 @@ async fn drain_tenant_backlog(
     let mut last_renewed = Instant::now();
 
     loop {
-        while !node_draining && in_flight.len() < max_concurrent {
+        while !node_draining && !state.lifecycle.is_draining() && in_flight.len() < max_concurrent {
             let job = match pending.take() {
                 Some(job) => job,
                 None => {
@@ -928,10 +1018,16 @@ pub(crate) struct JobRequest {
 }
 
 async fn proxy(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+    if state.lifecycle.is_draining() {
+        return lifecycle::draining_response();
+    }
     forward(state, job, "/proxy").await
 }
 
 async fn jobs(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+    if state.lifecycle.is_draining() {
+        return lifecycle::draining_response();
+    }
     forward(state, job, "/jobs").await
 }
 
@@ -1460,6 +1556,11 @@ mod tests {
             schemas: Arc::new(schemas::SchemaGate::new(false)),
             l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
             sockets: Arc::new(websocket::Sockets::with_max(100)),
+            lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig {
+                timeout: Duration::from_secs(5),
+                quiesce: Duration::ZERO,
+                ws_grace: Duration::from_millis(200),
+            })),
         };
         (state, dir)
     }
@@ -1780,6 +1881,101 @@ mod tests {
             Message::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1012, "a draining close passes straight through"),
             other => panic!("expected the instance's close, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_draining_node_refuses_new_work_but_keeps_registrations_and_status() {
+        let (state, _dir) = test_state().await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        state.lifecycle.begin();
+
+        let job = http.post(format!("http://{canalis}/proxy")).json(&job_for("acme")).send().await.unwrap();
+        let ready = http.get(format!("http://{canalis}/ready")).send().await.unwrap();
+        let ping = http
+            .post(format!("http://{canalis}/register"))
+            .header("content-type", "application/json")
+            .body(r#"{"port":"7100"}"#)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(job.status(), 503);
+        assert_eq!(job.headers()["x-aqueduct-node-state"], "draining", "the same answer a draining Aquifer gives");
+        assert_eq!(job.headers()["retry-after"], "1");
+        assert_eq!(ready.status(), 503, "so a load balancer stops sending here");
+        assert_eq!(ping.status(), 200, "registrations keep working while this node drains");
+    }
+
+    #[tokio::test]
+    async fn an_open_websocket_session_is_told_to_reconnect_then_closed_with_1012() {
+        use tokio_tungstenite::tungstenite::Message;
+        let (state, _dir) = test_state().await;
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap();
+        let _instance_hello = futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap();
+
+        state.lifecycle.begin();
+        let notice = futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap();
+        let close = futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap();
+        let new_session = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s2")).await;
+        cleanup(&state).await;
+
+        let notice: serde_json::Value = match notice {
+            Message::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+            other => panic!("expected server_draining, got {other:?}"),
+        };
+        assert_eq!(notice["type"], "status");
+        assert_eq!(notice["state"], "server_draining", "Aquifer's own drain notice, so clients handle both the same");
+        assert_eq!(notice["retry_after_ms"], 200);
+        match close {
+            Message::Close(Some(frame)) => assert_eq!(u16::from(frame.code), 1012),
+            other => panic!("expected a 1012 close, got {other:?}"),
+        }
+        assert!(
+            matches!(new_session, Err(tokio_tungstenite::tungstenite::Error::Http(ref r)) if r.status() == 503),
+            "and new sessions are refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_callers_hear_canalis_is_draining_and_their_jobs_stay_in_line() {
+        let (state, _dir) = test_state().await;
+        let response = forward_with_config(state.clone(), job_for("acme"), "/proxy", &generous_wait_retry_config()).await;
+
+        state.lifecycle.begin();
+        let told = close_waiting_room(&state);
+        let stream = read_all(response).await;
+        cleanup(&state).await;
+
+        assert_eq!(told, 1);
+        assert_eq!(event_names(&stream), ["canalis_queued", "canalis_draining"]);
+        assert_eq!(state.line.len().unwrap(), 1, "the job waits on disk for this node's next start");
+    }
+
+    #[tokio::test]
+    async fn nothing_leaves_the_line_once_draining_starts() {
+        let (state, _dir) = test_state().await;
+        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        register_node(&state, &start_plain_ok_mock().await).await;
+
+        state.lifecycle.begin();
+        let drained_any = try_drain_one(state.clone()).await.unwrap();
+        cleanup(&state).await;
+
+        assert!(!drained_any);
+        assert_eq!(state.line.len().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_finishes_promptly_when_nothing_is_open() {
+        let (state, _dir) = test_state().await;
+        let finished = tokio::time::timeout(Duration::from_secs(3), drain(state.clone())).await;
+        cleanup(&state).await;
+        assert!(finished.is_ok());
+        assert!(state.lifecycle.is_draining());
     }
 
     #[tokio::test]
@@ -2163,6 +2359,11 @@ mod tests {
             schemas: Arc::new(schemas::SchemaGate::new(false)),
             l8: Arc::new(l8::L8::new(l8::tests::new_key(), None, false)),
             sockets: Arc::new(websocket::Sockets::with_max(100)),
+            lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig {
+                timeout: Duration::from_secs(5),
+                quiesce: Duration::ZERO,
+                ws_grace: Duration::from_millis(200),
+            })),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
