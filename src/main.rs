@@ -2,6 +2,7 @@ mod assign;
 mod l8;
 mod lifecycle;
 mod line;
+mod metrics;
 mod scale;
 mod schemas;
 mod websocket;
@@ -70,6 +71,8 @@ pub struct AppState {
     scale: Arc<scale::ScaleSignal>,
     // WebSocket sessions waiting for an instance with room (websocket.rs).
     ws_room: Arc<websocket::WaitingRoom>,
+    // Counters for GET /metrics -- see metrics.rs.
+    metrics: Arc<metrics::Metrics>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -170,6 +173,7 @@ async fn main() {
         lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig::from_env())),
         scale: Arc::new(scale::ScaleSignal::from_env()),
         ws_room: Arc::new(websocket::WaitingRoom::from_env()),
+        metrics: Arc::default(),
     };
 
     let room_handout = state.clone();
@@ -313,6 +317,8 @@ fn router(state: AppState) -> Router {
         .route("/jobs", post(jobs))
         .route("/jobs/{idempotent_key}", get(job_status))
         .route("/websocket", get(websocket::handler))
+        .route("/metrics", get(metrics::handler))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), metrics::track))
         .with_state(state)
 }
 
@@ -348,7 +354,9 @@ async fn check_scale(state: &AppState) {
         return;
     }
     let fleet = assign::fleet(&mut state.valkey.clone(), &state.aqueduct).await.unwrap_or_default();
-    state.scale.check(jobs, oldest, fleet).await;
+    if state.scale.check(jobs, oldest, fleet).await {
+        state.metrics.inc("canalis_scale_signals_total", &[]);
+    }
 }
 
 // 503 while draining, so whatever routes traffic here stops sending more.
@@ -1165,6 +1173,7 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Dur
         }
         Err(line::LineError::Full { reason, limit }) => {
             unregister(&state);
+            state.metrics.inc("canalis_line_rejected_total", &[("reason", reason)]);
             return line_full_response(reason, limit, state.line.limits().retry_after_seconds);
         }
         Err(err) => {
@@ -1254,6 +1263,7 @@ async fn forward_with_config(
         return first;
     }
     tracing::info!("{node_id} is draining; re-routing {user_id}");
+    state.metrics.inc("canalis_reroutes_total", &[]);
     forward_attempt(state, job, target_path, config).await
 }
 
@@ -1611,6 +1621,7 @@ mod tests {
             })),
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
+            metrics: Arc::default(),
         };
         (state, dir)
     }
@@ -2045,6 +2056,31 @@ mod tests {
         assert_eq!(health["instances"]["total"], 1);
         assert_eq!(health["instances"]["accepting"], 1);
         assert_eq!(health["websocket"]["open"], 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_report_responses_the_line_and_each_instance() {
+        let (state, _dir) = test_state().await;
+        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        let mock = start_plain_ok_mock().await;
+        register_node(&state, &mock).await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        reqwest::get(format!("http://{canalis}/health")).await.unwrap();
+        reqwest::get(format!("http://{canalis}/jobs/nope")).await.unwrap();
+        let response = reqwest::get(format!("http://{canalis}/metrics")).await.unwrap();
+        let content_type = response.headers()["content-type"].to_str().unwrap().to_string();
+        let text = response.text().await.unwrap();
+        cleanup(&state).await;
+
+        assert!(content_type.starts_with("text/plain; version=0.0.4"));
+        assert!(text.contains("canalis_http_responses_total{route=\"/health\",status=\"200\"} 1\n"), "{text}");
+        assert!(text.contains("canalis_http_responses_total{route=\"/jobs/{idempotent_key}\",status=\"400\"} 1\n"), "{text}");
+        assert!(text.contains("canalis_line_jobs 1\n"));
+        assert!(text.contains("canalis_valkey_up 1\n"));
+        assert!(text.contains("canalis_instances_accepting 1\n"));
+        assert!(text.contains("canalis_instance_up{instance=\""), "{text}");
+        assert!(text.contains("canalis_draining 0\n"));
     }
 
     #[tokio::test]
@@ -2554,6 +2590,7 @@ mod tests {
             })),
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
+            metrics: Arc::default(),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

@@ -129,6 +129,9 @@ by Canalis.
    CANALIS_SCALE_AFTER_SECONDS sends `canalis_scale_up` to
    CANALIS_SCALE_WEBHOOK_URL (rate-limited); `GET /health` has the same
    line and fleet numbers. Starting instances stays outside Canalis.
+5. **Metrics.** Done (`src/metrics.rs`): Prometheus text at `GET /metrics`.
+   Counters are bumped where things happen. Gauges are read fresh from
+   the line, Valkey and the socket counts on every scrape.
 
 Everything below is the earlier design history, kept for the record.
 
