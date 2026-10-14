@@ -121,7 +121,10 @@ by Canalis.
    1012 close, tells waiting callers `canalis_draining` (jobs stay on
    disk), stops taking jobs out of the line, and lets handoffs and
    in-flight requests finish, within CANALIS_SHUTDOWN_TIMEOUT_SECONDS.
-4. Later: line length as the signal to scale out more nodes.
+4. **Scale-out signal.** Done (`src/scale.rs`): a job waiting longer than
+   CANALIS_SCALE_AFTER_SECONDS sends `canalis_scale_up` to
+   CANALIS_SCALE_WEBHOOK_URL (rate-limited); `GET /health` has the same
+   line and fleet numbers. Starting instances stays outside Canalis.
 
 Everything below is the earlier design history, kept for the record.
 

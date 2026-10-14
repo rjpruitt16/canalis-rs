@@ -56,6 +56,7 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 `/register` takes the port an instance listens on (its address is derived from the caller's connecting IP plus that port) and re-sends on every heartbeat; a registration expires on its own if pings stop, with no explicit deregistration call.
 
 **Shutting down.** On SIGTERM Canalis drains, the way Aquifer does: new `/proxy`, `/jobs`, and WebSocket handshakes get `503` + `Retry-After` + `X-Aqueduct-Node-State: draining` and `GET /ready` turns `503`, so whatever is in front retries another Canalis node; open WebSocket sessions get Aquifer's `server_draining` status and then a `1012` close; callers waiting in line get `canalis_draining` and their jobs stay in the line, on disk, until this node starts again; handoffs already under way finish and nothing more leaves the line.
+**Asking for more capacity.** The line is for the gap until more instances are running, not a substitute for them. Once a job has waited `CANALIS_SCALE_AFTER_SECONDS`, Canalis POSTs a `canalis_scale_up` signal to `CANALIS_SCALE_WEBHOOK_URL`, and whatever starts instances decides what to do; Canalis doesn't start infrastructure itself. `GET /health` reports the same numbers for anything that polls: `{"status":"ok","line":{"jobs":42,"oldest_wait_seconds":17},"instances":{"total":3,"accepting":0},"websocket":{"open":12}}`.
 
 `/proxy` and `/jobs` mirror Aquifer's own request body shape exactly, so a caller already speaking Aquifer's API can point at Canalis with no translation layer.
 
@@ -101,4 +102,7 @@ event: canalis_draining    data: {"status":"/jobs/k1?user_id=acme"}  (this Canal
 | `CANALIS_SHUTDOWN_TIMEOUT_SECONDS` | `30` | On SIGTERM, how long Canalis drains before exiting regardless |
 | `CANALIS_SHUTDOWN_QUIESCE_MS` | `500` | On SIGTERM, how long it keeps answering (with 503s) before closing anything, so load balancers notice |
 | `CANALIS_WS_DRAIN_GRACE_SECONDS` | `5` | On SIGTERM, time an open WebSocket session gets between `server_draining` and its 1012 close |
+| `CANALIS_SCALE_WEBHOOK_URL` | *(none)* | Where to POST `{"event":"canalis_scale_up", "line_jobs", "oldest_wait_seconds", "instances":{"total","accepting"}}` when the line backs up, for whatever adds instances (a script against your cloud's API, a controller) |
+| `CANALIS_SCALE_AFTER_SECONDS` | `10` | How long a job must have waited in line before the scale-up signal goes out |
+| `CANALIS_SCALE_WEBHOOK_INTERVAL_SECONDS` | `60` | At most one scale-up signal per this many seconds, per Canalis node |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |
