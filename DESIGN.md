@@ -97,9 +97,14 @@ by Canalis.
    `CANALIS_L8_SCHEMA_VALIDATION`): a job whose body breaks its upstream's
    published schema gets the same `422` Aquifer returns, before it reaches
    the line or any instance; same caching, hash, and no-external-`$ref`
-   rules as Aquifer's `l8_schema.go`. Next: verify registration pings
-   with L8, trusting only allowlisted node keys
-   (`CANALIS_L8_TRUSTED_NODE_KEYS`, `CANALIS_REQUIRE_SIGNED_REGISTRATION`): Aquifer only signs a delivery once the receiver has an L8
+   rules as Aquifer's `l8_schema.go`. Done too: signed registration
+   (`src/l8.rs`). Canalis serves `/.well-known/l8` and `/l8/challenge`, so
+   Aquifer and Spillway sign their pings on their own; with
+   `CANALIS_L8_TRUSTED_NODE_KEYS` only allowlisted keys can complete the
+   handshake or sign a ping, and `CANALIS_REQUIRE_SIGNED_REGISTRATION`
+   refuses unsigned ones. Verified with two real Aquifers (allowlisted one
+   registers, the other is refused at the handshake and then at
+   `/register`); not yet run against a real Spillway. Original notes: Aquifer only signs a delivery once the receiver has an L8
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
    of L8, which overlaps the later trust-broker work.
