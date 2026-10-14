@@ -58,6 +58,14 @@ curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","ur
 **Shutting down.** On SIGTERM Canalis drains, the way Aquifer does: new `/proxy`, `/jobs`, and WebSocket handshakes get `503` + `Retry-After` + `X-Aqueduct-Node-State: draining` and `GET /ready` turns `503`, so whatever is in front retries another Canalis node; open WebSocket sessions get Aquifer's `server_draining` status and then a `1012` close; callers waiting in line get `canalis_draining` and their jobs stay in the line, on disk, until this node starts again; handoffs already under way finish and nothing more leaves the line.
 **Asking for more capacity.** The line is for the gap until more instances are running, not a substitute for them. Once a job has waited `CANALIS_SCALE_AFTER_SECONDS`, Canalis POSTs a `canalis_scale_up` signal to `CANALIS_SCALE_WEBHOOK_URL`, and whatever starts instances decides what to do; Canalis doesn't start infrastructure itself. `GET /health` reports the same numbers for anything that polls: `{"status":"ok","line":{"jobs":42,"oldest_wait_seconds":17},"instances":{"total":3,"accepting":0},"websocket":{"open":12}}`.
 
+**Metrics.** `GET /metrics` is Prometheus text. It covers:
+
+- every response by route and status (`canalis_http_responses_total`), which includes 429s for a full line, 422s from the schema gate, 401s for refused registrations and draining 503s;
+- time to response headers by route (`canalis_http_request_duration_seconds`);
+- the line (`canalis_line_jobs`, `canalis_line_oldest_wait_seconds`, `canalis_line_rejected_total{reason}`);
+- each instance's state, fullness, active users and capacity (`canalis_instance_*`);
+- open and waiting WebSockets, re-routes away from draining instances, scale-up signals sent, and `canalis_valkey_up`.
+
 `/proxy` and `/jobs` mirror Aquifer's own request body shape exactly, so a caller already speaking Aquifer's API can point at Canalis with no translation layer.
 
 Aquifer and Spillway register themselves when `AQUIFER_REGISTRY_URL` / `SPILLWAY_REGISTRY_URL` points at Canalis's `/register`. Canalis speaks the receiving side of [L8](https://rjpruitt16.github.io/l8-protocol/) (`GET /.well-known/l8`, `POST /l8/challenge`), so those pings arrive signed with no change on the node's side; set `CANALIS_L8_TRUSTED_NODE_KEYS` and `CANALIS_REQUIRE_SIGNED_REGISTRATION=true` to accept only the nodes you run.

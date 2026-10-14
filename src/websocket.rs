@@ -116,6 +116,10 @@ impl WaitingRoom {
         self.lock().is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
     // Joins the back (or, after a draining instance turned it away, the
     // front) of the line; None when the room is full.
     fn join(&self, user: &str, front: bool) -> Option<(u64, tokio::sync::oneshot::Receiver<assign::Node>)> {
@@ -230,6 +234,7 @@ async fn wait_for_instance(
             _ = tokio::time::sleep(Duration::from_millis(500)) => continue,
             _ = &mut deadline => {
                 state.ws_room.leave(id);
+                state.metrics.inc("canalis_websocket_wait_timeouts_total", &[]);
                 close(&mut client, 1013, "no WebSocket instance had room in time; retry through the gateway").await;
                 return;
             }

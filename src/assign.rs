@@ -331,14 +331,21 @@ pub struct Fleet {
 }
 
 pub async fn fleet(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Fleet> {
-    let all = members(valkey, aq).await?;
-    let keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
-    let fullness: Vec<Option<u8>> = if keys.is_empty() { Vec::new() } else { valkey.mget(&keys).await? };
-    let active: Vec<(&Member, &Option<u8>)> = all.iter().zip(fullness.iter()).filter(|(m, _)| m.is_active()).collect();
+    let all = instances(valkey, aq).await?;
+    let active: Vec<&(Member, Option<u8>)> = all.iter().filter(|(m, _)| m.is_active()).collect();
     Ok(Fleet {
         total: active.len(),
         accepting: active.iter().filter(|(_, f)| f.is_none_or(|f| f < aq.queue_at_percent)).count(),
     })
+}
+
+/// Every registered instance with the fullness it last reported, for
+/// GET /metrics.
+pub async fn instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<(Member, Option<u8>)>> {
+    let all = members(valkey, aq).await?;
+    let keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
+    let fullness: Vec<Option<u8>> = if keys.is_empty() { Vec::new() } else { valkey.mget(&keys).await? };
+    Ok(all.into_iter().zip(fullness).collect())
 }
 
 /// Resolves user_id's instance: their live assignment if they have one
