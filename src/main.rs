@@ -68,6 +68,8 @@ pub struct AppState {
     // Tells whatever adds instances that the line is backing up -- see
     // scale.rs.
     scale: Arc<scale::ScaleSignal>,
+    // WebSocket sessions waiting for an instance with room (websocket.rs).
+    ws_room: Arc<websocket::WaitingRoom>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -167,7 +169,16 @@ async fn main() {
         sockets: Arc::new(websocket::Sockets::from_env()),
         lifecycle: Arc::new(lifecycle::Lifecycle::new(lifecycle::ShutdownConfig::from_env())),
         scale: Arc::new(scale::ScaleSignal::from_env()),
+        ws_room: Arc::new(websocket::WaitingRoom::from_env()),
     };
+
+    let room_handout = state.clone();
+    tokio::spawn(async move {
+        loop {
+            websocket::hand_out(&room_handout).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
 
     let position_every =
         Duration::from_millis(env_u64("CANALIS_POSITION_INTERVAL_MS", 1_000).max(50));
@@ -1599,6 +1610,7 @@ mod tests {
                 ws_grace: Duration::from_millis(200),
             })),
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
+            ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
         };
         (state, dir)
     }
@@ -2036,10 +2048,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_websocket_capable_instance_means_503_with_retry_after() {
-        let (state, _dir) = test_state().await;
-        let http_only = assign::Member { role: Some("http".into()), ..assign::tests::node(&start_plain_ok_mock().await) };
-        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &http_only).await.unwrap();
+    async fn a_full_websocket_waiting_room_means_503_with_retry_after() {
+        let (mut state, _dir) = test_state().await;
+        state.ws_room = Arc::new(websocket::WaitingRoom::new(0, Duration::from_secs(5)));
         let canalis = serve_canalis(state.clone()).await;
 
         let err = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap_err();
@@ -2052,6 +2063,126 @@ mod tests {
             }
             other => panic!("expected an HTTP refusal, got {other:?}"),
         }
+    }
+
+    type ClientSocket =
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    // The next message, as JSON if it's text, or {"close": code}.
+    async fn next_json(socket: &mut ClientSocket) -> serde_json::Value {
+        use tokio_tungstenite::tungstenite::Message;
+        let next = tokio::time::timeout(Duration::from_secs(5), futures_util::StreamExt::next(socket)).await;
+        match next.expect("timed out waiting for a message").unwrap().unwrap() {
+            Message::Text(text) => serde_json::from_str(text.as_str()).unwrap_or(serde_json::json!({ "text": text.as_str() })),
+            Message::Close(frame) => serde_json::json!({ "close": frame.map(|f| u16::from(f.code)) }),
+            other => serde_json::json!({ "other": format!("{other:?}") }),
+        }
+    }
+
+    // In tests nothing runs the hand-out ticker on its own.
+    fn run_hand_out(state: &AppState) -> tokio::task::JoinHandle<()> {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                websocket::hand_out(&state).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_session_waits_in_the_room_then_connects_once_an_instance_has_room() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (state, _dir) = test_state().await;
+        let canalis = serve_canalis(state.clone()).await;
+        let ticker = run_hand_out(&state);
+
+        let (mut socket, response) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap();
+        let waiting = next_json(&mut socket).await;
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let assigned = next_json(&mut socket).await;
+        let hello = next_json(&mut socket).await;
+        socket.send(Message::text("hi")).await.unwrap();
+        let echo = next_json(&mut socket).await;
+        ticker.abort();
+        cleanup(&state).await;
+
+        assert_eq!(response.headers()["sec-websocket-protocol"], "aqueduct.v1", "the client's subprotocol, agreed up front");
+        assert_eq!(waiting, serde_json::json!({ "type": "status", "state": "canalis_waiting", "position": 1 }));
+        assert_eq!(assigned, serde_json::json!({ "type": "status", "state": "canalis_assigned" }));
+        assert_eq!(hello["query"], "session_id=s1", "then the instance's own session, with the client's query");
+        assert_eq!(echo["text"], "echo:hi");
+    }
+
+    #[tokio::test]
+    async fn waiting_sessions_are_served_oldest_first_and_hear_their_place_move() {
+        let (state, _dir) = test_state().await;
+        // One ws instance with room for one session, already taken.
+        let instance = start_ws_instance().await;
+        let member = assign::Member { role: Some("ws".into()), capacity: 1, ..assign::tests::node(&instance) };
+        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &member).await.unwrap();
+        assert!(matches!(
+            assign::assign(&mut state.valkey.clone(), &state.aqueduct, "busy", assign::Traffic::WebSocket).await.unwrap(),
+            assign::AssignOutcome::Assigned(_)
+        ));
+        let canalis = serve_canalis(state.clone()).await;
+
+        let (mut first, _) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=first")).await.unwrap();
+        let first_waiting = next_json(&mut first).await;
+        let mut second_request = ws_request(&canalis, "session_id=second");
+        second_request.headers_mut().insert("X-Aqueduct-User-ID", "second-user".parse().unwrap());
+        let (mut second, _) = tokio_tungstenite::connect_async(second_request).await.unwrap();
+        let second_waiting = next_json(&mut second).await;
+
+        // The busy session ends; its room goes to whoever waited longest.
+        assign::release_ws_user(&mut state.valkey.clone(), &state.aqueduct, "busy", &instance).await.unwrap();
+        let ticker = run_hand_out(&state);
+        let first_assigned = next_json(&mut first).await;
+        assign::release_ws_user(&mut state.valkey.clone(), &state.aqueduct, "acme", &instance).await.unwrap();
+        let second_moved = next_json(&mut second).await;
+        ticker.abort();
+        cleanup(&state).await;
+
+        assert_eq!(first_waiting["position"], 1);
+        assert_eq!(second_waiting["position"], 2);
+        assert_eq!(first_assigned["state"], "canalis_assigned", "the oldest waiter goes first");
+        assert!(
+            second_moved["state"] == "canalis_assigned" || second_moved["position"] == 1,
+            "and the next one moves up: {second_moved}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_that_waits_too_long_is_closed_with_1013() {
+        let (mut state, _dir) = test_state().await;
+        state.ws_room = Arc::new(websocket::WaitingRoom::new(10, Duration::from_millis(300)));
+        let canalis = serve_canalis(state.clone()).await;
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap();
+        let waiting = next_json(&mut socket).await;
+        let closed = next_json(&mut socket).await;
+        cleanup(&state).await;
+
+        assert_eq!(waiting["state"], "canalis_waiting");
+        assert_eq!(closed["close"], 1013, "try again later");
+        assert!(state.ws_room.is_empty(), "and it left the room");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_session_hears_canalis_is_draining() {
+        let (state, _dir) = test_state().await;
+        let canalis = serve_canalis(state.clone()).await;
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await.unwrap();
+        let _waiting = next_json(&mut socket).await;
+        state.lifecycle.begin();
+        let notice = next_json(&mut socket).await;
+        let closed = next_json(&mut socket).await;
+        cleanup(&state).await;
+
+        assert_eq!(notice["state"], "server_draining");
+        assert_eq!(closed["close"], 1012);
     }
 
     #[tokio::test]
@@ -2422,6 +2553,7 @@ mod tests {
                 ws_grace: Duration::from_millis(200),
             })),
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
+            ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
