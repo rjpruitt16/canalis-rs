@@ -108,14 +108,18 @@ by Canalis.
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
    of L8, which overlaps the later trust-broker work.
-2. **A contract test that the claim script can't drift** between
-   Aquifer's Go copy and Canalis's Rust copy (and Aquifer taking the same
-   optional strict argument, so there's one canonical script).
+2. **A contract test that the claim script can't drift.** Done:
+   aqueduct-runner `test-claim-script`, in Canalis's and Aquifer's CI;
+   Aquifer's script takes the same optional strict argument.
 3. **WebSocket forwarding.** Done (`src/websocket.rs`): routed by role
    through the shared table, piped untouched, `503` when no instance has
    room, a draining instance skipped; the whole Aquifer/Spillway WebSocket
    contract passes through Canalis (aqueduct-runner `test-canalis-websocket`).
-   Not done: a waiting room for sockets (today it's `503` + `Retry-After`).
+   The waiting room for sockets is done too: with no instance free, a
+   session waits oldest-first (`canalis_waiting` with its position, then
+   `canalis_assigned`), new sessions join behind anyone already waiting,
+   and it's bounded by CANALIS_WS_MAX_WAITING (503 past it) and
+   CANALIS_WS_WAIT_TIMEOUT_SECONDS (1013 close).
    Graceful shutdown is done (`src/lifecycle.rs`): SIGTERM refuses new
    work with a draining 503, sends open sessions `server_draining` then a
    1012 close, tells waiting callers `canalis_draining` (jobs stay on
