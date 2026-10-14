@@ -2461,26 +2461,40 @@ mod tests {
         assert_eq!(next_claim, None, "and the draining node isn't offered again");
     }
 
-    // Every response takes `delay`, and advertises the given
-    // max_concurrent/rps under `<header_prefix>Max-Concurrent` /
-    // `<header_prefix>Rps` -- lets a test prove whether
-    // drain_tenant_backlog actually acted on those headers by measuring
-    // wall-clock time.
-    async fn start_delayed_pacing_mock(
+    // Counts what actually reaches an instance: how many requests were in
+    // flight when each one arrived. Every response takes `delay` and
+    // advertises the given max_concurrent/rps under
+    // `<header_prefix>Max-Concurrent` / `<header_prefix>Rps`, so a test can
+    // check drain_tenant_backlog acted on those headers by what the
+    // instance saw, not by wall-clock time (which a busy CI machine skews).
+    #[derive(Clone, Default)]
+    struct Concurrency {
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        seen_at_arrival: Arc<Mutex<Vec<usize>>>,
+    }
+
+    async fn start_counting_pacing_mock(
         delay: Duration,
         header_prefix: &'static str,
         max_concurrent: &'static str,
         rps: &'static str,
-    ) -> String {
+    ) -> (String, Concurrency) {
+        use std::sync::atomic::Ordering;
+        let counts = Concurrency::default();
+        let state = (delay, header_prefix, max_concurrent, rps, counts.clone());
         async fn handler(
-            AxumState((delay, header_prefix, max_concurrent, rps)): AxumState<(
+            AxumState((delay, header_prefix, max_concurrent, rps, counts)): AxumState<(
                 Duration,
                 &'static str,
                 &'static str,
                 &'static str,
+                Concurrency,
             )>,
         ) -> Response {
+            let now = counts.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            counts.seen_at_arrival.lock().unwrap().push(now);
             tokio::time::sleep(delay).await;
+            counts.in_flight.fetch_sub(1, Ordering::SeqCst);
             Response::builder()
                 .status(200)
                 .header(axum::http::header::CONTENT_TYPE, "application/json")
@@ -2489,15 +2503,13 @@ mod tests {
                 .body(Body::from(r#"{"status":"completed"}"#))
                 .expect("a hardcoded response should always build")
         }
-        let app = Router::new()
-            .route("/jobs", post(handler))
-            .with_state((delay, header_prefix, max_concurrent, rps));
+        let app = Router::new().route("/jobs", post(handler)).with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        addr.to_string()
+        (addr.to_string(), counts)
     }
 
     async fn assert_pacing_header_drives_concurrency(header_prefix: &'static str, user_id_prefix: &str) {
@@ -2506,30 +2518,25 @@ mod tests {
         let user_id = unique(user_id_prefix);
 
         // Every response advertises room for 4 concurrent, at 100rps. The
-        // *first* job still goes out alone against the conservative
-        // default, so: job 1 pays the 300ms delay by itself, then jobs 2-4
-        // pay it together. Fully serial would take ~1200ms; header-driven
-        // concurrency lands close to ~600ms.
-        let delay = Duration::from_millis(300);
-        let mock_addr = start_delayed_pacing_mock(delay, header_prefix, "4", "100").await;
-
+        // first job goes out alone, against the conservative default (1 at
+        // a time); once its response says 4, the other three go out
+        // together. Ignoring the headers would mean one at a time
+        // throughout.
+        let (mock_addr, counts) = start_counting_pacing_mock(Duration::from_millis(300), header_prefix, "4", "100").await;
         for _ in 0..4 {
             state.line.enqueue(&job_for(&user_id), "/jobs").unwrap();
         }
         register_node(&state, &mock_addr).await;
 
-        let start = Instant::now();
         try_drain_one(state).await.unwrap();
-        let elapsed = start.elapsed();
         cleanup(&cleanup_state).await;
 
+        let arrivals = counts.seen_at_arrival.lock().unwrap().clone();
+        assert_eq!(arrivals.len(), 4, "all four jobs reached the instance");
+        assert_eq!(arrivals[0], 1, "the first job goes out alone, before anything's been learned");
         assert!(
-            elapsed < Duration::from_millis(900),
-            "expected {header_prefix}-driven concurrency to clear 4 jobs in ~2 waves of {delay:?}, not 4 sequential waves; took {elapsed:?}"
-        );
-        assert!(
-            elapsed >= delay,
-            "expected at least one full delay's worth of real waiting (job 1 always goes out alone), took {elapsed:?}"
+            arrivals.iter().max().copied().unwrap_or(0) >= 2,
+            "{header_prefix}Max-Concurrent: 4 should let later jobs overlap; in flight at each arrival: {arrivals:?}"
         );
     }
 
