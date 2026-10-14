@@ -1,0 +1,43 @@
+# A local stack: Valkey, Canalis, and two Aquifer instances that register
+# themselves with Canalis. `docker compose up --build`, then:
+#   curl localhost:8080/health
+#   curl localhost:8080/metrics
+# Aquifer is built straight from its GitHub repo; set AQUIFER_REF to try a
+# branch (AQUIFER_REF=my-branch docker compose up --build).
+services:
+  valkey:
+    image: valkey/valkey:8
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 2s
+      retries: 10
+
+  canalis:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      CANALIS_VALKEY_URL: redis://valkey:6379
+      RUST_LOG: info
+    volumes:
+      - canalis-data:/data
+    depends_on:
+      valkey:
+        condition: service_healthy
+
+  aquifer:
+    build:
+      context: https://github.com/rjpruitt16/aquifer.git#${AQUIFER_REF:-main}
+      # The HTTP adapter (plain upstream HTTP calls), not the default
+      # MCP stdio one.
+      dockerfile: Dockerfile.bench
+    deploy:
+      replicas: 2
+    environment:
+      # Canalis records each instance at its connecting IP plus this port.
+      AQUIFER_REGISTRY_URL: http://canalis:8080/register
+    depends_on:
+      - canalis
+
+volumes:
+  canalis-data:

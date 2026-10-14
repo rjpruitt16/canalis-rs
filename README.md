@@ -40,7 +40,16 @@ When an instance frees up, Canalis doesn't just release one queued job and wait 
 
 ## Quick start
 
-Needs a running Valkey (or Redis) instance and at least one Aquifer or Spillway instance to route to.
+The quickest way to try it is the compose file, which starts Valkey, Canalis and two Aquifer instances that register themselves:
+
+```bash
+docker compose up --build
+curl localhost:8080/health      # "instances":{"total":2,...}
+curl -X POST localhost:8080/proxy -d '{"user_id":"acme","idempotent_key":"k1","url":"http://canalis:8080/health","method":"GET","webhook_url":"http://canalis:8080/health"}'
+curl localhost:8080/metrics
+```
+
+To run the image by itself, you need a Valkey (or Redis) instance and at least one Aquifer or Spillway instance to route to:
 
 ```bash
 docker build -t canalis-rs .
@@ -50,7 +59,7 @@ docker run -p 8080:8080 -v $(pwd)/data:/data -e CANALIS_VALKEY_URL=redis://your-
 ```bash
 curl localhost:8080/health
 curl -X POST localhost:8080/register -d '{"port":"9090","reported_at":"2026-09-04T12:00:00Z"}'
-curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","url":"https://example.com","method":"GET"}'
+curl -X POST localhost:8080/jobs -d '{"user_id":"acme","idempotent_key":"k1","url":"https://example.com","method":"GET","webhook_url":"https://yourapp.com/webhooks/aquifer"}'
 ```
 
 `/register` takes the port an instance listens on (its address is derived from the caller's connecting IP plus that port) and re-sends on every heartbeat; a registration expires on its own if pings stop, with no explicit deregistration call.
