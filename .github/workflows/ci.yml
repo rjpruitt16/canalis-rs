@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # The tests talk to a real Valkey on 127.0.0.1:6379 (each test under
+    # its own key prefix, see assign::tests::test_aqueduct).
+    services:
+      valkey:
+        image: valkey/valkey:8
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  # Canalis against the real nodes it routes to, through aqueduct-runner:
+  # Aquifer and Spillway registering, both signing their pings to a Canalis
+  # that only trusts them, and Canalis's copy of the claim script matching
+  # Aquifer's.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout canalis-rs
+        uses: actions/checkout@v4
+        with:
+          path: canalis-rs
+
+      - name: Checkout aquifer
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aquifer
+          path: aquifer
+
+      - name: Checkout spillway
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/spillway
+          path: spillway
+
+      - name: Pick the aqueduct-runner branch
+        id: runner
+        env:
+          BRANCH: ${{ github.head_ref }}
+        # A runner branch with the same name as this PR's branch carries the
+        # matching contract change; test against it. Otherwise use main.
+        run: |
+          ref=main
+          if [ -n "$BRANCH" ] && git ls-remote --exit-code --heads https://github.com/rjpruitt16/aqueduct-runner "$BRANCH" >/dev/null; then
+            ref="$BRANCH"
+          fi
+          echo "Testing with aqueduct-runner@$ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout aqueduct-runner
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/aqueduct-runner
+          ref: ${{ steps.runner.outputs.ref }}
+          path: aqueduct-runner
+
+      - name: Contract test -- Aquifer registers with Canalis
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-registration
+            --aquifer-source=./aquifer
+            --canalis-source=./canalis-rs
+
+      - name: Contract test -- Spillway registers with Canalis
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-spillway-registration
+            --spillway-source=./spillway
+            --canalis-source=./canalis-rs
+
+      - name: Contract test -- only allowlisted Aquifer and Spillway nodes can register
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-signed-registration
+            --aquifer-source=./aquifer
+            --spillway-source=./spillway
+            --canalis-source=./canalis-rs
+
+      - name: Contract test -- Canalis and Aquifer claim users with the same Lua
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-claim-script
+            --aquifer-source=./aquifer
+            --canalis-source=./canalis-rs
