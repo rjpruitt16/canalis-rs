@@ -111,8 +111,12 @@ by Canalis.
 2. **A contract test that the claim script can't drift** between
    Aquifer's Go copy and Canalis's Rust copy (and Aquifer taking the same
    optional strict argument, so there's one canonical script).
-3. **WebSocket forwarding**, routed by node role, with connection limits
-   and graceful drain.
+3. **WebSocket forwarding.** Done (`src/websocket.rs`): routed by role
+   through the shared table, piped untouched, `503` when no instance has
+   room, a draining instance skipped; the whole Aquifer/Spillway WebSocket
+   contract passes through Canalis (aqueduct-runner `test-canalis-websocket`).
+   Not done: a waiting room for sockets (today it's `503` + `Retry-After`),
+   and draining Canalis's own sockets on shutdown.
 4. Later: line length as the signal to scale out more nodes.
 
 Everything below is the earlier design history, kept for the record.
