@@ -93,10 +93,13 @@ by Canalis.
 
 **Still to do, in order:**
 
-1. **L8 at the gate.** Canalis implements L8 itself, including v0.2
-   `request_schemas`: requests that don't match a backend's published
-   schema are blocked before they reach any node. Verify registration pings
-   with L8: Aquifer only signs a delivery once the receiver has an L8
+1. **L8 at the gate.** Done: v0.2 `request_schemas` (`src/schemas.rs`,
+   `CANALIS_L8_SCHEMA_VALIDATION`): a job whose body breaks its upstream's
+   published schema gets the same `422` Aquifer returns, before it reaches
+   the line or any instance; same caching, hash, and no-external-`$ref`
+   rules as Aquifer's `l8_schema.go`. Next: verify registration pings
+   with L8, trusting only allowlisted node keys
+   (`CANALIS_L8_TRUSTED_NODE_KEYS`, `CANALIS_REQUIRE_SIGNED_REGISTRATION`): Aquifer only signs a delivery once the receiver has an L8
    trust established, and Canalis doesn't implement the receiving side
    yet, so today's pings to Canalis arrive unsigned. That's Canalis's half
    of L8, which overlaps the later trust-broker work.

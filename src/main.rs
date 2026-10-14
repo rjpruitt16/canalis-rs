@@ -1,5 +1,6 @@
 mod assign;
 mod line;
+mod schemas;
 
 use axum::{
     body::Body,
@@ -49,6 +50,9 @@ pub struct AppState {
     // Where assignment state lives (Aquifer's shared aqueduct: keys) and
     // the policy around it -- see assign.rs.
     aqueduct: Arc<assign::Aqueduct>,
+    // L8 v0.2 request schemas, checked before a job goes anywhere -- see
+    // schemas.rs. Off unless CANALIS_L8_SCHEMA_VALIDATION=true.
+    schemas: Arc<schemas::SchemaGate>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -143,6 +147,7 @@ async fn main() {
         waiters: Arc::default(),
         next_waiter_id: Arc::default(),
         aqueduct: Arc::new(assign::Aqueduct::from_env()),
+        schemas: Arc::new(schemas::SchemaGate::from_env()),
     };
 
     let position_every =
@@ -675,6 +680,7 @@ async fn dispatch_drained_job(
 
     let pacing = PacingSignal::from_headers(resp.headers());
     remember_fullness(&state.valkey, &state.aqueduct, &node.id, resp.headers());
+    observe_schema_hash(&state, &job.url, resp.headers());
     let stored_headers = headers_to_store(resp.headers());
     let status = resp.status().as_u16();
     let content_type = resp
@@ -1025,6 +1031,12 @@ async fn forward_with_config(
     target_path: &str,
     config: &RetryConfig,
 ) -> Response {
+    // Before anything else: a body the upstream's published schema rejects
+    // never takes a spot in the line or a user slot on an instance.
+    if let Err(mismatch) = state.schemas.check(&job.url, &job.method, job.body.as_deref().unwrap_or("")).await {
+        return schema_mismatch_response(mismatch);
+    }
+
     let mut valkey = state.valkey.clone();
     let user_id = job.user_id.clone();
     let first = forward_attempt(state.clone(), job.clone(), target_path, config).await;
@@ -1124,6 +1136,7 @@ async fn forward_attempt(
     };
 
     remember_fullness(&state.valkey, &state.aqueduct, &node.id, upstream.headers());
+    observe_schema_hash(&state, &job.url, upstream.headers());
     if node_is_draining(upstream.status().as_u16(), upstream.headers()) {
         let mut response = json_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1250,6 +1263,28 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+// Same body as Aquifer's own schema rejection (writeSchemaMismatch), so a
+// client handling one handles both.
+fn schema_mismatch_response(mismatch: schemas::Mismatch) -> Response {
+    json_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        serde_json::json!({
+            "error": format!("request body does not match the schema the upstream advertises for {}", mismatch.route),
+            "schema_route": mismatch.route,
+            "schema_hash": mismatch.schema_hash,
+            "schema_errors": mismatch.detail,
+        }),
+    )
+}
+
+// An upstream's X-Aqueduct-Schema-Hash, relayed by the instance, tells the
+// schema gate when the upstream's contract changed.
+fn observe_schema_hash(state: &AppState, job_url: &str, headers: &reqwest::header::HeaderMap) {
+    if let Some(hash) = headers.get("X-Aqueduct-Schema-Hash").and_then(|v| v.to_str().ok()) {
+        state.schemas.observe_hash(job_url, hash.trim());
+    }
+}
+
 // Same body shape as Aquifer's own admission rejections
 // ({"error", "limit_reason", "limit"}), so a client handling one handles
 // both.
@@ -1367,6 +1402,7 @@ mod tests {
             waiters: Arc::default(),
             next_waiter_id: Arc::default(),
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
+            schemas: Arc::new(schemas::SchemaGate::new(false)),
         };
         (state, dir)
     }
@@ -1542,6 +1578,48 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr.to_string()
+    }
+
+    async fn start_schema_upstream() -> String {
+        async fn well_known() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "protocol_version": "0.2",
+                "public_key": "AAAA",
+                "challenge_endpoint": "/l8/challenge",
+                "schema_hash": "sha256:v1",
+                "request_schemas": { "POST /v1/chat": { "type": "object", "required": ["model"] } }
+            }))
+        }
+        let app = Router::new().route("/.well-known/l8", get(well_known));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_job_that_breaks_its_upstreams_schema_is_blocked_before_the_line() {
+        let (mut state, _dir) = test_state().await;
+        state.schemas = Arc::new(schemas::SchemaGate::new(true));
+        let upstream = start_schema_upstream().await;
+        let mut job = job_for("acme");
+        job.url = format!("{upstream}/v1/chat");
+        job.method = "POST".into();
+        job.body = Some(r#"{"messages": []}"#.into());
+
+        // No instances at all: without the gate this job would wait in line.
+        let response = forward_with_config(state.clone(), job, "/proxy", &short_retry_config()).await;
+        let status = response.status();
+        let body: serde_json::Value = serde_json::from_str(&read_all(response).await).unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["schema_route"], "POST /v1/chat");
+        assert_eq!(body["schema_hash"], "sha256:v1");
+        assert!(body["schema_errors"].as_str().unwrap().contains("model"));
+        assert_eq!(state.line.len().unwrap(), 0, "a rejected job never takes a spot in line");
     }
 
     #[tokio::test]
@@ -1873,6 +1951,7 @@ mod tests {
             waiters: Arc::default(),
             next_waiter_id: Arc::default(),
             aqueduct: Arc::new(assign::tests::test_aqueduct()),
+            schemas: Arc::new(schemas::SchemaGate::new(false)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

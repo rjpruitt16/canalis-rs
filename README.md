@@ -88,4 +88,5 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 | `CANALIS_DEFAULT_USER_CAPACITY` | `100` | Users an instance takes when its record doesn't say (drain-mode instances take 1) |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long an idle user keeps their instance before it's released |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Valkey key prefix for the shared assignment table; must match `AQUIFER_CLUSTER_VALKEY_PREFIX` |
+| `CANALIS_L8_SCHEMA_VALIDATION` | `false` | Check each job's body against the JSON Schema its upstream publishes for that route ([L8 v0.2 `request_schemas`](https://rjpruitt16.github.io/l8-protocol/)) and answer `422` on a mismatch, before the job reaches the line or any instance. External `$ref`s are refused. Off by default because it fetches `/.well-known/l8` from each job's upstream |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' ping interval; a record expires after three missed pings |
