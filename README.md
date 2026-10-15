@@ -100,6 +100,12 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 event: canalis_draining    data: {"status":"/jobs/k1?user_id=acme"}  (this Canalis node is restarting; still in line)
 ```
 
+**Pools.** Instances can be split into pools, for example GPU and CPU instances, regions, or a set of instances dedicated to one customer. A node joins pools by listing them at registration: `AQUIFER_REGISTRY_POOLS=gpu,eu` or `SPILLWAY_REGISTRY_POOLS`. A node that lists none is in the `default` pool. Every ping replaces the list, so a node joins or leaves a pool with its next ping.
+
+A request picks its pool with `X-Aqueduct-Pool: gpu` (a `pool` query parameter also works for WebSockets and `GET /jobs/{key}`). Without one, it goes to the default pool. Requests only reach instances in their pool.
+
+Pools share one set of `aqueduct:` keys rather than a prefix each. So an instance in two pools has one capacity, not one per pool. Each pool has its own place in the line, so a pool with no free instances doesn't hold up the others. Queue positions count only jobs waiting in the same pool. A user's assignment is per pool, and the default pool keeps the plain per-user assignment that Aquifer's cluster mode uses.
+
 **WebSockets.** `GET /websocket` is routed to an instance and piped, frames untouched, both ways. Aquifer's and Spillway's own `/websocket` (an `aqueduct.v1` session over a Valkey transcript) does the ordering, replay, and reconnecting, and since the transcript is in shared Valkey, a client that reconnects through Canalis to a different instance replays what it missed. Canalis picks an instance with `role: ws` (or no role) for the gateway's `X-Aqueduct-User-ID`, else the `session_id`; an instance that can't do WebSockets (an Aquifer without Valkey answers 404) should register with `role: http`. No instance with room means the session waits in Canalis's WebSocket waiting room, oldest first, hearing `{"type":"status","state":"canalis_waiting","position":N}` as the line moves and `canalis_assigned` when an instance takes it (past `CANALIS_WS_MAX_WAITING` the handshake gets `503` + `Retry-After`; past `CANALIS_WS_WAIT_TIMEOUT_SECONDS` the session closes with `1013`); an instance's own refusal (a `409` replay gap, say) is relayed; a draining one is skipped. Aquifer's and Spillway's full WebSocket contract passes through Canalis in CI.
 
 `GET /jobs/{idempotent_key}?user_id=...` answers with the finished result, `202 {"status":"queued","ahead":N}`, or `404`. The line is per Canalis node, so ask the node that queued it.

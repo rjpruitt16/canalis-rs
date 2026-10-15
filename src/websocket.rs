@@ -92,7 +92,7 @@ pub struct WaitingRoom {
 
 struct WaitingSession {
     id: u64,
-    user: String,
+    user: assign::Tenant,
     ready: tokio::sync::oneshot::Sender<assign::Node>,
 }
 
@@ -122,14 +122,14 @@ impl WaitingRoom {
 
     // Joins the back (or, after a draining instance turned it away, the
     // front) of the line; None when the room is full.
-    fn join(&self, user: &str, front: bool) -> Option<(u64, tokio::sync::oneshot::Receiver<assign::Node>)> {
+    fn join(&self, user: &assign::Tenant, front: bool) -> Option<(u64, tokio::sync::oneshot::Receiver<assign::Node>)> {
         let mut queue = self.lock();
         if !front && queue.len() >= self.max_waiting {
             return None;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (ready, rx) = tokio::sync::oneshot::channel();
-        let session = WaitingSession { id, user: user.to_string(), ready };
+        let session = WaitingSession { id, user: user.clone(), ready };
         if front { queue.push_front(session) } else { queue.push_back(session) }
         Some((id, rx))
     }
@@ -172,7 +172,7 @@ pub async fn hand_out(state: &AppState) {
         };
         let handed = session.is_some_and(|s| s.ready.send(node.clone()).is_ok());
         if !handed {
-            let _ = assign::release_ws_user(&mut valkey, &state.aqueduct, &user, &node.id).await;
+            let _ = assign::release(&mut valkey, &state.aqueduct, &user, assign::Traffic::WebSocket, &node.id).await;
         }
     }
 }
@@ -192,7 +192,7 @@ async fn close(client: &mut WebSocket, code: u16, reason: &str) {
 // Everything a waiting session needs to connect once it's handed an
 // instance.
 struct Pending {
-    user: String,
+    user: assign::Tenant,
     query: String,
     headers: HeaderMap,
 }
@@ -255,7 +255,7 @@ async fn wait_for_instance(
             Err(Refused::Draining) => {
                 let mut valkey = state.valkey.clone();
                 let _ = assign::mark_draining(&mut valkey, &state.aqueduct, &node.id).await;
-                let _ = assign::release_ws_user(&mut valkey, &state.aqueduct, &pending.user, &node.id).await;
+                let _ = assign::release(&mut valkey, &state.aqueduct, &pending.user, assign::Traffic::WebSocket, &node.id).await;
                 // Back to the front: it already waited its turn.
                 let Some((new_id, new_ready)) = state.ws_room.join(&pending.user, true) else { return };
                 (id, ready) = (new_id, new_ready);
@@ -334,6 +334,10 @@ pub async fn handler(
     let Some(user) = routing_key(&headers, &query) else {
         return error(StatusCode::BAD_REQUEST, "need an X-Aqueduct-User-ID header or a session_id query parameter");
     };
+    let Some(pool) = crate::request_pool(&headers, query_param(&query, "pool").as_deref()) else {
+        return crate::bad_pool_response();
+    };
+    let user = assign::Tenant::new(user, pool);
 
     // An instance that turned this session away (draining or unreachable)
     // isn't offered it again.
@@ -385,7 +389,7 @@ pub async fn handler(
             Err(Refused::Draining) => {
                 let mut valkey = state.valkey.clone();
                 let _ = assign::mark_draining(&mut valkey, &state.aqueduct, &node.id).await;
-                let _ = assign::release_ws_user(&mut valkey, &state.aqueduct, &user, &node.id).await;
+                let _ = assign::release(&mut valkey, &state.aqueduct, &user, assign::Traffic::WebSocket, &node.id).await;
                 tracing::info!("{} is draining; trying another instance for a WebSocket session", node.id);
                 state.metrics.inc("canalis_reroutes_total", &[]);
                 skip = Some(node.id);
@@ -411,10 +415,14 @@ fn routing_key(headers: &HeaderMap, query: &str) -> Option<String> {
             return Some(user.to_string());
         }
     }
+    query_param(query, "session_id")
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
     reqwest::Url::parse(&format!("http://query/?{query}"))
         .ok()?
         .query_pairs()
-        .find(|(k, _)| k == "session_id")
+        .find(|(k, _)| k == name)
         .map(|(_, v)| v.into_owned())
         .filter(|v| !v.is_empty())
 }
@@ -476,7 +484,7 @@ async fn connect(node: &assign::Node, query: &str, headers: &HeaderMap) -> Resul
 // socket. If this Canalis node starts draining, the client gets Aquifer's
 // own `server_draining` status, then a 1012 close after the grace period,
 // and reconnects through the gateway.
-async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assign::Node, user: String, _slot: OpenSocket) {
+async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assign::Node, user: assign::Tenant, _slot: OpenSocket) {
     let (client_tx, mut client_rx) = client.split();
     let (upstream_tx, mut upstream_rx) = upstream.split();
     let client_tx = Arc::new(tokio::sync::Mutex::new(client_tx));
@@ -541,7 +549,7 @@ async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assi
     }
     let _ = client_tx.lock().await.close().await;
     let _ = upstream_tx.lock().await.close().await;
-    tracing::debug!("WebSocket session for {user} on {} closed", node.id);
+    tracing::debug!("WebSocket session for {} in pool {} on {} closed", user.user, user.pool, node.id);
 }
 
 fn to_tungstenite(message: ws::Message) -> tungstenite::Message {

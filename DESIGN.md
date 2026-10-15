@@ -132,6 +132,11 @@ by Canalis.
 5. **Metrics.** Done (`src/metrics.rs`): Prometheus text at `GET /metrics`.
    Counters are bumped where things happen. Gauges are read fresh from
    the line, Valkey and the socket counts on every scrape.
+7. **Pools.** Done (#20). An instance lists `pools` in its registration (none means `default`), and a request names one with `X-Aqueduct-Pool`.
+   - Pool filtering happens in Rust when choosing candidates, so the shared claim Lua is unchanged.
+   - The assignment scope is `pool\0<pool>\0<user>` outside the default pool, which keeps the plain user scope for Aquifer compatibility.
+   - The line keys tenants as `<pool>\0<user>`, and the sweep skips pools with no free instance.
+   - A sticky assignment to an instance that has since left the pool is released and claimed again.
 6. **Failure handling.** Tested with real processes: instance `kill -9`,
    Valkey paused and stopped, Canalis `kill -9` with jobs queued and with
    a job mid-handoff. Three fixes came out of it:

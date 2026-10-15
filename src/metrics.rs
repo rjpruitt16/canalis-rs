@@ -146,7 +146,13 @@ pub async fn handler(State(state): State<AppState>) -> Response {
         gauge(&mut out, "canalis_instances_accepting", "Live instances that would take a new user now.", &[(vec![], accepting as f64)]);
         let state_of = |m: &assign::Member| m.state.clone().unwrap_or_else(|| "active".into());
         let states: Vec<String> = instances.iter().map(|(m, _)| state_of(m)).collect();
-        let labels = |i: usize| vec![("instance", instances[i].0.id.as_str()), ("state", states[i].as_str())];
+        let pools: Vec<String> = instances
+            .iter()
+            .map(|(m, _)| if m.pools.is_empty() { assign::DEFAULT_POOL.to_string() } else { m.pools.join(",") })
+            .collect();
+        let labels = |i: usize| {
+            vec![("instance", instances[i].0.id.as_str()), ("state", states[i].as_str()), ("pools", pools[i].as_str())]
+        };
         let each = |f: &dyn Fn(usize) -> Option<f64>| -> Vec<(Vec<(&str, &str)>, f64)> {
             (0..instances.len()).filter_map(|i| Some((labels(i), f(i)?))).collect()
         };
