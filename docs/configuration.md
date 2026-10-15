@@ -39,6 +39,23 @@ CI checks that every variable Canalis reads is listed here (`scripts/check-confi
 | `CANALIS_WS_WAIT_TIMEOUT_SECONDS` | `60` | How long a session waits before a 1013 close. |
 | `CANALIS_WS_DRAIN_GRACE_SECONDS` | `5` | On shutdown, time between `server_draining` and the 1012 close. |
 
+## Who a request is for
+
+See [Authentication](../README.md#authentication) in the README.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_AUTH` | `header` | `header`: believe the `user_id` / `X-Aqueduct-User-ID` sent. `upstream-secret`: the same, but only from a gateway that sends the shared secret. `jwt`: verify the caller's token and take the tenant from it. |
+| `CANALIS_UPSTREAM_SECRET` | unset | Required for `upstream-secret`. The gateway sends it as `X-Canalis-Upstream-Secret`. |
+| `CANALIS_JWKS_URL` | unset | Required for `jwt`. The login provider's published signing keys. |
+| `CANALIS_JWT_ISSUER` | unset | Required for `jwt`. The `iss` tokens must have. |
+| `CANALIS_JWT_AUDIENCE` | unset | Comma-separated. If set, `aud` must include one of them. |
+| `CANALIS_JWT_AUTHORIZED_PARTIES` | unset | Comma-separated. If set, `azp` must be one of them (Clerk recommends this). |
+| `CANALIS_JWT_TENANT_CLAIM` | `sub` | The claim that names the tenant, as a dotted path for nested claims (`org_id`, `o.id`). |
+| `CANALIS_JWT_POOL_CLAIM` | unset | A claim naming the request's pool. If present in the token, it overrides `X-Aqueduct-Pool`. |
+| `CANALIS_JWKS_REFRESH_SECONDS` | `600` | How often the key set is refetched. An unknown key id also triggers a refetch, at most every 30s. |
+| `CANALIS_FORWARD_AUTHORIZATION` | `false` | Pass the caller's `Authorization` header (and `access_token`) on to the instance on WebSocket handshakes. |
+
 ## L8 (signed registration, request schemas)
 
 | Variable | Default | What it does |

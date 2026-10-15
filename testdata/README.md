@@ -1,0 +1,1 @@
+Test-only fixtures. `jwt-test-rsa.pem` is an RSA key generated for the JWT tests in `src/auth.rs` (RS256, what Clerk and WorkOS sign with) and `jwt-test-rsa.n` is its public modulus in JWK form. It protects nothing; never trust it anywhere.

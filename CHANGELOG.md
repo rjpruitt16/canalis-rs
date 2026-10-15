@@ -2,6 +2,13 @@
 
 Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor version (0.x) may change the protocol shared with Aquifer and Spillway; the changelog says when it does.
 
+## [Unreleased]
+
+### Added
+
+- **Pools** ([#20](https://github.com/rjpruitt16/canalis-rs/issues/20)): instances join pools at registration (`AQUIFER_REGISTRY_POOLS`, `SPILLWAY_REGISTRY_POOLS`), and requests pick one with `X-Aqueduct-Pool`. Each pool waits in line separately.
+- **Authentication** ([#25](https://github.com/rjpruitt16/canalis-rs/issues/25)): `CANALIS_AUTH=upstream-secret` (trust only your gateway) or `jwt` (verify the caller's token against the provider's JWKS and take the tenant, and optionally the pool, from its claims).
+
 ## [0.1.0] - 2026-10-14
 
 The first release. Canalis is an admission gateway in front of Aquifer and Spillway. It decides whether a request gets in, when, and to which instance, and holds the rest in a line on its own disk.

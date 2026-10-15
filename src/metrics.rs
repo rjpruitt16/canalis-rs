@@ -26,11 +26,12 @@ use std::time::{Duration, Instant};
 
 const BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-const COUNTERS: [(&str, &str); 5] = [
+const COUNTERS: [(&str, &str); 6] = [
     ("canalis_http_responses_total", "Responses sent, by route and status."),
     ("canalis_line_rejected_total", "Jobs turned away because the line was at a limit, by limit."),
     ("canalis_reroutes_total", "Requests and sessions re-routed because their instance was draining or unreachable."),
     ("canalis_scale_signals_total", "canalis_scale_up webhooks sent."),
+    ("canalis_auth_rejected_total", "Requests refused for missing or invalid credentials, or because the provider's keys couldn't be fetched."),
     ("canalis_websocket_wait_timeouts_total", "WebSocket sessions closed with 1013 after waiting too long for an instance."),
 ];
 

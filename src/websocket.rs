@@ -319,7 +319,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 pub async fn handler(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     if state.lifecycle.is_draining() {
@@ -330,12 +330,42 @@ pub async fn handler(
         response.headers_mut().insert("Retry-After", HeaderValue::from(1u32));
         return response;
     };
-    let query = query.unwrap_or_default();
-    let Some(user) = routing_key(&headers, &query) else {
-        return error(StatusCode::BAD_REQUEST, "need an X-Aqueduct-User-ID header or a session_id query parameter");
+    let mut query = query.unwrap_or_default();
+    // Browsers can't set headers on a WebSocket, so a token may come as
+    // ?access_token=.
+    let identity = match state.auth.check(&headers, query_param(&query, "access_token").as_deref()).await {
+        Ok(identity) => identity,
+        Err(rejection) => return crate::auth_rejected(&state, &rejection),
     };
-    let Some(pool) = crate::request_pool(&headers, query_param(&query, "pool").as_deref()) else {
+    if state.auth.strips_credentials() {
+        headers.remove(axum::http::header::AUTHORIZATION);
+        query = without_param(&query, "access_token");
+    }
+    let Some(mut pool) = crate::request_pool(&headers, query_param(&query, "pool").as_deref()) else {
         return crate::bad_pool_response();
+    };
+    let user = match identity {
+        crate::auth::Identity::Verified { tenant, pool: token_pool } => {
+            if let Some(token_pool) = token_pool {
+                if !assign::valid_pool(&token_pool) {
+                    return crate::bad_pool_response();
+                }
+                pool = token_pool;
+            }
+            // The instance sees the verified tenant, not whatever the
+            // client claimed.
+            let Ok(value) = HeaderValue::from_str(&tenant) else {
+                return error(StatusCode::BAD_REQUEST, "the token's tenant can't be sent as a header");
+            };
+            headers.insert("X-Aqueduct-User-ID", value);
+            tenant
+        }
+        crate::auth::Identity::AsSent => {
+            let Some(user) = routing_key(&headers, &query) else {
+                return error(StatusCode::BAD_REQUEST, "need an X-Aqueduct-User-ID header or a session_id query parameter");
+            };
+            user
+        }
     };
     let user = assign::Tenant::new(user, pool);
 
@@ -416,6 +446,19 @@ fn routing_key(headers: &HeaderMap, query: &str) -> Option<String> {
         }
     }
     query_param(query, "session_id")
+}
+
+// The query string without one parameter.
+fn without_param(query: &str, name: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(&format!("http://query/?{query}")) else {
+        return query.to_string();
+    };
+    let kept: Vec<(String, String)> = url.query_pairs().filter(|(k, _)| k != name).map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    url.query_pairs_mut().clear().extend_pairs(kept);
+    url.query().unwrap_or_default().to_string()
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
