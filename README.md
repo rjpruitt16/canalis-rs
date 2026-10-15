@@ -100,6 +100,35 @@ event: canalis_timeout     data: {"status":"/jobs/k1?user_id=acme"}  (still in l
 event: canalis_draining    data: {"status":"/jobs/k1?user_id=acme"}  (this Canalis node is restarting; still in line)
 ```
 
+## Authentication
+
+By default Canalis believes the `user_id` (or `X-Aqueduct-User-ID`) a request sends. That's fine only when nothing untrusted can reach it. Set `CANALIS_AUTH` to one of:
+
+- **`upstream-secret`:** your gateway does the login and sends `X-Canalis-Upstream-Secret: $CANALIS_UPSTREAM_SECRET`. Anything without it gets a 401.
+- **`jwt`:** callers send the token their login provider gave them, as `Authorization: Bearer <token>`. Browser WebSockets, which can't set headers, can use `?access_token=<token>` instead.
+
+In `jwt` mode, Canalis checks the token's signature against the provider's published keys, and checks its expiry, issuer and (optionally) audience. It then takes the tenant from a claim. That tenant replaces whatever user id the request named, for `/proxy`, `/jobs`, `GET /jobs/{key}` and WebSocket routing, so nobody can act as someone else.
+
+Keys are fetched once and cached, so there's no call to the provider per request. When the provider rotates keys, Canalis picks the new ones up without a restart. Any provider that issues JWTs works: Clerk, WorkOS, Auth0, Cognito, Supabase, Firebase. For example:
+
+```bash
+CANALIS_AUTH=jwt
+CANALIS_JWKS_URL=https://<your-provider>/.well-known/jwks.json
+CANALIS_JWT_ISSUER=https://<your-provider>
+CANALIS_JWT_TENANT_CLAIM=org_id      # route and queue per organization; default: sub
+```
+
+How Canalis answers:
+
+- A missing or bad token gets a `401` with `WWW-Authenticate: Bearer`. HMAC-signed tokens are always refused.
+- If the provider's keys can't be fetched and none are cached, it answers `503` with `Retry-After`.
+- On WebSockets, the token isn't passed on to the instance. The instance sees the verified tenant as `X-Aqueduct-User-ID`.
+- `canalis_auth_rejected_total{reason}` counts refusals.
+
+All the settings are in [docs/configuration.md](docs/configuration.md#who-a-request-is-for).
+
+## Pools and WebSockets
+
 **Pools.** Instances can be split into pools, for example GPU and CPU instances, regions, or a set of instances dedicated to one customer. A node joins pools by listing them at registration: `AQUIFER_REGISTRY_POOLS=gpu,eu` or `SPILLWAY_REGISTRY_POOLS`. A node that lists none is in the `default` pool. Every ping replaces the list, so a node joins or leaves a pool with its next ping.
 
 A request picks its pool with `X-Aqueduct-Pool: gpu` (a `pool` query parameter also works for WebSockets and `GET /jobs/{key}`). Without one, it goes to the default pool. Requests only reach instances in their pool.

@@ -1,4 +1,5 @@
 mod assign;
+mod auth;
 mod l8;
 mod lifecycle;
 mod line;
@@ -73,6 +74,9 @@ pub struct AppState {
     ws_room: Arc<websocket::WaitingRoom>,
     // Counters for GET /metrics -- see metrics.rs.
     metrics: Arc<metrics::Metrics>,
+    // Who a request is for: as sent, from a trusted gateway, or from a
+    // verified token -- see auth.rs.
+    auth: Arc<auth::Auth>,
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -174,6 +178,7 @@ async fn main() {
         scale: Arc::new(scale::ScaleSignal::from_env()),
         ws_room: Arc::new(websocket::WaitingRoom::from_env()),
         metrics: Arc::default(),
+        auth: Arc::new(auth::Auth::from_env().unwrap_or_else(|err| panic!("auth setup failed: {err}"))),
     };
 
     let room_handout = state.clone();
@@ -1138,23 +1143,65 @@ pub(crate) struct JobRequest {
 }
 
 async fn proxy(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
-    if state.lifecycle.is_draining() {
-        return lifecycle::draining_response();
-    }
-    let Some(pool) = request_pool(&headers, None) else {
-        return bad_pool_response();
-    };
-    forward(state, job, "/proxy", &pool).await
+    admit_job(state, headers, job, "/proxy").await
 }
 
 async fn jobs(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
+    admit_job(state, headers, job, "/jobs").await
+}
+
+// Draining, then who it's for (auth.rs), then which pool, then forward.
+async fn admit_job(state: AppState, headers: axum::http::HeaderMap, mut job: JobRequest, path: &str) -> Response {
     if state.lifecycle.is_draining() {
         return lifecycle::draining_response();
     }
-    let Some(pool) = request_pool(&headers, None) else {
+    let identity = match state.auth.check(&headers, None).await {
+        Ok(identity) => identity,
+        Err(rejection) => return auth_rejected(&state, &rejection),
+    };
+    let Some(mut pool) = request_pool(&headers, None) else {
         return bad_pool_response();
     };
-    forward(state, job, "/jobs", &pool).await
+    if let auth::Identity::Verified { tenant, pool: token_pool } = identity {
+        job.user_id = tenant;
+        if let Some(token_pool) = token_pool {
+            if !assign::valid_pool(&token_pool) {
+                return bad_pool_response();
+            }
+            pool = token_pool;
+        }
+    }
+    forward(state, job, path, &pool).await
+}
+
+/// 401 for missing or bad credentials, 503 when the provider's keys can't
+/// be fetched (a retry may succeed).
+pub(crate) fn auth_rejected(state: &AppState, rejection: &auth::Rejection) -> Response {
+    state.metrics.inc("canalis_auth_rejected_total", &[("reason", rejection.reason())]);
+    match rejection {
+        auth::Rejection::Unavailable(why) => {
+            tracing::error!("can't verify tokens: {why}");
+            let mut response = json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({ "error": "can't verify credentials right now" }),
+            );
+            response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(5u32));
+            response
+        }
+        auth::Rejection::Missing | auth::Rejection::Invalid(_) => {
+            let why = match rejection {
+                auth::Rejection::Invalid(why) => why.as_str(),
+                _ => "missing credentials",
+            };
+            let mut response = json_response(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": why }));
+            if state.auth.is_verified() {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, axum::http::HeaderValue::from_static("Bearer"));
+            }
+            response
+        }
+    }
 }
 
 /// The pool a request is for: X-Aqueduct-Pool (or, where given, a `pool`
@@ -1648,6 +1695,8 @@ fn line_full_response(reason: &'static str, limit: u64, retry_after_seconds: u64
 
 #[derive(Deserialize)]
 struct StatusQuery {
+    // Ignored (but still accepted) when the caller has a verified token.
+    #[serde(default)]
     user_id: String,
     #[serde(default)]
     pool: Option<String>,
@@ -1663,10 +1712,25 @@ async fn job_status(
     Query(query): Query<StatusQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(pool) = request_pool(&headers, query.pool.as_deref()) else {
+    let identity = match state.auth.check(&headers, None).await {
+        Ok(identity) => identity,
+        Err(rejection) => return auth_rejected(&state, &rejection),
+    };
+    let Some(mut pool) = request_pool(&headers, query.pool.as_deref()) else {
         return bad_pool_response();
     };
-    let user_id = assign::Tenant::new(query.user_id, pool).key();
+    let mut user = query.user_id;
+    if let auth::Identity::Verified { tenant, pool: token_pool } = identity {
+        // Only your own jobs, whatever user_id the query names.
+        user = tenant;
+        if let Some(token_pool) = token_pool.filter(|p| assign::valid_pool(p)) {
+            pool = token_pool;
+        }
+    }
+    if user.is_empty() {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "need a user_id query parameter" }));
+    }
+    let user_id = assign::Tenant::new(user, pool).key();
     match on_line(&state.line, move |l| l.lookup(&user_id, &idempotent_key)).await {
         Ok(line::Lookup::Done(cached)) => cached_result_response(cached),
         Ok(line::Lookup::Queued { ahead }) => json_response(
@@ -1761,6 +1825,7 @@ mod tests {
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
+            auth: Arc::new(auth::Auth::Header),
         };
         (state, dir)
     }
@@ -2007,6 +2072,7 @@ mod tests {
                 "query": query,
                 "authorization": headers.get("authorization").and_then(|v| v.to_str().ok()),
                 "upstream_url": headers.get("x-aqueduct-upstream-url").and_then(|v| v.to_str().ok()),
+                "user": headers.get("x-aqueduct-user-id").and_then(|v| v.to_str().ok()),
             });
             upgrade.protocols(["aqueduct.v1"]).on_upgrade(move |mut socket| async move {
                 let _ = socket.send(Message::Text(seen.to_string().into())).await;
@@ -2098,6 +2164,112 @@ mod tests {
 
         assert!(connected.is_ok(), "expected the session to reach the live instance: {:?}", connected.err());
         assert!(members.iter().all(|m| m.id != "127.0.0.1:1"), "the dead instance is out of rotation");
+    }
+
+    // A Canalis in CANALIS_AUTH=jwt mode, trusting a local JWKS that
+    // publishes `key`.
+    async fn jwt_state(key: &auth::tests::TestKey) -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = test_state().await;
+        let (url, _) = auth::tests::serve_jwks(Arc::new(Mutex::new(vec![key.jwk.clone()]))).await;
+        state.auth = Arc::new(auth::Auth::Jwt(Box::new(auth::tests::verifier(&url))));
+        (state, dir)
+    }
+
+    // An instance answering /proxy with the user_id it was sent.
+    async fn start_user_echo_mock() -> String {
+        async fn handler(Json(job): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "user_id": job["user_id"] }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, Router::new().route("/proxy", post(handler))).await.unwrap() });
+        addr.to_string()
+    }
+
+    #[tokio::test]
+    async fn with_jwt_auth_the_token_decides_who_a_job_is_for() {
+        let key = auth::tests::TestKey::ed25519("k1");
+        let (state, _dir) = jwt_state(&key).await;
+        register_node(&state, &start_user_echo_mock().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let job = serde_json::json!({ "user_id": "victim", "idempotent_key": unique("k"), "url": "https://x", "method": "GET" });
+
+        let anonymous = http.post(format!("http://{canalis}/proxy")).json(&job).send().await.unwrap();
+        let anonymous_status = anonymous.status();
+        let challenge = anonymous.headers().get("www-authenticate").cloned();
+        let token = key.sign(auth::tests::claims("alice"));
+        let served: serde_json::Value = http
+            .post(format!("http://{canalis}/proxy"))
+            .bearer_auth(&token)
+            .json(&job)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let forged = http
+            .post(format!("http://{canalis}/proxy"))
+            .bearer_auth(auth::tests::TestKey::ed25519("k1").sign(auth::tests::claims("alice")))
+            .json(&job)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let metrics = http.get(format!("http://{canalis}/metrics")).send().await.unwrap().text().await.unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(anonymous_status, StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge.unwrap(), "Bearer");
+        assert_eq!(served["user_id"], "alice", "the instance sees the token's tenant, not the body's");
+        assert_eq!(forged, StatusCode::UNAUTHORIZED);
+        assert!(metrics.contains("canalis_auth_rejected_total{reason=\"missing\"} 1"), "{metrics}");
+        assert!(metrics.contains("canalis_auth_rejected_total{reason=\"invalid\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn with_jwt_auth_you_only_see_your_own_job_status() {
+        let key = auth::tests::TestKey::ed25519("k1");
+        let (state, _dir) = jwt_state(&key).await;
+        let result = line::CachedResult { status: 200, content_type: "text/plain".into(), body: "secret".into(), headers: vec![] };
+        state.line.store_result("victim", "k", &result).unwrap();
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let get = |token: String| http.get(format!("http://{canalis}/jobs/k?user_id=victim")).bearer_auth(token).send();
+
+        let as_mallory = get(key.sign(auth::tests::claims("mallory"))).await.unwrap().status();
+        let as_victim = get(key.sign(auth::tests::claims("victim"))).await.unwrap().status();
+        cleanup(&state).await;
+
+        assert_eq!(as_mallory, StatusCode::NOT_FOUND, "the query's user_id is ignored");
+        assert_eq!(as_victim, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn with_jwt_auth_a_websocket_token_stays_with_canalis() {
+        let key = auth::tests::TestKey::ed25519("k1");
+        let (state, _dir) = jwt_state(&key).await;
+        register_ws_node(&state, &start_ws_instance().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let token = key.sign(auth::tests::claims("alice"));
+
+        let refused = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1")).await;
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(ws_request(&canalis, &format!("session_id=s1&access_token={token}"))).await.unwrap();
+        let seen: serde_json::Value = match futures_util::StreamExt::next(&mut socket).await.unwrap().unwrap() {
+            tokio_tungstenite::tungstenite::Message::Text(text) => serde_json::from_str(text.as_str()).unwrap(),
+            other => panic!("expected the instance's first message, got {other:?}"),
+        };
+        cleanup(&state).await;
+
+        match refused {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => assert_eq!(response.status(), 401),
+            other => panic!("expected a 401 without a token, got {other:?}"),
+        }
+        assert_eq!(seen["user"], "alice", "the instance sees the verified tenant");
+        assert_eq!(seen["query"], "session_id=s1", "the token isn't passed on");
+        assert!(seen["authorization"].is_null(), "nor is the client's Authorization header");
     }
 
     #[tokio::test]
@@ -2837,6 +3009,7 @@ mod tests {
             scale: Arc::new(scale::ScaleSignal::new(None, Duration::ZERO, Duration::ZERO)),
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
+            auth: Arc::new(auth::Auth::Header),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
