@@ -415,6 +415,11 @@ struct RegisterRequest {
     drain_state: Option<String>,
     #[serde(default)]
     fullness: Option<u8>,
+    // Pools this instance joins (AQUIFER_REGISTRY_POOLS); none means the
+    // default pool. Each ping replaces the list, so joining or leaving a
+    // pool is just the next ping.
+    #[serde(default)]
+    pools: Vec<String>,
 }
 
 // Reads the raw body first: an L8 signature covers the exact bytes sent,
@@ -504,6 +509,7 @@ async fn handle_registration(
         reserved_for: payload.reserved_for.clone().filter(|s| !s.is_empty()),
         role: payload.role.clone().filter(|s| !s.is_empty()),
         drain_state: payload.drain_state.clone(),
+        pools: registered_pools(address, &payload.pools),
         ..Default::default()
     };
     assign::heartbeat(&mut state.valkey, &aq, &member).await?;
@@ -540,6 +546,27 @@ async fn handle_registration(
         });
     }
     Ok(())
+}
+
+// The pools a registration names, minus any malformed names (logged, not
+// fatal: the instance still serves the rest), sorted and deduplicated.
+fn registered_pools(address: &str, named: &[String]) -> Vec<String> {
+    let mut pools: Vec<String> = named
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            let ok = assign::valid_pool(p);
+            if !ok {
+                tracing::warn!("instance {address} named an invalid pool {p:?}; ignoring it");
+            }
+            ok
+        })
+        .map(str::to_string)
+        .collect();
+    pools.sort();
+    pools.dedup();
+    pools
 }
 
 // X-Aqueduct-Fullness (0-100) from any instance response, so Canalis's
@@ -656,40 +683,46 @@ impl Drop for DrainGuard {
 }
 
 // Takes the longest-waiting job out of line and resolves an instance for
-// its tenant. If nothing's free after all, the job goes back in its
-// original place (not to the back of the line) and this returns None.
+// its tenant. If nothing's free in its pool after all, the job goes back in
+// its original place (not to the back of the line), the pool is added to
+// `blocked`, and the next oldest job in another pool gets its turn -- one
+// full pool never holds up the rest. None once nothing more can be claimed.
 async fn claim_next(
     state: &mut AppState,
+    blocked: &mut HashSet<String>,
 ) -> Result<Option<(line::QueuedJob, assign::Node, DrainGuard)>, BoxError> {
-    // A draining node takes nothing more out of the line: whatever is still
-    // in it waits there, on disk, for this node's next start.
-    if state.lifecycle.is_draining() {
-        return Ok(None);
-    }
-    let skip = state.draining.lock().map_err(|e| e.to_string())?.clone();
-    let Some(queued) = on_line(&state.line, move |l| l.pop_oldest(&skip)).await? else {
-        return Ok(None);
-    };
-
-    let user_id = queued.job.user_id.clone();
-    let newly_marked = state.draining.lock().map_err(|e| e.to_string())?.insert(user_id.clone());
-    if !newly_marked {
-        // A drain for this tenant started between the snapshot above and
-        // now; it'll reach this job itself.
-        on_line(&state.line, move |l| l.requeue(&queued)).await?;
-        return Ok(None);
-    }
-    let guard = DrainGuard { draining: state.draining.clone(), user_id: user_id.clone() };
-
-    match assign::assign(&mut state.valkey, &state.aqueduct, &user_id, assign::Traffic::Http).await {
-        Ok(assign::AssignOutcome::Assigned(node)) => Ok(Some((queued, node, guard))),
-        Ok(assign::AssignOutcome::PoolExhausted) => {
-            on_line(&state.line, move |l| l.requeue(&queued)).await?;
-            Ok(None)
+    loop {
+        // A draining node takes nothing more out of the line: whatever is
+        // still in it waits there, on disk, for this node's next start.
+        if state.lifecycle.is_draining() {
+            return Ok(None);
         }
-        Err(err) => {
+        let skip = state.draining.lock().map_err(|e| e.to_string())?.clone();
+        let skip_pools = blocked.clone();
+        let Some(queued) = on_line(&state.line, move |l| l.pop_oldest(&skip, &skip_pools)).await? else {
+            return Ok(None);
+        };
+
+        let tenant = assign::Tenant::new(queued.job.user_id.as_str(), queued.pool.as_str());
+        let newly_marked = state.draining.lock().map_err(|e| e.to_string())?.insert(tenant.key());
+        if !newly_marked {
+            // A drain for this tenant started between the snapshot above
+            // and now; it'll reach this job itself.
             on_line(&state.line, move |l| l.requeue(&queued)).await?;
-            Err(err.into())
+            continue;
+        }
+        let guard = DrainGuard { draining: state.draining.clone(), user_id: tenant.key() };
+
+        match assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await {
+            Ok(assign::AssignOutcome::Assigned(node)) => return Ok(Some((queued, node, guard))),
+            Ok(assign::AssignOutcome::PoolExhausted) => {
+                on_line(&state.line, move |l| l.requeue(&queued)).await?;
+                blocked.insert(tenant.pool);
+            }
+            Err(err) => {
+                on_line(&state.line, move |l| l.requeue(&queued)).await?;
+                return Err(err.into());
+            }
         }
     }
 }
@@ -700,7 +733,7 @@ async fn claim_next(
 // before waiting for another registration to come along. Returns whether
 // anything was drained.
 async fn try_drain_one(mut state: AppState) -> Result<bool, BoxError> {
-    let Some((first, node, guard)) = claim_next(&mut state).await? else {
+    let Some((first, node, guard)) = claim_next(&mut state, &mut HashSet::new()).await? else {
         return Ok(false);
     };
     drain_tenant_backlog(state, first, node, guard).await?;
@@ -714,7 +747,8 @@ async fn sweep_once(mut state: AppState) -> Result<usize, BoxError> {
     on_line(&state.line, |l| l.expire_results()).await?;
 
     let mut started = 0;
-    while let Some((first, node, guard)) = claim_next(&mut state).await? {
+    let mut blocked = HashSet::new();
+    while let Some((first, node, guard)) = claim_next(&mut state, &mut blocked).await? {
         let drain_state = state.clone();
         tokio::spawn(async move {
             if let Err(err) = drain_tenant_backlog(drain_state, first, node, guard).await {
@@ -753,7 +787,8 @@ async fn drain_tenant_backlog(
     node: assign::Node,
     _guard: DrainGuard,
 ) -> Result<(), BoxError> {
-    let user_id = first.job.user_id.clone();
+    let tenant = assign::Tenant::new(first.job.user_id.as_str(), first.pool.as_str());
+    let user_id = tenant.key();
     let mut pending = Some(first);
     let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
     let mut rps = DEFAULT_DRAIN_RPS;
@@ -788,7 +823,7 @@ async fn drain_tenant_backlog(
             }
             last_dispatch_at = Some(Instant::now());
             if last_renewed.elapsed() > state.aqueduct.assignment_ttl / 3 {
-                let _ = assign::assign(&mut state.valkey, &state.aqueduct, &user_id, assign::Traffic::Http).await;
+                let _ = assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await;
                 last_renewed = Instant::now();
             }
 
@@ -825,7 +860,7 @@ async fn drain_tenant_backlog(
         // node draining and releasing the assignment means the next claim
         // finds them a different node.
         assign::mark_draining(&mut state.valkey, &state.aqueduct, &node.id).await?;
-        assign::release_user(&mut state.valkey, &state.aqueduct, &user_id, &node.id).await?;
+        assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
         tracing::info!("{} is draining; {user_id}'s remaining jobs stay in line for another node", node.id);
     }
     Ok(())
@@ -889,8 +924,8 @@ async fn dispatch_drained_job(
                     .to_string(),
                 headers: Vec::new(),
             };
-            let waiter = take_waiter(waiters, job);
-            finish_drained_job(line, queued.seq, job, cached, waiter, false).await;
+            let waiter = take_waiter(waiters, job, &queued.pool);
+            finish_drained_job(line, &queued, cached, waiter, false).await;
             return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: None };
         }
     };
@@ -908,7 +943,7 @@ async fn dispatch_drained_job(
         .to_string();
     let streams = content_type.starts_with("text/event-stream");
 
-    let mut waiter = take_waiter(waiters, job);
+    let mut waiter = take_waiter(waiters, job, &queued.pool);
     // A /jobs answer is the node's acknowledgment (201 + job_id); the
     // caller learns about the assignment once that id is known, below.
     if !follows_job_stream {
@@ -987,7 +1022,7 @@ async fn dispatch_drained_job(
         }
     }
 
-    finish_drained_job(line, queued.seq, job, cached, waiter, already_streamed).await;
+    finish_drained_job(line, &queued, cached, waiter, already_streamed).await;
     DispatchOutcome { pacing, back_in_line: None }
 }
 
@@ -1031,12 +1066,19 @@ async fn follow_job_stream(
 fn take_waiter(
     waiters: &Mutex<HashMap<(String, String), Waiter>>,
     job: &JobRequest,
+    pool: &str,
 ) -> Option<mpsc::Sender<Bytes>> {
     waiters
         .lock()
         .ok()?
-        .remove(&(job.user_id.clone(), job.idempotent_key.clone()))
+        .remove(&waiter_key(job, pool))
         .map(|w| w.tx)
+}
+
+// Waiters, like the line, are keyed by the tenant's line key and the
+// idempotency key.
+fn waiter_key(job: &JobRequest, pool: &str) -> (String, String) {
+    (assign::Tenant::new(job.user_id.as_str(), pool).key(), job.idempotent_key.clone())
 }
 
 // Caches a drained job's outcome, then -- unless its stream already
@@ -1045,8 +1087,7 @@ fn take_waiter(
 // and a caller who checks GET /jobs/{key} right after must find the result.
 async fn finish_drained_job(
     line: &Arc<line::Line>,
-    seq: u64,
-    job: &JobRequest,
+    queued: &line::QueuedJob,
     cached: line::CachedResult,
     waiter: Option<mpsc::Sender<Bytes>>,
     already_streamed: bool,
@@ -1062,7 +1103,8 @@ async fn finish_drained_job(
             }),
         )
     });
-    let (user_id, key) = (job.user_id.clone(), job.idempotent_key.clone());
+    let (job, seq) = (&queued.job, queued.seq);
+    let (user_id, key) = waiter_key(job, &queued.pool);
     if let Err(err) = on_line(line, move |l| {
         l.store_result(&user_id, &key, &cached)?;
         l.finish(seq)
@@ -1095,18 +1137,47 @@ pub(crate) struct JobRequest {
     pub(crate) webhook_url: Option<String>,
 }
 
-async fn proxy(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+async fn proxy(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
     if state.lifecycle.is_draining() {
         return lifecycle::draining_response();
     }
-    forward(state, job, "/proxy").await
+    let Some(pool) = request_pool(&headers, None) else {
+        return bad_pool_response();
+    };
+    forward(state, job, "/proxy", &pool).await
 }
 
-async fn jobs(State(state): State<AppState>, Json(job): Json<JobRequest>) -> Response {
+async fn jobs(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
     if state.lifecycle.is_draining() {
         return lifecycle::draining_response();
     }
-    forward(state, job, "/jobs").await
+    let Some(pool) = request_pool(&headers, None) else {
+        return bad_pool_response();
+    };
+    forward(state, job, "/jobs", &pool).await
+}
+
+/// The pool a request is for: X-Aqueduct-Pool (or, where given, a `pool`
+/// query parameter), else the default pool. None for a malformed name
+/// (answer with bad_pool_response).
+pub(crate) fn request_pool(headers: &axum::http::HeaderMap, query: Option<&str>) -> Option<String> {
+    let named = headers
+        .get("X-Aqueduct-Pool")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or(query.filter(|v| !v.is_empty()));
+    match named {
+        None => Some(assign::DEFAULT_POOL.to_string()),
+        Some(pool) => assign::valid_pool(pool).then(|| pool.to_string()),
+    }
+}
+
+pub(crate) fn bad_pool_response() -> Response {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({ "error": "X-Aqueduct-Pool must be 1-64 characters of A-Z a-z 0-9 _ . -" }),
+    )
 }
 
 // All the retry/timeout knobs forward() needs, as explicit values rather
@@ -1156,16 +1227,16 @@ pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-async fn forward(state: AppState, job: JobRequest, target_path: &str) -> Response {
-    forward_with_config(state, job, target_path, &RetryConfig::from_env()).await
+async fn forward(state: AppState, job: JobRequest, target_path: &str, pool: &str) -> Response {
+    forward_in_pool(state, job, target_path, pool, &RetryConfig::from_env()).await
 }
 
 // Puts the job in line and turns the caller's connection into the waiting
 // room's stream. The caller is registered as a waiter *before* the job is
 // enqueued, so a drain that picks the job up immediately still finds
 // someone to stream to.
-async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Duration, reason: &str) -> Response {
-    let key = (job.user_id.clone(), job.idempotent_key.clone());
+async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, timeout: Duration, reason: &str) -> Response {
+    let key = waiter_key(&job, pool);
     let id = state.next_waiter_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     {
@@ -1186,8 +1257,8 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Dur
         }
     };
 
-    let (queued_job, path) = (job.clone(), path.to_string());
-    let (ahead, seq) = match on_line(&state.line, move |l| l.enqueue(&queued_job, &path)).await {
+    let (queued_job, path, queued_pool) = (job.clone(), path.to_string(), pool.to_string());
+    let (ahead, seq) = match on_line(&state.line, move |l| l.enqueue(&queued_job, &path, &queued_pool)).await {
         Ok(line::Enqueued::Queued { ahead, seq } | line::Enqueued::AlreadyQueued { ahead, seq }) => (ahead, seq),
         Ok(line::Enqueued::AlreadyDone(cached)) => {
             unregister(&state);
@@ -1212,7 +1283,10 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, timeout: Dur
             waiter.last_ahead = Some(ahead);
         }
     }
-    let status_url = format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id);
+    let mut status_url = format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id);
+    if pool != assign::DEFAULT_POOL {
+        status_url.push_str(&format!("&pool={pool}"));
+    }
     let _ = tx.try_send(sse_event(
         "canalis_queued",
         serde_json::json!({ "reason": reason, "ahead": ahead, "status": status_url }),
@@ -1259,10 +1333,17 @@ enum Reroute {
     Unreachable(String),
 }
 
-async fn forward_with_config(
+// The default pool, for tests that don't care about pools.
+#[cfg(test)]
+async fn forward_with_config(state: AppState, job: JobRequest, target_path: &str, config: &RetryConfig) -> Response {
+    forward_in_pool(state, job, target_path, assign::DEFAULT_POOL, config).await
+}
+
+async fn forward_in_pool(
     state: AppState,
     job: JobRequest,
     target_path: &str,
+    pool: &str,
     config: &RetryConfig,
 ) -> Response {
     // Before anything else: a body the upstream's published schema rejects
@@ -1273,7 +1354,8 @@ async fn forward_with_config(
 
     let mut valkey = state.valkey.clone();
     let user_id = job.user_id.clone();
-    let first = forward_attempt(state.clone(), job.clone(), target_path, config).await;
+    let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
+    let first = forward_attempt(state.clone(), job.clone(), target_path, pool, config).await;
     let Some(reroute) = first.extensions().get::<Reroute>().cloned() else {
         return first;
     };
@@ -1287,7 +1369,7 @@ async fn forward_with_config(
             if let Err(err) = assign::mark_draining(&mut valkey, &state.aqueduct, node_id).await {
                 tracing::warn!("failed to mark {node_id} draining: {err}");
             }
-            if let Err(err) = assign::release_user(&mut valkey, &state.aqueduct, &user_id, node_id).await {
+            if let Err(err) = assign::release(&mut valkey, &state.aqueduct, &tenant, assign::Traffic::Http, node_id).await {
                 tracing::error!("failed to release {user_id} from draining instance {node_id}: {err}");
                 return first;
             }
@@ -1305,7 +1387,7 @@ async fn forward_with_config(
         }
     }
     state.metrics.inc("canalis_reroutes_total", &[]);
-    forward_attempt(state, job, target_path, config).await
+    forward_attempt(state, job, target_path, pool, config).await
 }
 
 // Resolves the assignment, then forwards the same job body to the
@@ -1330,19 +1412,21 @@ async fn forward_attempt(
     mut state: AppState,
     job: JobRequest,
     target_path: &str,
+    pool: &str,
     config: &RetryConfig,
 ) -> Response {
-    let node = match assign::assign(&mut state.valkey, &state.aqueduct, &job.user_id, assign::Traffic::Http).await {
+    let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
+    let node = match assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await {
         Ok(assign::AssignOutcome::Assigned(node)) => node,
         Ok(assign::AssignOutcome::PoolExhausted) => {
-            return wait_in_line(state, job, target_path, config.pool_wait_timeout, "no_instance_free").await;
+            return wait_in_line(state, job, target_path, pool, config.pool_wait_timeout, "no_instance_free").await;
         }
         // Valkey (where assignments live) can't be reached. The line is on
         // local disk and doesn't need it, so the job waits there and the
         // sweep hands it out once Valkey is back.
         Err(err) => {
             tracing::error!("assign failed, holding the job in line: {err}");
-            return wait_in_line(state, job, target_path, config.pool_wait_timeout, "assignment_store_unavailable").await;
+            return wait_in_line(state, job, target_path, pool, config.pool_wait_timeout, "assignment_store_unavailable").await;
         }
     };
 
@@ -1565,6 +1649,8 @@ fn line_full_response(reason: &'static str, limit: u64, retry_after_seconds: u64
 #[derive(Deserialize)]
 struct StatusQuery {
     user_id: String,
+    #[serde(default)]
+    pool: Option<String>,
 }
 
 // Where a queued job stands, on *this* Canalis node: its finished result
@@ -1575,8 +1661,12 @@ async fn job_status(
     State(state): State<AppState>,
     Path(idempotent_key): Path<String>,
     Query(query): Query<StatusQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    let user_id = query.user_id;
+    let Some(pool) = request_pool(&headers, query.pool.as_deref()) else {
+        return bad_pool_response();
+    };
+    let user_id = assign::Tenant::new(query.user_id, pool).key();
     match on_line(&state.line, move |l| l.lookup(&user_id, &idempotent_key)).await {
         Ok(line::Lookup::Done(cached)) => cached_result_response(cached),
         Ok(line::Lookup::Queued { ahead }) => json_response(
@@ -1739,7 +1829,7 @@ mod tests {
         register_node(&state, &mock_addr).await;
         let cleanup_state = state.clone();
 
-        let response = forward(state, job_for(&user_id), "/proxy").await;
+        let response = forward(state, job_for(&user_id), "/proxy", assign::DEFAULT_POOL).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-aqueduct-queue-depth"], "3", "streamed responses relay headers too");
 
@@ -1997,7 +2087,7 @@ mod tests {
     async fn a_websocket_session_assigned_to_a_dead_instance_is_moved_to_a_live_one() {
         let (state, _dir) = test_state().await;
         register_ws_node(&state, "127.0.0.1:1").await;
-        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, "acme", assign::Traffic::WebSocket).await.unwrap();
+        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("acme"), assign::Traffic::WebSocket).await.unwrap();
         assert!(matches!(first, assign::AssignOutcome::Assigned(ref n) if n.id == "127.0.0.1:1"));
         register_ws_node(&state, &start_ws_instance().await).await;
         let canalis = serve_canalis(state.clone()).await;
@@ -2085,7 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn nothing_leaves_the_line_once_draining_starts() {
         let (state, _dir) = test_state().await;
-        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        state.line.enqueue(&job_for("acme"), "/jobs", assign::DEFAULT_POOL).unwrap();
         register_node(&state, &start_plain_ok_mock().await).await;
 
         state.lifecycle.begin();
@@ -2108,7 +2198,7 @@ mod tests {
     #[tokio::test]
     async fn health_reports_the_line_and_the_fleet() {
         let (state, _dir) = test_state().await;
-        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        state.line.enqueue(&job_for("acme"), "/jobs", assign::DEFAULT_POOL).unwrap();
         register_node(&state, &start_plain_ok_mock().await).await;
         let canalis = serve_canalis(state.clone()).await;
 
@@ -2118,7 +2208,8 @@ mod tests {
 
         assert_eq!(health["status"], "ok");
         assert_eq!(health["line"]["jobs"], 1);
-        assert_eq!(health["line"]["oldest_wait_seconds"], 0);
+        // Whole seconds: the clock can tick over between enqueue and read.
+        assert!(health["line"]["oldest_wait_seconds"].as_u64().unwrap() <= 2);
         assert_eq!(health["instances"]["total"], 1);
         assert_eq!(health["instances"]["accepting"], 1);
         assert_eq!(health["websocket"]["open"], 0);
@@ -2127,7 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_report_responses_the_line_and_each_instance() {
         let (state, _dir) = test_state().await;
-        state.line.enqueue(&job_for("acme"), "/jobs").unwrap();
+        state.line.enqueue(&job_for("acme"), "/jobs", assign::DEFAULT_POOL).unwrap();
         let mock = start_plain_ok_mock().await;
         register_node(&state, &mock).await;
         let canalis = serve_canalis(state.clone()).await;
@@ -2225,7 +2316,7 @@ mod tests {
         let member = assign::Member { role: Some("ws".into()), capacity: 1, ..assign::tests::node(&instance) };
         assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &member).await.unwrap();
         assert!(matches!(
-            assign::assign(&mut state.valkey.clone(), &state.aqueduct, "busy", assign::Traffic::WebSocket).await.unwrap(),
+            assign::assign(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("busy"), assign::Traffic::WebSocket).await.unwrap(),
             assign::AssignOutcome::Assigned(_)
         ));
         let canalis = serve_canalis(state.clone()).await;
@@ -2238,10 +2329,10 @@ mod tests {
         let second_waiting = next_json(&mut second).await;
 
         // The busy session ends; its room goes to whoever waited longest.
-        assign::release_ws_user(&mut state.valkey.clone(), &state.aqueduct, "busy", &instance).await.unwrap();
+        assign::release(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("busy"), assign::Traffic::WebSocket, &instance).await.unwrap();
         let ticker = run_hand_out(&state);
         let first_assigned = next_json(&mut first).await;
-        assign::release_ws_user(&mut state.valkey.clone(), &state.aqueduct, "acme", &instance).await.unwrap();
+        assign::release(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("acme"), assign::Traffic::WebSocket, &instance).await.unwrap();
         let second_moved = next_json(&mut second).await;
         ticker.abort();
         cleanup(&state).await;
@@ -2352,7 +2443,7 @@ mod tests {
             try_drain_one(task_state).await.unwrap();
         });
         let stream = read_all(forward_with_config(state.clone(), job, "/proxy", &generous_wait_retry_config()).await).await;
-        let later = job_status(State(state.clone()), Path(key), Query(StatusQuery { user_id: "acme".into() })).await;
+        let later = job_status(State(state.clone()), Path(key), Query(StatusQuery { user_id: "acme".into(), pool: None }), axum::http::HeaderMap::new()).await;
         cleanup(&state).await;
 
         assert!(stream.contains(r#""retry-after":"7""#), "canalis_result carries the instance's headers: {stream}");
@@ -2497,7 +2588,7 @@ mod tests {
     async fn waiting_callers_hear_when_the_line_moves() {
         let (state, _dir) = test_state().await;
         let ahead_of_you = job_for(&unique("ahead-of-you"));
-        state.line.enqueue(&ahead_of_you, "/jobs").unwrap();
+        state.line.enqueue(&ahead_of_you, "/jobs", assign::DEFAULT_POOL).unwrap();
 
         // This test's own aqueduct: prefix has no instances at all.
         let response =
@@ -2542,7 +2633,7 @@ mod tests {
     async fn full_line_blocks_with_429_and_retry_after() {
         let limits = line::LineLimits { max_jobs: 1, retry_after_seconds: 7, ..Default::default() };
         let (state, _dir) = test_state_with(limits).await;
-        state.line.enqueue(&job_for(&unique("already-waiting")), "/jobs").unwrap();
+        state.line.enqueue(&job_for(&unique("already-waiting")), "/jobs", assign::DEFAULT_POOL).unwrap();
 
         let response =
             forward_with_config(state, job_for(&unique("user-full")), "/proxy", &short_retry_config())
@@ -2586,7 +2677,7 @@ mod tests {
         let (state, _dir) = test_state().await;
         let user_id = unique("user-moved");
         register_node(&state, "127.0.0.1:1").await;
-        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, &user_id, assign::Traffic::Http).await.unwrap();
+        let first = assign::assign(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user(&user_id), assign::Traffic::Http).await.unwrap();
         assert!(matches!(first, assign::AssignOutcome::Assigned(ref n) if n.id == "127.0.0.1:1"));
         register_node(&state, &start_plain_ok_mock().await).await;
 
@@ -2606,7 +2697,7 @@ mod tests {
 
         let jobs: Vec<JobRequest> = (0..3).map(|_| job_for(&user_id)).collect();
         for job in &jobs {
-            state.line.enqueue(job, "/jobs").unwrap();
+            state.line.enqueue(job, "/jobs", assign::DEFAULT_POOL).unwrap();
         }
 
         register_node(&state, &mock_addr).await;
@@ -2625,18 +2716,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_waiting_for_a_full_pool_does_not_block_another_pool() {
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let gpu_job = job_for(&unique("gpu-user"));
+        let cpu_job = job_for(&unique("cpu-user"));
+        // Nothing serves gpu; the gpu job is first in line.
+        state.line.enqueue(&gpu_job, "/jobs", "gpu").unwrap();
+        state.line.enqueue(&cpu_job, "/jobs", assign::DEFAULT_POOL).unwrap();
+        register_node(&state, &start_plain_ok_mock().await).await;
+
+        let line = state.line.clone();
+        let started = sweep_once(state).await.unwrap();
+        // The drain runs in the background; wait for its result.
+        let mut done = None;
+        for _ in 0..100 {
+            done = line.get_result(&cpu_job.user_id, &cpu_job.idempotent_key).unwrap();
+            if done.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(started, 1);
+        assert_eq!(done.expect("the default-pool job was drained").status, 200);
+        assert_eq!(line.len().unwrap(), 1, "the gpu job is still waiting for a gpu instance");
+    }
+
+    #[tokio::test]
+    async fn a_request_names_its_pool_with_a_header() {
+        let (state, _dir) = test_state().await;
+        let gpu = assign::Member { pools: vec!["gpu".into()], ..assign::tests::node(&start_plain_ok_mock().await) };
+        assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &gpu).await.unwrap();
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let send = |pool: Option<&str>| {
+            let mut request = http.post(format!("http://{canalis}/proxy")).json(&job_for(&unique("pooled")));
+            if let Some(pool) = pool {
+                request = request.header("X-Aqueduct-Pool", pool);
+            }
+            request.send()
+        };
+
+        let served = send(Some("gpu")).await.unwrap();
+        let served_type = served.headers()["content-type"].to_str().unwrap().to_string();
+        let bad = send(Some("not a pool")).await.unwrap().status();
+        let queued = send(None).await.unwrap();
+        let queued_type = queued.headers()["content-type"].to_str().unwrap().to_string();
+        cleanup(&state).await;
+
+        assert!(!served_type.starts_with("text/event-stream"), "the gpu instance answered directly");
+        assert_eq!(bad, StatusCode::BAD_REQUEST);
+        assert!(queued_type.starts_with("text/event-stream"), "no default-pool instance, so it waits in line");
+        assert_eq!(state.line.len().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn registration_records_pools_and_drops_bad_names() {
+        let (state, _dir) = test_state().await;
+        let addr = format!("127.0.0.1:{}", 40000 + (unique("p").len() % 1000));
+        let ping = RegisterRequest {
+            pools: vec!["gpu".into(), "not a pool".into(), "eu".into(), "gpu".into()],
+            ..ping("active")
+        };
+        handle_registration(state.clone(), &addr, &ping).await.unwrap();
+        let member = assign::member(&mut state.valkey.clone(), &state.aqueduct, &addr).await.unwrap().unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(member.pools, vec!["eu".to_string(), "gpu".to_string()]);
+    }
+
+    #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
         let first = job_for(&unique("first-in-line"));
         let second = job_for(&unique("second-in-line"));
-        state.line.enqueue(&first, "/jobs").unwrap();
-        state.line.enqueue(&second, "/jobs").unwrap();
+        state.line.enqueue(&first, "/jobs", assign::DEFAULT_POOL).unwrap();
+        state.line.enqueue(&second, "/jobs", assign::DEFAULT_POOL).unwrap();
 
         // Nothing registered for these tenants, so the drain can't hand the
         // job anywhere. It must go back in front, not behind `second`.
         let line = state.line.clone();
         assert!(!try_drain_one(state).await.unwrap());
-        let next = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        let next = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
         assert_eq!(next.job.user_id, first.user_id);
     }
 
@@ -2651,7 +2814,7 @@ mod tests {
         let job = job_for(&user_id);
         {
             let before = line::Line::open(&path, line::LineLimits::default()).unwrap();
-            before.enqueue(&job, "/jobs").unwrap();
+            before.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
         }
 
         let line = Arc::new(line::Line::open(&path, line::LineLimits::default()).unwrap());
@@ -2697,12 +2860,12 @@ mod tests {
         let (state, _dir) = test_state().await;
         let user_id = unique("user-status");
         let job = job_for(&user_id);
-        state.line.enqueue(&job_for(&unique("ahead-of-you")), "/jobs").unwrap();
-        state.line.enqueue(&job, "/jobs").unwrap();
+        state.line.enqueue(&job_for(&unique("ahead-of-you")), "/jobs", assign::DEFAULT_POOL).unwrap();
+        state.line.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
 
         let ask = |state: AppState| {
             let (key, user_id) = (job.idempotent_key.clone(), user_id.clone());
-            async move { job_status(State(state), Path(key), Query(StatusQuery { user_id })).await }
+            async move { job_status(State(state), Path(key), Query(StatusQuery { user_id, pool: None }), axum::http::HeaderMap::new()).await }
         };
 
         let queued = ask(state.clone()).await;
@@ -2750,7 +2913,7 @@ mod tests {
     }
 
     async fn claim(state: &AppState, user_id: &str) -> Option<String> {
-        match assign::assign(&mut state.valkey.clone(), &state.aqueduct, user_id, assign::Traffic::Http).await.unwrap() {
+        match assign::assign(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user(user_id), assign::Traffic::Http).await.unwrap() {
             assign::AssignOutcome::Assigned(node) => Some(node.id),
             assign::AssignOutcome::PoolExhausted => None,
         }
@@ -2910,7 +3073,7 @@ mod tests {
         let mut newcomer = claim(&state, "newcomer").await;
         while newcomer.is_some() && Instant::now() < deadline {
             // The reading is recorded in the background; give it a moment.
-            assign::release_user(&mut state.valkey.clone(), &state.aqueduct, "newcomer", &addr).await.unwrap();
+            assign::release(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("newcomer"), assign::Traffic::Http, &addr).await.unwrap();
             tokio::time::sleep(Duration::from_millis(20)).await;
             newcomer = claim(&state, "newcomer").await;
         }
@@ -2949,7 +3112,7 @@ mod tests {
 
         let jobs: Vec<JobRequest> = (0..2).map(|_| job_for(&user_id)).collect();
         for job in &jobs {
-            state.line.enqueue(job, "/jobs").unwrap();
+            state.line.enqueue(job, "/jobs", assign::DEFAULT_POOL).unwrap();
         }
         register_node(&state, &draining_addr).await;
 
@@ -2966,7 +3129,7 @@ mod tests {
                 "a draining node's 503 must not be stored as the job's result"
             );
         }
-        let first = line.pop_oldest(&HashSet::new()).unwrap().unwrap();
+        let first = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
         assert_eq!(first.job.idempotent_key, jobs[0].idempotent_key, "and still in their original order");
         assert!(assignment.is_none(), "the tenant must be free to get a different node");
         assert_eq!(next_claim, None, "and the draining node isn't offered again");
@@ -3035,7 +3198,7 @@ mod tests {
         // throughout.
         let (mock_addr, counts) = start_counting_pacing_mock(Duration::from_millis(300), header_prefix, "4", "100").await;
         for _ in 0..4 {
-            state.line.enqueue(&job_for(&user_id), "/jobs").unwrap();
+            state.line.enqueue(&job_for(&user_id), "/jobs", assign::DEFAULT_POOL).unwrap();
         }
         register_node(&state, &mock_addr).await;
 

@@ -25,6 +25,16 @@
 //! already on one stays -- the script keeps live assignments sticky), an
 //! instance reserved for one user is only offered to that user, and a
 //! `ws`-role instance isn't offered HTTP traffic.
+//!
+//! Pools: an instance lists the pools it serves (`pools`, from the node's
+//! AQUIFER_REGISTRY_POOLS / SPILLWAY_REGISTRY_POOLS); one that lists none
+//! is in `default`. A request names its pool (X-Aqueduct-Pool, default
+//! `default`) and is only offered instances in it. Pools share one set of
+//! keys rather than a prefix each, so an instance in two pools has one
+//! capacity and one assignment set, not one per pool. A user's assignment
+//! is scoped to the pool, so they can be on different instances in
+//! different pools; the default pool keeps the plain user scope Aquifer's
+//! own cluster mode uses.
 
 use crate::Valkey;
 use redis::AsyncCommands;
@@ -107,6 +117,59 @@ pub struct Member {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain_state: Option<String>,
+    /// Pools this instance serves; empty means just `default`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pools: Vec<String>,
+}
+
+pub const DEFAULT_POOL: &str = "default";
+
+/// Whether `name` is usable as a pool name: 1-64 of `A-Z a-z 0-9 _ . -`.
+pub fn valid_pool(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 64 && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// Who a request is for: the user, within a pool.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Tenant {
+    pub user: String,
+    pub pool: String,
+}
+
+impl Tenant {
+    pub fn new(user: impl Into<String>, pool: impl Into<String>) -> Self {
+        Self { user: user.into(), pool: pool.into() }
+    }
+
+    /// A user in the default pool.
+    #[cfg(test)]
+    pub fn user(user: impl Into<String>) -> Self {
+        Self::new(user, DEFAULT_POOL)
+    }
+
+    /// What the line keys this tenant's jobs by: the bare user in the
+    /// default pool (so a line from before pools reads back unchanged),
+    /// `<pool>\x00<user>` otherwise.
+    pub fn key(&self) -> String {
+        if self.pool == DEFAULT_POOL { self.user.clone() } else { format!("{}\x00{}", self.pool, self.user) }
+    }
+
+    /// The pool a line key belongs to.
+    pub fn pool_of_key(key: &str) -> &str {
+        key.split_once('\x00').map_or(DEFAULT_POOL, |(pool, _)| pool)
+    }
+
+    fn scope(&self, traffic: Traffic) -> String {
+        let base = if self.pool == DEFAULT_POOL {
+            self.user.clone()
+        } else {
+            format!("pool\x00{}\x00{}", self.pool, self.user)
+        };
+        match traffic {
+            Traffic::Http => base,
+            Traffic::WebSocket => format!("ws\x00{base}"),
+        }
+    }
 }
 
 fn is_zero(v: &i64) -> bool {
@@ -116,6 +179,10 @@ fn is_zero(v: &i64) -> bool {
 impl Member {
     pub fn is_active(&self) -> bool {
         !matches!(self.state.as_deref(), Some("draining") | Some("offline"))
+    }
+
+    pub fn serves(&self, pool: &str) -> bool {
+        if self.pools.is_empty() { pool == DEFAULT_POOL } else { self.pools.iter().any(|p| p == pool) }
     }
 }
 
@@ -355,9 +422,10 @@ pub async fn instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult
 pub async fn assign(
     valkey: &mut Valkey,
     aq: &Aqueduct,
-    user_id: &str,
+    tenant: &Tenant,
     traffic: Traffic,
 ) -> redis::RedisResult<AssignOutcome> {
+    let user_id = tenant.user.as_str();
     let all = members(valkey, aq).await?;
     let fullness_keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
     let fullness: Vec<Option<u8>> = if fullness_keys.is_empty() {
@@ -371,6 +439,7 @@ pub async fn assign(
         .zip(fullness.iter())
         .filter(|(m, full)| {
             m.is_active()
+                && m.serves(&tenant.pool)
                 && traffic.accepts(m.role.as_deref())
                 && m.reserved_for.as_deref().is_none_or(|owner| owner == user_id)
                 && full.is_none_or(|f| f < aq.queue_at_percent)
@@ -389,46 +458,52 @@ pub async fn assign(
     // Runs even with no candidates: a user who already has a live
     // assignment keeps it, full or not. A user's WebSocket sessions are
     // assigned separately from their HTTP jobs (a different scope), since
-    // they may need a different kind of instance.
-    let hash = match traffic {
-        Traffic::Http => scope_hash(user_id),
-        Traffic::WebSocket => scope_hash(&format!("ws\x00{user_id}")),
-    };
-    let assign_script = redis::Script::new(ASSIGN_LUA);
-    let mut script = assign_script.prepare_invoke();
-    script.key(aq.assignment_key(&hash));
-    script
-        .arg(aq.assignment_ttl.as_millis() as u64)
-        .arg(&hash)
-        .arg(candidates.len())
-        .arg(&aq.prefix);
-    for m in &candidates {
-        script.key(aq.instance_key(&m.id)).key(aq.assignments_key(&m.id));
-        let capacity = if m.capacity > 0 { m.capacity } else { aq.default_capacity };
-        script.arg(&m.id).arg(capacity);
-    }
-    script.arg("1");
+    // they may need a different kind of instance, and so are their jobs
+    // in each pool.
+    let hash = scope_hash(&tenant.scope(traffic));
+    // Twice at most: a live assignment to an instance that has since left
+    // this pool is dropped, and the claim runs again without it.
+    for _ in 0..2 {
+        let assign_script = redis::Script::new(ASSIGN_LUA);
+        let mut script = assign_script.prepare_invoke();
+        script.key(aq.assignment_key(&hash));
+        script
+            .arg(aq.assignment_ttl.as_millis() as u64)
+            .arg(&hash)
+            .arg(candidates.len())
+            .arg(&aq.prefix);
+        for m in &candidates {
+            script.key(aq.instance_key(&m.id)).key(aq.assignments_key(&m.id));
+            let capacity = if m.capacity > 0 { m.capacity } else { aq.default_capacity };
+            script.arg(&m.id).arg(capacity);
+        }
+        script.arg("1");
 
-    let payload: String = script.invoke_async(valkey).await?;
-    if payload.is_empty() {
-        return Ok(AssignOutcome::PoolExhausted);
+        let payload: String = script.invoke_async(valkey).await?;
+        if payload.is_empty() {
+            return Ok(AssignOutcome::PoolExhausted);
+        }
+        let member: Member = serde_json::from_str(&payload)
+            .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "decode member", e.to_string())))?;
+        if member.serves(&tenant.pool) {
+            return Ok(AssignOutcome::Assigned(Node { id: member.id, base_url: member.address }));
+        }
+        release_scope(valkey, aq, &hash, &member.id).await?;
     }
-    let member: Member = serde_json::from_str(&payload)
-        .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "decode member", e.to_string())))?;
-    Ok(AssignOutcome::Assigned(Node { id: member.id, base_url: member.address }))
+    Ok(AssignOutcome::PoolExhausted)
 }
 
-/// Releases user_id from node_id, if that's still where they're assigned.
-/// Their next request resolves a fresh assignment, or waits in line.
-pub async fn release_user(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str, node_id: &str) -> redis::RedisResult<bool> {
-    let hash = scope_hash(user_id);
-    release_scope(valkey, aq, &hash, node_id).await
-}
-
-/// release_user for a user's WebSocket assignment.
-pub async fn release_ws_user(valkey: &mut Valkey, aq: &Aqueduct, user_id: &str, node_id: &str) -> redis::RedisResult<bool> {
-    let hash = scope_hash(&format!("ws\x00{user_id}"));
-    release_scope(valkey, aq, &hash, node_id).await
+/// Releases a tenant's assignment for this kind of traffic from node_id,
+/// if that's still where it points. Their next request resolves a fresh
+/// assignment, or waits in line.
+pub async fn release(
+    valkey: &mut Valkey,
+    aq: &Aqueduct,
+    tenant: &Tenant,
+    traffic: Traffic,
+    node_id: &str,
+) -> redis::RedisResult<bool> {
+    release_scope(valkey, aq, &scope_hash(&tenant.scope(traffic)), node_id).await
 }
 
 async fn release_scope(valkey: &mut Valkey, aq: &Aqueduct, hash: &str, node_id: &str) -> redis::RedisResult<bool> {
@@ -505,7 +580,7 @@ pub(crate) mod tests {
     }
 
     async fn assigned(valkey: &mut Valkey, aq: &Aqueduct, user: &str) -> Option<String> {
-        match assign(valkey, aq, user, Traffic::Http).await.unwrap() {
+        match assign(valkey, aq, &Tenant::user(user), Traffic::Http).await.unwrap() {
             AssignOutcome::Assigned(node) => Some(node.id),
             AssignOutcome::PoolExhausted => None,
         }
@@ -618,6 +693,90 @@ pub(crate) mod tests {
         assert_eq!(owner.as_deref(), Some("vip-node"));
     }
 
+    async fn assigned_in(valkey: &mut Valkey, aq: &Aqueduct, user: &str, pool: &str) -> Option<String> {
+        match assign(valkey, aq, &Tenant::new(user, pool), Traffic::Http).await.unwrap() {
+            AssignOutcome::Assigned(node) => Some(node.id),
+            AssignOutcome::PoolExhausted => None,
+        }
+    }
+
+    fn in_pools(id: &str, pools: &[&str]) -> Member {
+        Member { pools: pools.iter().map(|p| p.to_string()).collect(), ..node(id) }
+    }
+
+    #[tokio::test]
+    async fn requests_only_reach_instances_in_their_pool() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("plain")).await.unwrap();
+        heartbeat(&mut v, &aq, &in_pools("gpu-node", &["gpu"])).await.unwrap();
+
+        let default_user = assigned(&mut v, &aq, "a").await;
+        let gpu_user = assigned_in(&mut v, &aq, "b", "gpu").await;
+        let unknown_pool = assigned_in(&mut v, &aq, "c", "eu").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(default_user.as_deref(), Some("plain"), "an instance with no pools is the default pool");
+        assert_eq!(gpu_user.as_deref(), Some("gpu-node"));
+        assert_eq!(unknown_pool, None, "nothing serves eu, so it waits");
+    }
+
+    #[tokio::test]
+    async fn an_instance_in_two_pools_has_one_capacity() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &Member { capacity: 1, ..in_pools("shared", &["a", "b"]) }).await.unwrap();
+
+        let first = assigned_in(&mut v, &aq, "u1", "a").await;
+        let second = assigned_in(&mut v, &aq, "u2", "b").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(first.as_deref(), Some("shared"));
+        assert_eq!(second, None, "its one slot is already taken from pool a");
+    }
+
+    #[tokio::test]
+    async fn a_user_is_assigned_separately_in_each_pool() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &node("plain")).await.unwrap();
+        heartbeat(&mut v, &aq, &in_pools("gpu-node", &["gpu"])).await.unwrap();
+
+        let plain = assigned(&mut v, &aq, "acme").await;
+        let gpu = assigned_in(&mut v, &aq, "acme", "gpu").await;
+        let plain_again = assigned(&mut v, &aq, "acme").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!((plain.as_deref(), gpu.as_deref()), (Some("plain"), Some("gpu-node")));
+        assert_eq!(plain_again.as_deref(), Some("plain"), "the default-pool assignment is untouched");
+    }
+
+    #[tokio::test]
+    async fn leaving_a_pool_moves_its_users_on() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        heartbeat(&mut v, &aq, &in_pools("leaver", &["gpu"])).await.unwrap();
+        let before = assigned_in(&mut v, &aq, "acme", "gpu").await;
+        // Its next ping no longer lists gpu; another instance joined it.
+        heartbeat(&mut v, &aq, &in_pools("leaver", &["cpu"])).await.unwrap();
+        heartbeat(&mut v, &aq, &in_pools("joiner", &["gpu"])).await.unwrap();
+        let after = assigned_in(&mut v, &aq, "acme", "gpu").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(before.as_deref(), Some("leaver"));
+        assert_eq!(after.as_deref(), Some("joiner"), "the sticky assignment to an instance that left the pool is dropped");
+    }
+
+    #[test]
+    fn line_keys_keep_the_default_pool_unchanged() {
+        assert_eq!(Tenant::user("acme").key(), "acme");
+        let gpu = Tenant::new("acme", "gpu").key();
+        assert_ne!(gpu, "acme");
+        assert_eq!(Tenant::pool_of_key(&gpu), "gpu");
+        assert_eq!(Tenant::pool_of_key("acme"), DEFAULT_POOL);
+        assert!(valid_pool("gpu-a100.eu_1") && !valid_pool("") && !valid_pool("has space") && !valid_pool(&"x".repeat(65)));
+    }
+
     #[tokio::test]
     async fn ws_instances_are_kept_out_of_http_routing() {
         let mut v = test_valkey().await;
@@ -637,7 +796,7 @@ pub(crate) mod tests {
         heartbeat(&mut v, &aq, &Member { role: Some("ws".into()), ..node("ws-node") }).await.unwrap();
         heartbeat(&mut v, &aq, &Member { role: Some("http".into()), ..node("http-node") }).await.unwrap();
 
-        let ws = match assign(&mut v, &aq, "acme", Traffic::WebSocket).await.unwrap() {
+        let ws = match assign(&mut v, &aq, &Tenant::user("acme"), Traffic::WebSocket).await.unwrap() {
             AssignOutcome::Assigned(n) => Some(n.id),
             AssignOutcome::PoolExhausted => None,
         };
@@ -688,7 +847,7 @@ pub(crate) mod tests {
         let aq = test_aqueduct();
         let _: () = v.set(aq.assignment_key(&scope_hash("acme")), "new-node").await.unwrap();
 
-        let released = release_user(&mut v, &aq, "acme", "old-node").await.unwrap();
+        let released = release(&mut v, &aq, &Tenant::user("acme"), Traffic::Http, "old-node").await.unwrap();
         let still: String = v.get(aq.assignment_key(&scope_hash("acme"))).await.unwrap();
         cleanup(&mut v, &aq).await;
 
