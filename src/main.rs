@@ -41,6 +41,13 @@ pub type Valkey = redis::aio::ConnectionManager;
 pub struct AppState {
     valkey: Valkey,
     http: reqwest::Client,
+    // For forwarding to other Canalis nodes: HTTP/2, so forwarded
+    // waiting-room streams share a few connections instead of holding one
+    // each (one per waiting caller ran both nodes out of open files in the
+    // Fly benchmark). Several clients, each its own connection, because a
+    // server allows 200 streams per HTTP/2 connection and forwarding
+    // stalled in steps of 200 with just one.
+    peers: Arc<PeerClients>,
     // This node's own durable waiting line -- see line.rs. Valkey still
     // holds assignment state; queued work never goes there.
     line: Arc<line::Line>,
@@ -246,6 +253,7 @@ async fn main() {
     let state = AppState {
         valkey,
         http: reqwest::Client::new(),
+        peers: Arc::new(PeerClients::from_env()),
         line: Arc::new(line),
         draining: Arc::default(),
         waiters: Arc::default(),
@@ -1445,6 +1453,28 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str, pool: &str
     forward_in_pool(state, job, target_path, pool, origin, &RetryConfig::from_env()).await
 }
 
+pub struct PeerClients {
+    clients: Vec<reqwest::Client>,
+    next: AtomicU64,
+}
+
+impl PeerClients {
+    // CANALIS_PEER_CONNECTIONS (default 32) HTTP/2 connections per peer,
+    // 200 streams each.
+    fn from_env() -> Self {
+        let n = env_u64("CANALIS_PEER_CONNECTIONS", 32).clamp(1, 1024) as usize;
+        let clients = (0..n)
+            .map(|_| reqwest::Client::builder().http2_prior_knowledge().build().unwrap_or_default())
+            .collect();
+        Self { clients, next: AtomicU64::new(0) }
+    }
+
+    fn next(&self) -> &reqwest::Client {
+        let i = self.next.fetch_add(1, Ordering::Relaxed) as usize % self.clients.len();
+        &self.clients[i]
+    }
+}
+
 // Passes a request on to the Canalis node holding its tenant's line and
 // relays that node's answer (a waiting-room stream, or a result) as it
 // comes. None if the owner can't be reached at all, so the caller can
@@ -1459,7 +1489,8 @@ async fn forward_to_owner(
     origin: &Origin,
 ) -> Option<Response> {
     let mut request = state
-        .http
+        .peers
+        .next()
         .request(method, format!("{owner_url}{path_and_query}"))
         .header(FORWARDED_BY, state.ownership.node_id.as_str())
         .header("X-Aqueduct-Pool", pool);
@@ -2061,6 +2092,7 @@ mod tests {
         let state = AppState {
             valkey: test_valkey().await,
             http: reqwest::Client::new(),
+            peers: Arc::new(PeerClients::from_env()),
             line: Arc::new(line),
             draining: Arc::default(),
             waiters: Arc::default(),
@@ -3388,6 +3420,7 @@ mod tests {
         let state = AppState {
             valkey: test_valkey().await,
             http: reqwest::Client::new(),
+            peers: Arc::new(PeerClients::from_env()),
             line: line.clone(),
             draining: Arc::default(),
             waiters: Arc::default(),

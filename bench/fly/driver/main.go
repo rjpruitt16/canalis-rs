@@ -34,6 +34,17 @@ func main() {
 		serve()
 	case "run", "ramp":
 		load(os.Args[1], os.Args[2:])
+	case "resolve":
+		// Every address a host resolves to, one per line (for reading each
+		// Canalis node's own /metrics).
+		addrs, err := net.LookupHost(os.Args[2])
+		if err != nil {
+			log.Fatal(err)
+		}
+		sort.Strings(addrs)
+		for _, a := range addrs {
+			fmt.Println(a)
+		}
 	default:
 		log.Fatalf("unknown command %q", os.Args[1])
 	}

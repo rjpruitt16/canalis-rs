@@ -19,4 +19,7 @@ ENV CANALIS_L8_KEY_PATH=/data/.l8-key
 RUN mkdir -p /data
 VOLUME /data
 EXPOSE 8080
-CMD ["./canalis-rs"]
+# Every caller waiting in line holds a connection, so the default limit
+# of open files (often 1,024 or 10,240) is the first ceiling a busy
+# Canalis hits. Raise it as far as the runtime allows.
+CMD ["sh", "-c", "ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null; exec ./canalis-rs"]
