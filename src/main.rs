@@ -221,9 +221,7 @@ async fn main() {
     let state_for_shutdown = state.clone();
     let app = router(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080")
-        .await
-        .expect("failed to bind to 0.0.0.0:8080");
+    let listener = bind_listener().await;
 
     tracing::info!("canalis-rs listening on {}", listener.local_addr().unwrap());
 
@@ -456,12 +454,42 @@ async fn register(
         }
     };
 
-    let address = format!("{}:{}", remote.ip(), payload.port);
+    let Some(address) = instance_address(remote.ip(), &payload.port) else {
+        return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "port must be a number from 1 to 65535" }));
+    };
     match handle_registration(state, &address, &payload).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(err) => {
             tracing::error!("failed to register instance {address}: {err}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// The instance's address: the connecting IP plus the port it reports, as a
+// socket address, so an IPv6 address gets its brackets
+// (`[fdaa::5]:8080`, not `fdaa::5:8080`, which isn't a usable URL). An
+// IPv4 client reaching a dual-stack listener shows up as ::ffff:a.b.c.d;
+// that's recorded as the plain IPv4 address.
+fn instance_address(ip: std::net::IpAddr, port: &str) -> Option<String> {
+    let port: u16 = port.trim().parse().ok().filter(|p| *p != 0)?;
+    Some(SocketAddr::new(ip.to_canonical(), port).to_string())
+}
+
+// CANALIS_LISTEN_ADDR, default [::]:8080 -- every IPv6 and (dual-stack, the
+// Linux default) IPv4 address, so private IPv6 networks such as Fly's reach
+// it. Falls back to 0.0.0.0:8080 where IPv6 is switched off.
+async fn bind_listener() -> tokio::net::TcpListener {
+    if let Ok(addr) = std::env::var("CANALIS_LISTEN_ADDR") {
+        return tokio::net::TcpListener::bind(addr.trim())
+            .await
+            .unwrap_or_else(|err| panic!("failed to bind CANALIS_LISTEN_ADDR={addr}: {err}"));
+    }
+    match tokio::net::TcpListener::bind("[::]:8080").await {
+        Ok(listener) => listener,
+        Err(err) => {
+            tracing::warn!("can't listen on [::]:8080 ({err}); using 0.0.0.0:8080");
+            tokio::net::TcpListener::bind("0.0.0.0:8080").await.expect("failed to bind to 0.0.0.0:8080")
         }
     }
 }
@@ -2885,6 +2913,21 @@ mod tests {
             assert_eq!(cached.status, 200, "job {i} should have been dispatched and completed");
         }
         assert_eq!(line.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn instance_addresses_are_usable_urls_for_ipv4_and_ipv6() {
+        let v4: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        let v6: std::net::IpAddr = "fdaa:0:1::5".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:10.0.0.5".parse().unwrap();
+        assert_eq!(instance_address(v4, "8080").as_deref(), Some("10.0.0.5:8080"));
+        assert_eq!(instance_address(v6, "8080").as_deref(), Some("[fdaa:0:1::5]:8080"));
+        assert_eq!(instance_address(mapped, " 8080 ").as_deref(), Some("10.0.0.5:8080"));
+        for bad in ["", "0", "http", "70000"] {
+            assert_eq!(instance_address(v4, bad), None, "{bad:?}");
+        }
+        let url = format!("http://{}/proxy", instance_address(v6, "8080").unwrap());
+        assert!(reqwest::Url::parse(&url).is_ok(), "{url}");
     }
 
     #[tokio::test]

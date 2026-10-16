@@ -1,8 +1,14 @@
 # Configuration
 
-Canalis is configured only through environment variables. It listens on `0.0.0.0:8080`. Durations are whole numbers in the unit their name says.
+Canalis is configured only through environment variables. It listens on `[::]:8080` (IPv6, and IPv4 on dual-stack hosts such as Linux), falling back to `0.0.0.0:8080` where IPv6 is off; `CANALIS_LISTEN_ADDR` overrides it. Durations are whole numbers in the unit their name says.
 
 CI checks that every variable Canalis reads is listed here (`scripts/check-config-docs.sh`).
+
+## Listening
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_LISTEN_ADDR` | `[::]:8080` | Address to listen on. The default falls back to `0.0.0.0:8080` if IPv6 is unavailable. |
 
 ## Valkey and the shared pool
 
