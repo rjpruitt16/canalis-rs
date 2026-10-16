@@ -127,6 +127,17 @@ How Canalis answers:
 
 All the settings are in [docs/configuration.md](docs/configuration.md#who-a-request-is-for).
 
+## Running several Canalis nodes
+
+Each Canalis keeps its line on its own disk. To keep each tenant in one line, the first node that has to queue a tenant claims them in Valkey. Any other node that would queue that tenant forwards the request to the owner instead, and `GET /jobs/{key}` follows the claim too, so a client can hit any node.
+
+- **Cost:** ownership is checked only when a request would be queued, so a request that gets an instance straight away costs nothing extra.
+- **While the tenant waits:** the owner renews its claim while the tenant has jobs waiting, and lets go when they're done.
+- **If the owner stops heartbeating:** the next node to queue that tenant takes over. Jobs still on the lost node's disk wait for it to come back, and are lost if it never does.
+- **If the owner can't be reached:** the job is queued on the node that got it, never dropped.
+
+Each node needs an address the others can reach. On Fly that's automatic, from `FLY_PRIVATE_IP`. Elsewhere, set `CANALIS_ADVERTISE_URL` (for example `http://10.0.0.7:8080`). A node without one never claims a tenant, which is how a single Canalis runs. The settings are in [docs/configuration.md](docs/configuration.md#several-canalis-nodes).
+
 ## Pools and WebSockets
 
 **Pools.** Instances can be split into pools, for example GPU and CPU instances, regions, or a set of instances dedicated to one customer. A node joins pools by listing them at registration: `AQUIFER_REGISTRY_POOLS=gpu,eu` or `SPILLWAY_REGISTRY_POOLS`. A node that lists none is in the `default` pool. Every ping replaces the list, so a node joins or leaves a pool with its next ping.
