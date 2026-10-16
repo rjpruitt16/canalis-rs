@@ -19,6 +19,7 @@ CI checks that every variable Canalis reads is listed here (`scripts/check-confi
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' expected ping interval. A registration expires after 3 missed pings. |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long a user's assignment to an instance survives without traffic. |
 | `CANALIS_DEFAULT_USER_CAPACITY` | `100` | User capacity for instances that don't report `user_capacity`. |
+| `CANALIS_MEMBER_CACHE_MS` | `250` | How long the instance list used for claims is reused before Valkey is read again. Registrations and instances this node finds draining or unreachable take effect at once; fullness may lag by this much. `0` reads Valkey on every claim. |
 | `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this `X-Aqueduct-Fullness`, an instance gets no new users. When every instance is past it, new users wait in line. |
 
 ## The line
@@ -34,6 +35,8 @@ CI checks that every variable Canalis reads is listed here (`scripts/check-confi
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked for jobs that can be handed out. |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position`. |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream waits in line before `canalis_timeout`. The job stays in line. |
+| `CANALIS_DRAIN_RPS` | `100` | How fast one tenant's waiting jobs are handed to their instance once it has room, until the instance says otherwise with `X-Aqueduct-Rps`. |
+| `CANALIS_DRAIN_MAX_CONCURRENT` | `10` | How many of one tenant's waiting jobs are handed over at once (at most 50), until the instance says otherwise with `X-Aqueduct-Max-Concurrent`. |
 | `CANALIS_INSTANCE_RETRY_BASE_DELAY_MS` | `200` | Backoff between the 3 attempts to reach an instance, doubling each time. |
 
 ## WebSockets

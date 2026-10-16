@@ -636,13 +636,24 @@ fn node_is_draining(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
         })
 }
 
-// Default pacing before anything's been learned about the target
-// instance's own tolerance -- mirrors Aquifer's own account_queue.go
-// defaults (RateConfig{RPS: 2.0, MaxConcurrent: 1}) exactly: start
-// conservative (fully sequential), then adjust from whatever the
-// instance reports back on each dispatch.
-const DEFAULT_DRAIN_RPS: f64 = 2.0;
-const DEFAULT_DRAIN_MAX_CONCURRENT: usize = 1;
+// How fast one tenant's backlog is handed from the line to its instance
+// before the instance says otherwise (X-Aqueduct-Rps /
+// X-Aqueduct-Max-Concurrent on its responses). CANALIS_DRAIN_RPS and
+// CANALIS_DRAIN_MAX_CONCURRENT, default 100/s and 10 at once.
+//
+// This used to mirror Aquifer's own pace toward a target API (2/s, one at
+// a time), but the instance isn't the resource being protected: Aquifer
+// queues durably and pushes back with 429s and fullness. At 2/s, the
+// Fly benchmark's line drained about 100 times slower than the fleet
+// could serve once the fleet filled.
+fn default_drain_pace() -> (f64, usize) {
+    static PACE: std::sync::OnceLock<(f64, usize)> = std::sync::OnceLock::new();
+    *PACE.get_or_init(|| {
+        let rps = std::env::var("CANALIS_DRAIN_RPS").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v > 0.0);
+        let max = env_u64("CANALIS_DRAIN_MAX_CONCURRENT", 10).clamp(1, MAX_DRAIN_CONCURRENCY_CEILING as u64) as usize;
+        (rps.unwrap_or(100.0).max(MIN_DRAIN_RPS), max)
+    })
+}
 const MIN_DRAIN_RPS: f64 = 0.5;
 // A misbehaving or malicious instance advertising an absurd concurrency
 // ceiling shouldn't be able to make Canalis fire an unbounded number of
@@ -823,8 +834,7 @@ async fn drain_tenant_backlog(
     let tenant = assign::Tenant::new(first.job.user_id.as_str(), first.pool.as_str());
     let user_id = tenant.key();
     let mut pending = Some(first);
-    let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
-    let mut rps = DEFAULT_DRAIN_RPS;
+    let (mut rps, mut max_concurrent) = default_drain_pace();
     let mut last_dispatch_at: Option<Instant> = None;
     let mut in_flight: tokio::task::JoinSet<DispatchOutcome> = tokio::task::JoinSet::new();
     // Set once the instance says it's draining: stop taking more jobs out
@@ -895,6 +905,12 @@ async fn drain_tenant_backlog(
         assign::mark_draining(&mut state.valkey, &state.aqueduct, &node.id).await?;
         assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
         tracing::info!("{} is draining; {user_id}'s remaining jobs stay in line for another node", node.id);
+    } else {
+        // Their backlog is done: give the slot back now rather than after
+        // the assignment idles out (idle seconds plus two heartbeats), so
+        // the next tenant waiting in line gets it. If they're still
+        // sending, their next request claims a slot again.
+        assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
     }
     Ok(())
 }
@@ -3000,6 +3016,22 @@ mod tests {
         cleanup(&state).await;
 
         assert_eq!(member.pools, vec!["eu".to_string(), "gpu".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_drained_tenant_gives_its_slot_back() {
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-done-draining");
+        state.line.enqueue(&job_for(&user_id), "/jobs", assign::DEFAULT_POOL).unwrap();
+        register_node(&state, &start_plain_ok_mock().await).await;
+
+        let check = state.clone();
+        assert!(try_drain_one(state).await.unwrap());
+        let still_assigned = assigned_to(&check, &user_id).await;
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(still_assigned, None, "the next tenant in line shouldn't wait for this one to idle out");
     }
 
     #[tokio::test]
