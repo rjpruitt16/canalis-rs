@@ -23,6 +23,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 ### Fixed
 
 - **IPv6:** instances on IPv6 networks such as Fly's were recorded as unusable addresses (`fdaa::5:8080`), and Canalis didn't listen on IPv6.
+- **Several nodes and L8:** a key learned through the handshake by one Canalis node is now shared through Valkey. Before, the other nodes accepted that node's signed pings as unsigned (logging every ping), or refused them with `CANALIS_REQUIRE_SIGNED_REGISTRATION`.
 - **Restarts:** after a Canalis restart, nodes that had already registered got `401` indefinitely. Learned L8 node keys are now saved on the volume.
 
 ## [0.1.0] - 2026-10-14
