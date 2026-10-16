@@ -4,6 +4,7 @@ mod l8;
 mod lifecycle;
 mod line;
 mod metrics;
+mod ownership;
 mod scale;
 mod schemas;
 mod websocket;
@@ -79,6 +80,33 @@ pub struct AppState {
     auth: Arc<auth::Auth>,
     // Proxied requests in progress, and when to start shedding them.
     shedder: Arc<Shedder>,
+    // Which Canalis node holds each waiting tenant's line (ownership.rs).
+    ownership: Arc<ownership::Ownership>,
+}
+
+/// Where a request came from, for forwarding it to the Canalis node that
+/// holds its tenant's line: whether another node already forwarded it (so
+/// it's queued here, never passed on again), and the caller's credentials,
+/// which the owner checks again.
+#[derive(Clone, Default)]
+pub(crate) struct Origin {
+    forwarded: bool,
+    credentials: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+}
+
+const FORWARDED_BY: &str = "X-Canalis-Forwarded-By";
+
+impl Origin {
+    fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        let credentials = [axum::http::header::AUTHORIZATION.as_str(), "x-canalis-upstream-secret"]
+            .iter()
+            .filter_map(|name| {
+                let name = axum::http::HeaderName::from_static(name);
+                headers.get(&name).map(|v| (name, v.clone()))
+            })
+            .collect();
+        Self { forwarded: headers.contains_key(FORWARDED_BY), credentials }
+    }
 }
 
 /// Load shedding for /proxy and /jobs. Past CANALIS_MAX_IN_FLIGHT requests
@@ -232,6 +260,7 @@ async fn main() {
         metrics: Arc::default(),
         auth: Arc::new(auth::Auth::from_env().unwrap_or_else(|err| panic!("auth setup failed: {err}"))),
         shedder: Arc::new(Shedder::from_env()),
+        ownership: Arc::new(ownership::Ownership::from_env()),
     };
 
     let room_handout = state.clone();
@@ -254,6 +283,20 @@ async fn main() {
         }
     });
 
+    // Advertise this node to the other Canalis nodes (ownership.rs).
+    if let Some(url) = state.ownership.advertise.clone() {
+        tracing::info!("this Canalis node is {} at {url}", state.ownership.node_id);
+        let heartbeat_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = heartbeat_state.ownership.heartbeat(&mut heartbeat_state.valkey.clone(), &heartbeat_state.aqueduct).await {
+                    tracing::warn!("couldn't advertise this Canalis node: {err}");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
+
     // Runs once immediately -- that's crash recovery: whatever was in line
     // when this process last died gets drained as soon as instances are
     // free -- and then periodically, so a line held by this node still
@@ -267,6 +310,7 @@ async fn main() {
                 tracing::error!("line sweep failed: {err}");
             }
             check_scale(&sweeper_state).await;
+            renew_line_ownership(&sweeper_state).await;
             tokio::time::sleep(sweep_every).await;
         }
     });
@@ -320,6 +364,11 @@ async fn main() {
 // under way. Bounded by the caller's watchdog.
 async fn drain(state: AppState) {
     state.lifecycle.begin();
+    // Stop advertising: other nodes take over this node's tenants as soon
+    // as they next need to queue them, instead of forwarding here.
+    if let Err(err) = state.ownership.leave(&mut state.valkey.clone(), &state.aqueduct).await {
+        tracing::warn!("couldn't withdraw this Canalis node: {err}");
+    }
     let closed = close_waiting_room(&state);
     tracing::info!("draining: refusing new work; told {closed} waiting callers to reconnect later");
 
@@ -399,6 +448,24 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "instances": fleet,
         "websocket": { "open": state.sockets.open() },
     }))
+}
+
+// Keeps this node's claim on every tenant it has jobs waiting for, so
+// other Canalis nodes keep forwarding them here.
+async fn renew_line_ownership(state: &AppState) {
+    if !state.ownership.enabled() {
+        return;
+    }
+    let tenants = match on_line(&state.line, |l| l.tenants()).await {
+        Ok(keys) => keys.iter().map(|k| assign::Tenant::from_key(k)).collect::<Vec<_>>(),
+        Err(err) => {
+            tracing::warn!("couldn't list tenants in line to renew ownership: {err}");
+            return;
+        }
+    };
+    if let Err(err) = state.ownership.renew(&mut state.valkey.clone(), &state.aqueduct, &tenants).await {
+        tracing::warn!("couldn't renew line ownership: {err}");
+    }
 }
 
 async fn check_scale(state: &AppState) {
@@ -964,6 +1031,9 @@ async fn drain_tenant_backlog(
         // the next tenant waiting in line gets it. If they're still
         // sending, their next request claims a slot again.
         assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
+        // And their line here is empty: other nodes no longer need to
+        // forward them to this one.
+        state.ownership.release(&mut state.valkey, &state.aqueduct, &tenant).await?;
     }
     Ok(())
 }
@@ -1268,7 +1338,7 @@ async fn admit_job(state: AppState, headers: axum::http::HeaderMap, mut job: Job
             pool = token_pool;
         }
     }
-    forward(state, job, path, &pool).await
+    forward(state, job, path, &pool, &Origin::from_headers(&headers)).await
 }
 
 /// 401 for missing or bad credentials, 503 when the provider's keys can't
@@ -1371,15 +1441,78 @@ pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-async fn forward(state: AppState, job: JobRequest, target_path: &str, pool: &str) -> Response {
-    forward_in_pool(state, job, target_path, pool, &RetryConfig::from_env()).await
+async fn forward(state: AppState, job: JobRequest, target_path: &str, pool: &str, origin: &Origin) -> Response {
+    forward_in_pool(state, job, target_path, pool, origin, &RetryConfig::from_env()).await
+}
+
+// Passes a request on to the Canalis node holding its tenant's line and
+// relays that node's answer (a waiting-room stream, or a result) as it
+// comes. None if the owner can't be reached at all, so the caller can
+// queue locally instead of failing.
+async fn forward_to_owner(
+    state: &AppState,
+    owner_url: &str,
+    method: reqwest::Method,
+    path_and_query: &str,
+    job: Option<&JobRequest>,
+    pool: &str,
+    origin: &Origin,
+) -> Option<Response> {
+    let mut request = state
+        .http
+        .request(method, format!("{owner_url}{path_and_query}"))
+        .header(FORWARDED_BY, state.ownership.node_id.as_str())
+        .header("X-Aqueduct-Pool", pool);
+    for (name, value) in &origin.credentials {
+        request = request.header(name.as_str(), value.as_bytes());
+    }
+    if let Some(job) = job {
+        request = request.json(job);
+    }
+    let upstream = match request.send().await {
+        Ok(upstream) => upstream,
+        Err(err) if err.is_connect() => return None,
+        Err(err) => {
+            return Some(json_response(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": format!("the Canalis node holding this line failed: {err}") }),
+            ));
+        }
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let headers = upstream.headers().clone();
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|_| json_response(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": "invalid response" })));
+    relay_headers(&headers, response.headers_mut());
+    if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE).and_then(|v| axum::http::HeaderValue::from_bytes(v.as_bytes()).ok()) {
+        response.headers_mut().insert(axum::http::header::CONTENT_TYPE, ct);
+    }
+    Some(response)
 }
 
 // Puts the job in line and turns the caller's connection into the waiting
 // room's stream. The caller is registered as a waiter *before* the job is
 // enqueued, so a drain that picks the job up immediately still finds
 // someone to stream to.
-async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, timeout: Duration, reason: &str) -> Response {
+async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, origin: &Origin, timeout: Duration, reason: &str) -> Response {
+    // One line per tenant across Canalis nodes: if another node already
+    // holds this tenant's line, the request joins it there. A request
+    // another node forwarded here is queued here whatever happens, so it
+    // can't bounce; if the owner can't be reached, it's queued here too.
+    let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
+    match state.ownership.owner_for_queueing(&mut state.valkey.clone(), &state.aqueduct, &tenant).await {
+        Ok(ownership::LineOwner::Elsewhere { node, url }) if !origin.forwarded => {
+            if let Some(response) = forward_to_owner(&state, &url, reqwest::Method::POST, path, Some(&job), pool, origin).await {
+                state.metrics.inc("canalis_line_forwarded_total", &[]);
+                return response;
+            }
+            tracing::warn!("couldn't reach Canalis node {node} holding {}'s line; queueing here", job.user_id);
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!("couldn't check who holds {}'s line ({err}); queueing here", job.user_id),
+    }
     let key = waiter_key(&job, pool);
     let id = state.next_waiter_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::channel::<Bytes>(64);
@@ -1480,7 +1613,7 @@ enum Reroute {
 // The default pool, for tests that don't care about pools.
 #[cfg(test)]
 async fn forward_with_config(state: AppState, job: JobRequest, target_path: &str, config: &RetryConfig) -> Response {
-    forward_in_pool(state, job, target_path, assign::DEFAULT_POOL, config).await
+    forward_in_pool(state, job, target_path, assign::DEFAULT_POOL, &Origin::default(), config).await
 }
 
 async fn forward_in_pool(
@@ -1488,6 +1621,7 @@ async fn forward_in_pool(
     job: JobRequest,
     target_path: &str,
     pool: &str,
+    origin: &Origin,
     config: &RetryConfig,
 ) -> Response {
     // Before anything else: a body the upstream's published schema rejects
@@ -1499,7 +1633,7 @@ async fn forward_in_pool(
     let mut valkey = state.valkey.clone();
     let user_id = job.user_id.clone();
     let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
-    let first = forward_attempt(state.clone(), job.clone(), target_path, pool, config).await;
+    let first = forward_attempt(state.clone(), job.clone(), target_path, pool, origin, config).await;
     let Some(reroute) = first.extensions().get::<Reroute>().cloned() else {
         return first;
     };
@@ -1531,7 +1665,7 @@ async fn forward_in_pool(
         }
     }
     state.metrics.inc("canalis_reroutes_total", &[]);
-    forward_attempt(state, job, target_path, pool, config).await
+    forward_attempt(state, job, target_path, pool, origin, config).await
 }
 
 // Resolves the assignment, then forwards the same job body to the
@@ -1557,20 +1691,21 @@ async fn forward_attempt(
     job: JobRequest,
     target_path: &str,
     pool: &str,
+    origin: &Origin,
     config: &RetryConfig,
 ) -> Response {
     let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
     let node = match assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await {
         Ok(assign::AssignOutcome::Assigned(node)) => node,
         Ok(assign::AssignOutcome::PoolExhausted) => {
-            return wait_in_line(state, job, target_path, pool, config.pool_wait_timeout, "no_instance_free").await;
+            return wait_in_line(state, job, target_path, pool, origin, config.pool_wait_timeout, "no_instance_free").await;
         }
         // Valkey (where assignments live) can't be reached. The line is on
         // local disk and doesn't need it, so the job waits there and the
         // sweep hands it out once Valkey is back.
         Err(err) => {
             tracing::error!("assign failed, holding the job in line: {err}");
-            return wait_in_line(state, job, target_path, pool, config.pool_wait_timeout, "assignment_store_unavailable").await;
+            return wait_in_line(state, job, target_path, pool, origin, config.pool_wait_timeout, "assignment_store_unavailable").await;
         }
     };
 
@@ -1827,8 +1962,21 @@ async fn job_status(
     if user.is_empty() {
         return json_response(StatusCode::BAD_REQUEST, serde_json::json!({ "error": "need a user_id query parameter" }));
     }
-    let user_id = assign::Tenant::new(user, pool).key();
-    match on_line(&state.line, move |l| l.lookup(&user_id, &idempotent_key)).await {
+    let tenant = assign::Tenant::new(user, pool);
+    let user_id = tenant.key();
+    let key_for_lookup = idempotent_key.clone();
+    let found = on_line(&state.line, move |l| l.lookup(&user_id, &key_for_lookup)).await;
+    // Not here: maybe it's waiting on the node that holds this tenant's line.
+    let origin = Origin::from_headers(&headers);
+    if matches!(found, Ok(line::Lookup::Unknown)) && !origin.forwarded {
+        if let Ok(Some((_, url))) = state.ownership.other_owner(&mut state.valkey.clone(), &state.aqueduct, &tenant).await {
+            let path = format!("/jobs/{}?user_id={}&pool={}", idempotent_key, urlencode(&tenant.user), urlencode(&tenant.pool));
+            if let Some(response) = forward_to_owner(&state, &url, reqwest::Method::GET, &path, None, &tenant.pool, &origin).await {
+                return response;
+            }
+        }
+    }
+    match found {
         Ok(line::Lookup::Done(cached)) => cached_result_response(cached),
         Ok(line::Lookup::Queued { ahead }) => json_response(
             StatusCode::ACCEPTED,
@@ -1846,6 +1994,13 @@ async fn job_status(
             )
         }
     }
+}
+
+fn urlencode(s: &str) -> String {
+    reqwest::Url::parse_with_params("http://x/", &[("v", s)])
+        .ok()
+        .and_then(|u| u.query().map(|q| q.trim_start_matches("v=").to_string()))
+        .unwrap_or_default()
 }
 
 // A drained job's cached outcome is the *complete* text a live viewer
@@ -1924,6 +2079,7 @@ mod tests {
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
             shedder: Arc::new(Shedder::with_max(0)),
+            ownership: Arc::new(ownership::tests::node("test-node", None)),
         };
         (state, dir)
     }
@@ -1992,7 +2148,7 @@ mod tests {
         register_node(&state, &mock_addr).await;
         let cleanup_state = state.clone();
 
-        let response = forward(state, job_for(&user_id), "/proxy", assign::DEFAULT_POOL).await;
+        let response = forward(state, job_for(&user_id), "/proxy", assign::DEFAULT_POOL, &Origin::default()).await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-aqueduct-queue-depth"], "3", "streamed responses relay headers too");
 
@@ -3127,6 +3283,77 @@ mod tests {
         assert!(metrics.contains("canalis_shed_total 1\n"), "{metrics}");
     }
 
+    // Two Canalis nodes sharing Valkey, each with its own line file, both
+    // advertising themselves so each can find the other.
+    async fn two_canalis_nodes() -> ((AppState, String, tempfile::TempDir), (AppState, String, tempfile::TempDir)) {
+        let (mut a, dir_a) = test_state().await;
+        let (mut b, dir_b) = test_state().await;
+        b.aqueduct = a.aqueduct.clone();
+        let mut nodes = Vec::new();
+        for (state, id) in [(&mut a, "node-a"), (&mut b, "node-b")] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            state.ownership = Arc::new(ownership::tests::node(id, Some(&format!("http://{addr}"))));
+            state.ownership.heartbeat(&mut state.valkey.clone(), &state.aqueduct).await.unwrap();
+            let serving = state.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, router(serving).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+            });
+            nodes.push(addr);
+        }
+        let b_addr = nodes.pop().unwrap();
+        let a_addr = nodes.pop().unwrap();
+        ((a, a_addr, dir_a), (b, b_addr, dir_b))
+    }
+
+    #[tokio::test]
+    async fn a_tenant_waits_in_one_line_across_canalis_nodes() {
+        let ((a, a_addr, _da), (b, b_addr, _db)) = two_canalis_nodes().await;
+        // No instances: every request has to wait.
+        let http = reqwest::Client::new();
+        let first = job_for("acme");
+        let second = job_for("acme");
+        let other = job_for("someone-else");
+        let post = |addr: &str, job: &JobRequest| http.post(format!("http://{addr}/proxy")).json(job).send();
+
+        let at_a = post(&a_addr, &first).await.unwrap();
+        let at_b = post(&b_addr, &second).await.unwrap();
+        let other_at_b = post(&b_addr, &other).await.unwrap();
+        let status_via_b = http
+            .get(format!("http://{b_addr}/jobs/{}?user_id=acme", second.idempotent_key))
+            .send()
+            .await
+            .unwrap();
+        let status_code = status_via_b.status();
+        let status: serde_json::Value = status_via_b.json().await.unwrap();
+        let metrics_b = http.get(format!("http://{b_addr}/metrics")).send().await.unwrap().text().await.unwrap();
+        let (a_len, b_len) = (a.line.len().unwrap(), b.line.len().unwrap());
+        drop((at_a, at_b, other_at_b));
+        cleanup(&a).await;
+
+        assert_eq!(a_len, 2, "both of acme's jobs wait at node a, which queued them first");
+        assert_eq!(b_len, 1, "node b holds only the tenant it queued first");
+        assert_eq!(status_code, StatusCode::ACCEPTED, "node b finds acme's job on node a: {status}");
+        assert_eq!(status["status"], "queued");
+        assert!(metrics_b.contains("canalis_line_forwarded_total 1\n"), "{metrics_b}");
+    }
+
+    #[tokio::test]
+    async fn if_the_line_owner_is_unreachable_the_job_waits_here() {
+        let ((a, _a_addr, _da), (b, b_addr, _db)) = two_canalis_nodes().await;
+        // node a holds acme, but its advertised address is dead.
+        a.ownership.owner_for_queueing(&mut a.valkey.clone(), &a.aqueduct, &assign::Tenant::user("acme")).await.unwrap();
+        let dead = ownership::tests::node("node-a", Some("http://127.0.0.1:1"));
+        dead.heartbeat(&mut a.valkey.clone(), &a.aqueduct).await.unwrap();
+
+        let response = reqwest::Client::new().post(format!("http://{b_addr}/proxy")).json(&job_for("acme")).send().await.unwrap();
+        let queued_here = b.line.len().unwrap();
+        drop(response);
+        cleanup(&a).await;
+
+        assert_eq!(queued_here, 1, "not lost: queued on the node that got it");
+    }
+
     #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
@@ -3179,6 +3406,7 @@ mod tests {
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
             shedder: Arc::new(Shedder::with_max(0)),
+            ownership: Arc::new(ownership::tests::node("test-node", None)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

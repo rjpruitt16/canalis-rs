@@ -641,6 +641,17 @@ impl Line {
         Ok((stored.enqueued_at > 0).then(|| now_unix().saturating_sub(stored.enqueued_at)))
     }
 
+    /// The line keys (Tenant::key) of every tenant with jobs waiting.
+    pub fn tenants(&self) -> Result<Vec<String>, LineError> {
+        let txn = self.db.begin_read()?;
+        let counts = txn.open_table(TENANT_COUNTS)?;
+        let mut tenants = Vec::new();
+        for entry in counts.range::<&str>(..)? {
+            tenants.push(entry?.0.value().to_string());
+        }
+        Ok(tenants)
+    }
+
     /// Jobs currently in line.
     pub fn len(&self) -> Result<u64, LineError> {
         let txn = self.db.begin_read()?;

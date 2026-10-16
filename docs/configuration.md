@@ -10,6 +10,16 @@ CI checks that every variable Canalis reads is listed here (`scripts/check-confi
 | --- | --- | --- |
 | `CANALIS_LISTEN_ADDR` | `[::]:8080` | Address to listen on. The default falls back to `0.0.0.0:8080` if IPv6 is unavailable. |
 
+## Several Canalis nodes
+
+See [Running several Canalis nodes](../README.md#running-several-canalis-nodes) in the README.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_ADVERTISE_URL` | `http://[$FLY_PRIVATE_IP]:8080` on Fly, else unset | How other Canalis nodes reach this one. Unset means this node doesn't take part: it never claims a tenant's line, so a single Canalis behaves as before. |
+| `CANALIS_NODE_ID` | `$FLY_MACHINE_ID`, else random per start | This node's id among the Canalis nodes sharing Valkey. |
+| `CANALIS_LINE_OWNER_TTL_SECONDS` | `30` | How long a node's claim on a tenant's line lasts without renewal. It's renewed every sweep while the tenant has jobs waiting. |
+
 ## Load shedding
 
 | Variable | Default | What it does |

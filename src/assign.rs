@@ -181,6 +181,18 @@ impl Tenant {
         if self.pool == DEFAULT_POOL { self.user.clone() } else { format!("{}\x00{}", self.pool, self.user) }
     }
 
+    /// The tenant a line key (see key()) stands for.
+    pub fn from_key(key: &str) -> Self {
+        match key.split_once('\x00') {
+            Some((pool, user)) => Self::new(user, pool),
+            None => Self::user_in_default(key),
+        }
+    }
+
+    fn user_in_default(user: &str) -> Self {
+        Self::new(user, DEFAULT_POOL)
+    }
+
     /// The pool a line key belongs to.
     pub fn pool_of_key(key: &str) -> &str {
         key.split_once('\x00').map_or(DEFAULT_POOL, |(pool, _)| pool)
