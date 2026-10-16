@@ -54,7 +54,7 @@ curl localhost:8080/metrics
 To run the published image by itself, you need a Valkey (or Redis) instance and at least one Aquifer or Spillway instance to route to:
 
 ```bash
-docker run -p 8080:8080 -v $(pwd)/data:/data -e CANALIS_VALKEY_URL=redis://your-valkey-host:6379 ghcr.io/rjpruitt16/canalis-rs:0.1
+docker run -p 8080:8080 -v $(pwd)/data:/data -e CANALIS_VALKEY_URL=redis://your-valkey-host:6379 ghcr.io/rjpruitt16/canalis-rs:0.2
 ```
 
 Every setting is in [docs/configuration.md](docs/configuration.md), and changes between versions are in [CHANGELOG.md](CHANGELOG.md).

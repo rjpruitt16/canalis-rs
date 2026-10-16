@@ -2,7 +2,9 @@
 
 Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor version (0.x) may change the protocol shared with Aquifer and Spillway; the changelog says when it does.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-16
+
+Pools, authentication, several Canalis nodes, and the fixes from two rounds of Fly benchmarks ([BENCHMARKS.md](BENCHMARKS.md)). New settings are in [docs/configuration.md](docs/configuration.md); existing deployments keep working unchanged.
 
 ### Added
 
