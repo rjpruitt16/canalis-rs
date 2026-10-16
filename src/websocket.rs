@@ -319,6 +319,7 @@ fn error(status: StatusCode, message: &str) -> Response {
 pub async fn handler(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
+    client: Option<axum::Extension<crate::ClientIp>>,
     mut headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
@@ -368,6 +369,20 @@ pub async fn handler(
         }
     };
     let user = assign::Tenant::new(user, pool);
+    // A session holds one of the client's stream slots for as long as it's
+    // open, waiting or connected; a tenant's new sessions count against its
+    // request rate.
+    let client = client.map(|c| c.0).filter(|c| !c.peer);
+    let mut stream_slot = None;
+    if let Some(client) = client {
+        if let Err(limited) = state.limits.check_tenant(&user) {
+            return crate::limited_response(&state, &limited);
+        }
+        match state.limits.open_stream(client.ip) {
+            Ok(guard) => stream_slot = Some(guard),
+            Err(limited) => return crate::limited_response(&state, &limited),
+        }
+    }
 
     // An instance that turned this session away (draining or unreachable)
     // isn't offered it again.
@@ -387,7 +402,10 @@ pub async fn handler(
                     let pending = Pending { user, query, headers: headers.clone() };
                     return upgrade
                         .protocols(offered_protocols(&headers))
-                        .on_upgrade(move |client| wait_for_instance(state, client, id, ready, pending, slot))
+                        .on_upgrade(move |client| async move {
+                            let _held = stream_slot;
+                            wait_for_instance(state, client, id, ready, pending, slot).await
+                        })
                         .into_response();
                 }
                 let mut response = error(
@@ -413,7 +431,10 @@ pub async fn handler(
                     upgrade = upgrade.protocols([protocol]);
                 }
                 return upgrade
-                    .on_upgrade(move |client| pipe(state, client, upstream, node, user, slot))
+                    .on_upgrade(move |client| async move {
+                        let _held = stream_slot;
+                        pipe(state, client, upstream, node, user, slot).await
+                    })
                     .into_response();
             }
             Err(Refused::Draining) => {

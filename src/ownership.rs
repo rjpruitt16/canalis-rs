@@ -112,6 +112,32 @@ impl Ownership {
         valkey.set_ex(Self::node_key(aq, &self.node_id), url, self.node_ttl.as_secs()).await
     }
 
+    /// How many Canalis nodes are advertising themselves (1 for a node
+    /// that doesn't take part).
+    pub async fn live_nodes(&self, valkey: &mut Valkey, aq: &assign::Aqueduct) -> redis::RedisResult<usize> {
+        if !self.enabled() {
+            return Ok(1);
+        }
+        let mut cursor: u64 = 0;
+        let mut count = 0usize;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(format!("{}canalis:node:*", aq.prefix))
+                .arg("COUNT")
+                .arg(200)
+                .query_async(valkey)
+                .await?;
+            count += keys.len();
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(count.max(1))
+    }
+
     pub async fn leave(&self, valkey: &mut Valkey, aq: &assign::Aqueduct) -> redis::RedisResult<()> {
         valkey.del(Self::node_key(aq, &self.node_id)).await
     }

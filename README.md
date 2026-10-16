@@ -129,6 +129,15 @@ How Canalis answers:
 
 All the settings are in [docs/configuration.md](docs/configuration.md#who-a-request-is-for).
 
+## Limits
+
+Volumetric floods are the edge's job: the cloud load balancer, or a CDN. Canalis enforces the limits only it can see:
+- **Per tenant, on by default.** 1,000 requests a second (bursts of 2,000) across all Canalis nodes. Each node enforces its share, so it costs no Valkey round trip. Give a big customer more, or a misbehaving tenant less, in the config file.
+- **Per client address.** 100 requests a second and 200 open streams. These turn on once `CANALIS_TRUSTED_PROXIES` tells Canalis whose `X-Forwarded-For` to believe, because behind an unlisted load balancer every request seems to come from one address.
+- **Capacity.** Load shedding past `CANALIS_MAX_IN_FLIGHT` (5,000 per CPU), a 2 MiB body limit, and a 10 s header-read timeout.
+
+Past a limit, the answer is `429` with `Retry-After` and a `limit_reason`. Settings and the config file format are in [docs/configuration.md](docs/configuration.md#limits).
+
 ## Running several Canalis nodes
 
 Each Canalis keeps its line on its own disk. To keep each tenant in one line, the first node that has to queue a tenant claims them in Valkey. Any other node that would queue that tenant forwards the request to the owner instead, and `GET /jobs/{key}` follows the claim too, so a client can hit any node.
