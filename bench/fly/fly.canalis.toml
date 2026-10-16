@@ -1,0 +1,22 @@
+# Canalis under test, built from this repo (run fly deploy from the repo
+# root with --config bench/fly/fly.canalis.toml). Private network only.
+app = "canalis-bench"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 35
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  CANALIS_VALKEY_URL = "redis://canalis-bench-valkey.internal:6379"
+  RUST_LOG = "warn,canalis_rs=info"
+
+[[mounts]]
+  source = "canalis_bench_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2gb"

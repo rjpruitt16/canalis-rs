@@ -1,0 +1,13 @@
+# Valkey for Canalis's assignment table. Private network only.
+app = "canalis-bench-valkey"
+primary_region = "iad"
+
+[build]
+  image = "valkey/valkey:8"
+
+[processes]
+  app = "valkey-server --bind 0.0.0.0 :: --protected-mode no --appendonly no"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "1gb"
