@@ -7,19 +7,20 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 ### Added
 
 - **Pools** ([#20](https://github.com/rjpruitt16/canalis-rs/issues/20)): instances join pools at registration (`AQUIFER_REGISTRY_POOLS`, `SPILLWAY_REGISTRY_POOLS`), and requests pick one with `X-Aqueduct-Pool`. Each pool waits in line separately.
+- **Authentication** ([#25](https://github.com/rjpruitt16/canalis-rs/issues/25)): `CANALIS_AUTH=upstream-secret` (trust only your gateway) or `jwt` (verify the caller's token against the provider's JWKS and take the tenant, and optionally the pool, from its claims).
 - **Load shedding:** past `CANALIS_MAX_IN_FLIGHT` (default 5,000) requests in progress, `/proxy` and `/jobs` answer `503` + `Retry-After` instead of slowing down until connections time out.
+- `CANALIS_LISTEN_ADDR`. Canalis listens on `[::]:8080` by default.
+
+### Changed
+
+- **Lower latency:** the instance list used for claims is reused for `CANALIS_MEMBER_CACHE_MS` (250), so a request costs one Valkey round trip instead of four. The p50 Canalis adds went from about 5 ms to about 1.6 ms; see [BENCHMARKS.md](BENCHMARKS.md).
 - **Faster when the fleet is full:** the line drains at `CANALIS_DRAIN_RPS` / `CANALIS_DRAIN_MAX_CONCURRENT` (100/s, 10 at once per tenant) instead of 2/s one at a time, and a tenant's slot is freed as soon as its backlog drains.
-- **Lower latency:** the instance list used for claims is reused for `CANALIS_MEMBER_CACHE_MS` (250), so a request costs one Valkey round trip instead of four (p50 added by Canalis about 5 ms → 1.6 ms). See [BENCHMARKS.md](BENCHMARKS.md).
-- `CANALIS_LISTEN_ADDR`; Canalis listens on `[::]:8080` by default.
+- With no allowlist and signing not required, a registration signed by a key Canalis hasn't learned is accepted as unsigned instead of refused.
 
 ### Fixed
 
-- IPv6: instances on IPv6 networks such as Fly's were recorded as unusable addresses (`fdaa::5:8080`), and Canalis didn't listen on IPv6.
-- After a Canalis restart, nodes that had already registered got `401` indefinitely; learned L8 node keys are now saved on the volume.
-
-### Added (continued)
-
-- **Authentication** ([#25](https://github.com/rjpruitt16/canalis-rs/issues/25)): `CANALIS_AUTH=upstream-secret` (trust only your gateway) or `jwt` (verify the caller's token against the provider's JWKS and take the tenant, and optionally the pool, from its claims).
+- **IPv6:** instances on IPv6 networks such as Fly's were recorded as unusable addresses (`fdaa::5:8080`), and Canalis didn't listen on IPv6.
+- **Restarts:** after a Canalis restart, nodes that had already registered got `401` indefinitely. Learned L8 node keys are now saved on the volume.
 
 ## [0.1.0] - 2026-10-14
 
