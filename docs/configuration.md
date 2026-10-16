@@ -37,6 +37,7 @@ See [Running several Canalis nodes](../README.md#running-several-canalis-nodes) 
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long a user's assignment to an instance survives without traffic. |
 | `CANALIS_DEFAULT_USER_CAPACITY` | `100` | User capacity for instances that don't report `user_capacity`. |
 | `CANALIS_MEMBER_CACHE_MS` | `250` | How long the instance list used for claims is reused before Valkey is read again. Registrations and instances this node finds draining or unreachable take effect at once; fullness may lag by this much. `0` reads Valkey on every claim. |
+| `CANALIS_MAX_HOLD_SECONDS` | `10` | While anyone waits in a pool's line, a tenant that has held its slot longer than this gives it up on its next request, which joins the back of the line. `0`: holders keep their slots for as long as they're active. Whatever this is set to, while anyone waits, a tenant without a slot joins the line instead of taking a slot that frees up. |
 | `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this `X-Aqueduct-Fullness`, an instance gets no new users. When every instance is past it, new users wait in line. |
 
 ## The line

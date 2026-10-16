@@ -545,6 +545,12 @@ pub async fn assign(
     Ok(AssignOutcome::PoolExhausted)
 }
 
+/// The instance a tenant is assigned to right now for this kind of
+/// traffic, if any. Doesn't renew it.
+pub async fn current(valkey: &mut Valkey, aq: &Aqueduct, tenant: &Tenant, traffic: Traffic) -> redis::RedisResult<Option<String>> {
+    valkey.get(aq.assignment_key(&scope_hash(&tenant.scope(traffic)))).await
+}
+
 /// Releases a tenant's assignment for this kind of traffic from node_id,
 /// if that's still where it points. Their next request resolves a fresh
 /// assignment, or waits in line.

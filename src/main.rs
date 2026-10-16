@@ -89,6 +89,68 @@ pub struct AppState {
     shedder: Arc<Shedder>,
     // Which Canalis node holds each waiting tenant's line (ownership.rs).
     ownership: Arc<ownership::Ownership>,
+    // How long each tenant has held its slot, for taking turns (Turns).
+    turns: Arc<Turns>,
+}
+
+/// Taking turns while others wait (#36). A tenant holds a slot on an
+/// instance for as long as it keeps sending, so during a burst the tenants
+/// that got slots first were served throughout while the ones waiting in
+/// line got nothing until the holders went quiet. While anyone is waiting
+/// in a pool's line:
+///
+/// - a tenant without a slot joins the back of the line rather than
+///   taking a slot that just freed up, and
+/// - a tenant that has held its slot longer than CANALIS_MAX_HOLD_SECONDS
+///   (default 10; 0 = never) gives it up on its next request, which joins
+///   the back of the line; the slot goes to whoever has waited longest.
+///
+/// Hold times are kept per Canalis node, for the slots it handed out.
+pub struct Turns {
+    max_hold: Duration,
+    // tenant line key -> (when it took its slot, when it was last seen)
+    held: Mutex<HashMap<String, (Instant, Instant)>>,
+}
+
+impl Turns {
+    fn from_env() -> Self {
+        Self::new(Duration::from_secs(env_u64("CANALIS_MAX_HOLD_SECONDS", 10)))
+    }
+
+    fn new(max_hold: Duration) -> Self {
+        Self { max_hold, held: Mutex::default() }
+    }
+
+    // A request was served on the tenant's slot. A tenant not seen for
+    // longer than its assignment lasts had let it go: its hold starts over.
+    fn served(&self, tenant: &str, idle_release: Duration) {
+        let now = Instant::now();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = held.entry(tenant.to_string()).or_insert((now, now));
+        if now.duration_since(entry.1) > idle_release {
+            entry.0 = now;
+        }
+        entry.1 = now;
+    }
+
+    fn held_too_long(&self, tenant: &str) -> bool {
+        !self.max_hold.is_zero()
+            && self.held.lock().unwrap_or_else(|e| e.into_inner()).get(tenant).is_some_and(|(since, _)| since.elapsed() > self.max_hold)
+    }
+
+    fn gave_up(&self, tenant: &str) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).remove(tenant);
+    }
+
+    // Drops tenants not seen for longer than an assignment lasts.
+    fn prune(&self, idle_release: Duration) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, seen)| seen.elapsed() <= idle_release);
+    }
+
+    #[cfg(test)]
+    fn hold_since(&self, tenant: &str, since: Instant) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).insert(tenant.to_string(), (since, Instant::now()));
+    }
 }
 
 /// Where a request came from, for forwarding it to the Canalis node that
@@ -269,6 +331,7 @@ async fn main() {
         auth: Arc::new(auth::Auth::from_env().unwrap_or_else(|err| panic!("auth setup failed: {err}"))),
         shedder: Arc::new(Shedder::from_env()),
         ownership: Arc::new(ownership::Ownership::from_env()),
+        turns: Arc::new(Turns::from_env()),
     };
 
     let room_handout = state.clone();
@@ -318,6 +381,7 @@ async fn main() {
                 tracing::error!("line sweep failed: {err}");
             }
             check_scale(&sweeper_state).await;
+            sweeper_state.turns.prune(sweeper_state.aqueduct.assignment_ttl);
             renew_line_ownership(&sweeper_state).await;
             tokio::time::sleep(sweep_every).await;
         }
@@ -1475,6 +1539,32 @@ impl PeerClients {
     }
 }
 
+// Whether this request should join the line instead of using a slot,
+// because others are already waiting in its pool (see Turns): why, or None.
+async fn take_turns(state: &mut AppState, tenant: &assign::Tenant) -> Option<&'static str> {
+    let pool = tenant.pool.clone();
+    let waiting = on_line(&state.line, move |l| l.waiting_in_pool(&pool)).await.unwrap_or(0);
+    if waiting == 0 {
+        return None;
+    }
+    let current = assign::current(&mut state.valkey, &state.aqueduct, tenant, assign::Traffic::Http).await.ok()?;
+    let Some(node) = current else {
+        return Some("others_waiting");
+    };
+    let key = tenant.key();
+    if !state.turns.held_too_long(&key) {
+        return None;
+    }
+    // Their turn is up: hand the slot back for whoever has waited longest.
+    if let Err(err) = assign::release(&mut state.valkey, &state.aqueduct, tenant, assign::Traffic::Http, &node).await {
+        tracing::warn!("couldn't release {}'s slot for the next in line: {err}", tenant.user);
+        return None;
+    }
+    state.turns.gave_up(&key);
+    state.metrics.inc("canalis_turns_given_up_total", &[]);
+    Some("turn_over")
+}
+
 // Passes a request on to the Canalis node holding its tenant's line and
 // relays that node's answer (a waiting-room stream, or a result) as it
 // comes. None if the owner can't be reached at all, so the caller can
@@ -1726,8 +1816,14 @@ async fn forward_attempt(
     config: &RetryConfig,
 ) -> Response {
     let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
+    if let Some(reason) = take_turns(&mut state, &tenant).await {
+        return wait_in_line(state, job, target_path, pool, origin, config.pool_wait_timeout, reason).await;
+    }
     let node = match assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await {
-        Ok(assign::AssignOutcome::Assigned(node)) => node,
+        Ok(assign::AssignOutcome::Assigned(node)) => {
+            state.turns.served(&tenant.key(), state.aqueduct.assignment_ttl);
+            node
+        }
         Ok(assign::AssignOutcome::PoolExhausted) => {
             return wait_in_line(state, job, target_path, pool, origin, config.pool_wait_timeout, "no_instance_free").await;
         }
@@ -2112,6 +2208,7 @@ mod tests {
             auth: Arc::new(auth::Auth::Header),
             shedder: Arc::new(Shedder::with_max(0)),
             ownership: Arc::new(ownership::tests::node("test-node", None)),
+            turns: Arc::new(Turns::new(Duration::ZERO)),
         };
         (state, dir)
     }
@@ -3386,6 +3483,66 @@ mod tests {
         assert_eq!(queued_here, 1, "not lost: queued on the node that got it");
     }
 
+    // Is this response the waiting-room stream (the request joined the
+    // line) rather than the instance's own answer?
+    fn joined_line(response: &Response) -> bool {
+        response.headers().get("content-type").and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.starts_with("text/event-stream"))
+    }
+
+    #[tokio::test]
+    async fn while_others_wait_a_newcomer_joins_the_line_instead_of_cutting_in() {
+        let (state, _dir) = test_state().await;
+        register_node(&state, &start_plain_ok_mock().await).await;
+        // Someone is already waiting in the default pool.
+        state.line.enqueue(&job_for(&unique("waiting")), "/jobs", assign::DEFAULT_POOL).unwrap();
+
+        let newcomer = forward_with_config(state.clone(), job_for(&unique("newcomer")), "/proxy", &short_retry_config()).await;
+        let queued = state.line.len().unwrap();
+        cleanup(&state).await;
+
+        assert!(joined_line(&newcomer), "a free slot goes to whoever has waited longest");
+        assert_eq!(queued, 2);
+    }
+
+    #[tokio::test]
+    async fn a_holder_past_the_max_hold_gives_its_slot_up_while_others_wait() {
+        let (mut state, _dir) = test_state().await;
+        state.turns = Arc::new(Turns::new(Duration::from_secs(10)));
+        register_node(&state, &start_plain_ok_mock().await).await;
+        let holder = unique("holder");
+        let tenant = assign::Tenant::user(holder.as_str());
+
+        // Holding a slot, within the hold time: served even with others waiting.
+        assert!(!joined_line(&forward_with_config(state.clone(), job_for(&holder), "/proxy", &short_retry_config()).await));
+        state.line.enqueue(&job_for(&unique("waiting")), "/jobs", assign::DEFAULT_POOL).unwrap();
+        let within = forward_with_config(state.clone(), job_for(&holder), "/proxy", &short_retry_config()).await;
+
+        // Past it: the next request joins the line and the slot is handed back.
+        state.turns.hold_since(&tenant.key(), Instant::now() - Duration::from_secs(20));
+        let past = forward_with_config(state.clone(), job_for(&holder), "/proxy", &short_retry_config()).await;
+        let slot = assign::current(&mut state.valkey.clone(), &state.aqueduct, &tenant, assign::Traffic::Http).await.unwrap();
+        cleanup(&state).await;
+
+        assert!(!joined_line(&within), "within the hold time it keeps its slot");
+        assert!(joined_line(&past), "past it, the request joins the back of the line");
+        assert_eq!(slot, None, "and the slot is free for the next in line");
+    }
+
+    #[tokio::test]
+    async fn with_nobody_waiting_a_long_holder_keeps_its_slot() {
+        let (mut state, _dir) = test_state().await;
+        state.turns = Arc::new(Turns::new(Duration::from_secs(10)));
+        register_node(&state, &start_plain_ok_mock().await).await;
+        let holder = unique("holder");
+        forward_with_config(state.clone(), job_for(&holder), "/proxy", &short_retry_config()).await;
+        state.turns.hold_since(&assign::Tenant::user(holder.as_str()).key(), Instant::now() - Duration::from_secs(60));
+
+        let response = forward_with_config(state.clone(), job_for(&holder), "/proxy", &short_retry_config()).await;
+        cleanup(&state).await;
+
+        assert!(!joined_line(&response));
+    }
+
     #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
@@ -3440,6 +3597,7 @@ mod tests {
             auth: Arc::new(auth::Auth::Header),
             shedder: Arc::new(Shedder::with_max(0)),
             ownership: Arc::new(ownership::tests::node("test-node", None)),
+            turns: Arc::new(Turns::new(Duration::ZERO)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;
