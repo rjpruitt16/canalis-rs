@@ -10,6 +10,12 @@ CI checks that every variable Canalis reads is listed here (`scripts/check-confi
 | --- | --- | --- |
 | `CANALIS_LISTEN_ADDR` | `[::]:8080` | Address to listen on. The default falls back to `0.0.0.0:8080` if IPv6 is unavailable. |
 
+## Load shedding
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_MAX_IN_FLIGHT` | `5000` | Past this many `/proxy` and `/jobs` requests in progress, new ones get `503` + `Retry-After: 1` at once instead of slowing everything down. A request counts until its response starts, so a slow target API keeps requests in progress longer: raise it if yours answer slowly. `0` turns shedding off. Registration, health and metrics are never shed. |
+
 ## Valkey and the shared pool
 
 | Variable | Default | What it does |

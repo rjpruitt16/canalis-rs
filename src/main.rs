@@ -77,6 +77,58 @@ pub struct AppState {
     // Who a request is for: as sent, from a trusted gateway, or from a
     // verified token -- see auth.rs.
     auth: Arc<auth::Auth>,
+    // Proxied requests in progress, and when to start shedding them.
+    shedder: Arc<Shedder>,
+}
+
+/// Load shedding for /proxy and /jobs. Past CANALIS_MAX_IN_FLIGHT requests
+/// in progress (default 5000; 0 turns it off), new ones get an immediate
+/// 503 + Retry-After instead of queueing behind a saturated CPU until
+/// connections time out, which is how an overloaded Canalis failed in the
+/// Fly benchmark. A request counts until its response starts, so callers
+/// waiting in line on a stream don't. Registration, health and metrics are
+/// never shed, so the control plane keeps working under overload.
+pub struct Shedder {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Shedder {
+    fn from_env() -> Self {
+        Self::with_max(env_u64("CANALIS_MAX_IN_FLIGHT", 5000) as usize)
+    }
+
+    fn with_max(max: usize) -> Self {
+        Self { in_flight: Default::default(), max }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
+struct InFlight(Arc<Shedder>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn shed(State(state): State<AppState>, request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let shedder = state.shedder.clone();
+    let before = shedder.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _counted = InFlight(shedder.clone());
+    if shedder.max > 0 && before >= shedder.max {
+        state.metrics.inc("canalis_shed_total", &[]);
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "canalis is at capacity; retry shortly" }),
+        );
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(1u32));
+        return response;
+    }
+    next.run(request).await
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -179,6 +231,7 @@ async fn main() {
         ws_room: Arc::new(websocket::WaitingRoom::from_env()),
         metrics: Arc::default(),
         auth: Arc::new(auth::Auth::from_env().unwrap_or_else(|err| panic!("auth setup failed: {err}"))),
+        shedder: Arc::new(Shedder::from_env()),
     };
 
     let room_handout = state.clone();
@@ -316,8 +369,8 @@ fn router(state: AppState) -> Router {
         .route("/register", post(register))
         .route("/.well-known/l8", get(l8_well_known))
         .route("/l8/challenge", post(l8_challenge))
-        .route("/proxy", post(proxy))
-        .route("/jobs", post(jobs))
+        .route("/proxy", post(proxy).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
+        .route("/jobs", post(jobs).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
         .route("/jobs/{idempotent_key}", get(job_status))
         .route("/websocket", get(websocket::handler))
         .route("/metrics", get(metrics::handler))
@@ -1870,6 +1923,7 @@ mod tests {
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
+            shedder: Arc::new(Shedder::with_max(0)),
         };
         (state, dir)
     }
@@ -3035,6 +3089,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn past_the_in_flight_cap_requests_are_shed_but_registration_still_works() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            "done"
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, Router::new().route("/proxy", post(slow))).await.unwrap() });
+        let (mut state, _dir) = test_state().await;
+        state.shedder = Arc::new(Shedder::with_max(1));
+        register_node(&state, &mock).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let send = || http.post(format!("http://{canalis}/proxy")).json(&job_for(&unique("shed"))).send();
+
+        let first = tokio::spawn(send());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let second = send().await.unwrap();
+        let ping = http
+            .post(format!("http://{canalis}/register"))
+            .json(&serde_json::json!({ "port": "7999" }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let first = first.await.unwrap().unwrap().status();
+        let after = send().await.unwrap().status();
+        let metrics = http.get(format!("http://{canalis}/metrics")).send().await.unwrap().text().await.unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.headers()["retry-after"], "1");
+        assert_eq!(ping, StatusCode::OK, "registration is never shed");
+        assert_eq!(after, StatusCode::OK, "the slot comes back once the first request finishes");
+        assert!(metrics.contains("canalis_shed_total 1\n"), "{metrics}");
+    }
+
+    #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
         let first = job_for(&unique("first-in-line"));
@@ -3085,6 +3178,7 @@ mod tests {
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
+            shedder: Arc::new(Shedder::with_max(0)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

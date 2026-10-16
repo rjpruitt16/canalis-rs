@@ -26,11 +26,12 @@ use std::time::{Duration, Instant};
 
 const BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-const COUNTERS: [(&str, &str); 6] = [
+const COUNTERS: [(&str, &str); 7] = [
     ("canalis_http_responses_total", "Responses sent, by route and status."),
     ("canalis_line_rejected_total", "Jobs turned away because the line was at a limit, by limit."),
     ("canalis_reroutes_total", "Requests and sessions re-routed because their instance was draining or unreachable."),
     ("canalis_scale_signals_total", "canalis_scale_up webhooks sent."),
+    ("canalis_shed_total", "Requests answered 503 because CANALIS_MAX_IN_FLIGHT requests were already in progress."),
     ("canalis_auth_rejected_total", "Requests refused for missing or invalid credentials, or because the provider's keys couldn't be fetched."),
     ("canalis_websocket_wait_timeouts_total", "WebSocket sessions closed with 1013 after waiting too long for an instance."),
 ];
@@ -136,6 +137,7 @@ pub async fn handler(State(state): State<AppState>) -> Response {
     gauge(&mut out, "canalis_line_streams", "Callers holding a waiting-room stream open.", &[(vec![], waiters as f64)]);
     gauge(&mut out, "canalis_websocket_open", "WebSocket sessions open through this node.", &[(vec![], state.sockets.open() as f64)]);
     gauge(&mut out, "canalis_websocket_waiting", "WebSocket sessions waiting for an instance with room.", &[(vec![], state.ws_room.len() as f64)]);
+    gauge(&mut out, "canalis_in_flight", "Proxied requests in progress (see CANALIS_MAX_IN_FLIGHT).", &[(vec![], state.shedder.in_flight() as f64)]);
     gauge(&mut out, "canalis_draining", "1 while this node is shutting down.", &[(vec![], if state.lifecycle.is_draining() { 1.0 } else { 0.0 })]);
 
     // Instances come from Valkey; if it can't be read, say so rather than
