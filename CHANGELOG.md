@@ -2,6 +2,22 @@
 
 Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor version (0.x) may change the protocol shared with Aquifer and Spillway; the changelog says when it does.
 
+## [Unreleased]
+
+### Added
+
+- **Limits** ([#21](https://github.com/rjpruitt16/canalis-rs/issues/21)):
+  - per tenant, on by default: 1,000 req/s and bursts of 2,000 cluster-wide, enforced as each node's share, with per-tenant overrides;
+  - per client address (100 req/s, 200 open streams), on with `CANALIS_TRUSTED_PROXIES`, which also makes `X-Forwarded-For` trusted from those proxies;
+  - a configurable body limit, and a header-read timeout against slow clients.
+- **Config file** (`CANALIS_CONFIG_PATH`, YAML, read at startup; environment variables override it).
+
+### Changed
+
+- `CANALIS_MAX_IN_FLIGHT` defaults to 5,000 per CPU instead of 5,000.
+- Canalis runs its own HTTP server loop (hyper) instead of `axum::serve`, for the header-read timeout and 10,000 concurrent HTTP/2 streams per connection.
+- **Behavior change:** a single tenant sending more than 1,000 req/s (sustained) is now limited. Set `CANALIS_TENANT_RPS=0` to turn it off, or give that tenant its own limit.
+
 ## [0.2.0] - 2026-10-16
 
 Pools, authentication, several Canalis nodes, and the fixes from two rounds of Fly benchmarks ([BENCHMARKS.md](BENCHMARKS.md)). New settings are in [docs/configuration.md](docs/configuration.md); existing deployments keep working unchanged.
