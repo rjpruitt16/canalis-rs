@@ -1,0 +1,18 @@
+# Two Aquifer instances that register themselves with Canalis. Private
+# network only. Deploy with fly deploy --config bench/fly/fly.aquifer.toml bench/fly/aquifer.
+app = "canalis-bench-aquifer"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "aquifer/Dockerfile"
+
+[env]
+  PORT = "8080"
+  AQUIFER_REGISTRY_URL = "http://canalis-bench.internal:8080/register"
+  AQUIFER_REGISTRY_INTERVAL_SECONDS = "5"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2gb"

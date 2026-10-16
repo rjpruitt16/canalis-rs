@@ -77,6 +77,58 @@ pub struct AppState {
     // Who a request is for: as sent, from a trusted gateway, or from a
     // verified token -- see auth.rs.
     auth: Arc<auth::Auth>,
+    // Proxied requests in progress, and when to start shedding them.
+    shedder: Arc<Shedder>,
+}
+
+/// Load shedding for /proxy and /jobs. Past CANALIS_MAX_IN_FLIGHT requests
+/// in progress (default 5000; 0 turns it off), new ones get an immediate
+/// 503 + Retry-After instead of queueing behind a saturated CPU until
+/// connections time out, which is how an overloaded Canalis failed in the
+/// Fly benchmark. A request counts until its response starts, so callers
+/// waiting in line on a stream don't. Registration, health and metrics are
+/// never shed, so the control plane keeps working under overload.
+pub struct Shedder {
+    in_flight: std::sync::atomic::AtomicUsize,
+    max: usize,
+}
+
+impl Shedder {
+    fn from_env() -> Self {
+        Self::with_max(env_u64("CANALIS_MAX_IN_FLIGHT", 5000) as usize)
+    }
+
+    fn with_max(max: usize) -> Self {
+        Self { in_flight: Default::default(), max }
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::Relaxed)
+    }
+}
+
+struct InFlight(Arc<Shedder>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+async fn shed(State(state): State<AppState>, request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let shedder = state.shedder.clone();
+    let before = shedder.in_flight.fetch_add(1, Ordering::Relaxed);
+    let _counted = InFlight(shedder.clone());
+    if shedder.max > 0 && before >= shedder.max {
+        state.metrics.inc("canalis_shed_total", &[]);
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "canalis is at capacity; retry shortly" }),
+        );
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(1u32));
+        return response;
+    }
+    next.run(request).await
 }
 
 // One caller waiting in line. `seq` is the job's place in the line's
@@ -179,6 +231,7 @@ async fn main() {
         ws_room: Arc::new(websocket::WaitingRoom::from_env()),
         metrics: Arc::default(),
         auth: Arc::new(auth::Auth::from_env().unwrap_or_else(|err| panic!("auth setup failed: {err}"))),
+        shedder: Arc::new(Shedder::from_env()),
     };
 
     let room_handout = state.clone();
@@ -316,8 +369,8 @@ fn router(state: AppState) -> Router {
         .route("/register", post(register))
         .route("/.well-known/l8", get(l8_well_known))
         .route("/l8/challenge", post(l8_challenge))
-        .route("/proxy", post(proxy))
-        .route("/jobs", post(jobs))
+        .route("/proxy", post(proxy).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
+        .route("/jobs", post(jobs).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
         .route("/jobs/{idempotent_key}", get(job_status))
         .route("/websocket", get(websocket::handler))
         .route("/metrics", get(metrics::handler))
@@ -636,13 +689,24 @@ fn node_is_draining(status: u16, headers: &reqwest::header::HeaderMap) -> bool {
         })
 }
 
-// Default pacing before anything's been learned about the target
-// instance's own tolerance -- mirrors Aquifer's own account_queue.go
-// defaults (RateConfig{RPS: 2.0, MaxConcurrent: 1}) exactly: start
-// conservative (fully sequential), then adjust from whatever the
-// instance reports back on each dispatch.
-const DEFAULT_DRAIN_RPS: f64 = 2.0;
-const DEFAULT_DRAIN_MAX_CONCURRENT: usize = 1;
+// How fast one tenant's backlog is handed from the line to its instance
+// before the instance says otherwise (X-Aqueduct-Rps /
+// X-Aqueduct-Max-Concurrent on its responses). CANALIS_DRAIN_RPS and
+// CANALIS_DRAIN_MAX_CONCURRENT, default 100/s and 10 at once.
+//
+// This used to mirror Aquifer's own pace toward a target API (2/s, one at
+// a time), but the instance isn't the resource being protected: Aquifer
+// queues durably and pushes back with 429s and fullness. At 2/s, the
+// Fly benchmark's line drained about 100 times slower than the fleet
+// could serve once the fleet filled.
+fn default_drain_pace() -> (f64, usize) {
+    static PACE: std::sync::OnceLock<(f64, usize)> = std::sync::OnceLock::new();
+    *PACE.get_or_init(|| {
+        let rps = std::env::var("CANALIS_DRAIN_RPS").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|v| *v > 0.0);
+        let max = env_u64("CANALIS_DRAIN_MAX_CONCURRENT", 10).clamp(1, MAX_DRAIN_CONCURRENCY_CEILING as u64) as usize;
+        (rps.unwrap_or(100.0).max(MIN_DRAIN_RPS), max)
+    })
+}
 const MIN_DRAIN_RPS: f64 = 0.5;
 // A misbehaving or malicious instance advertising an absurd concurrency
 // ceiling shouldn't be able to make Canalis fire an unbounded number of
@@ -823,8 +887,7 @@ async fn drain_tenant_backlog(
     let tenant = assign::Tenant::new(first.job.user_id.as_str(), first.pool.as_str());
     let user_id = tenant.key();
     let mut pending = Some(first);
-    let mut max_concurrent = DEFAULT_DRAIN_MAX_CONCURRENT;
-    let mut rps = DEFAULT_DRAIN_RPS;
+    let (mut rps, mut max_concurrent) = default_drain_pace();
     let mut last_dispatch_at: Option<Instant> = None;
     let mut in_flight: tokio::task::JoinSet<DispatchOutcome> = tokio::task::JoinSet::new();
     // Set once the instance says it's draining: stop taking more jobs out
@@ -895,6 +958,12 @@ async fn drain_tenant_backlog(
         assign::mark_draining(&mut state.valkey, &state.aqueduct, &node.id).await?;
         assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
         tracing::info!("{} is draining; {user_id}'s remaining jobs stay in line for another node", node.id);
+    } else {
+        // Their backlog is done: give the slot back now rather than after
+        // the assignment idles out (idle seconds plus two heartbeats), so
+        // the next tenant waiting in line gets it. If they're still
+        // sending, their next request claims a slot again.
+        assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
     }
     Ok(())
 }
@@ -1854,6 +1923,7 @@ mod tests {
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
+            shedder: Arc::new(Shedder::with_max(0)),
         };
         (state, dir)
     }
@@ -3003,6 +3073,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_drained_tenant_gives_its_slot_back() {
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-done-draining");
+        state.line.enqueue(&job_for(&user_id), "/jobs", assign::DEFAULT_POOL).unwrap();
+        register_node(&state, &start_plain_ok_mock().await).await;
+
+        let check = state.clone();
+        assert!(try_drain_one(state).await.unwrap());
+        let still_assigned = assigned_to(&check, &user_id).await;
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(still_assigned, None, "the next tenant in line shouldn't wait for this one to idle out");
+    }
+
+    #[tokio::test]
+    async fn past_the_in_flight_cap_requests_are_shed_but_registration_still_works() {
+        async fn slow() -> &'static str {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            "done"
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, Router::new().route("/proxy", post(slow))).await.unwrap() });
+        let (mut state, _dir) = test_state().await;
+        state.shedder = Arc::new(Shedder::with_max(1));
+        register_node(&state, &mock).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let send = || http.post(format!("http://{canalis}/proxy")).json(&job_for(&unique("shed"))).send();
+
+        let first = tokio::spawn(send());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let second = send().await.unwrap();
+        let ping = http
+            .post(format!("http://{canalis}/register"))
+            .json(&serde_json::json!({ "port": "7999" }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let first = first.await.unwrap().unwrap().status();
+        let after = send().await.unwrap().status();
+        let metrics = http.get(format!("http://{canalis}/metrics")).send().await.unwrap().text().await.unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(first, StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(second.headers()["retry-after"], "1");
+        assert_eq!(ping, StatusCode::OK, "registration is never shed");
+        assert_eq!(after, StatusCode::OK, "the slot comes back once the first request finishes");
+        assert!(metrics.contains("canalis_shed_total 1\n"), "{metrics}");
+    }
+
+    #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
         let first = job_for(&unique("first-in-line"));
@@ -3053,6 +3178,7 @@ mod tests {
             ws_room: Arc::new(websocket::WaitingRoom::new(10, Duration::from_secs(5))),
             metrics: Arc::default(),
             auth: Arc::new(auth::Auth::Header),
+            shedder: Arc::new(Shedder::with_max(0)),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

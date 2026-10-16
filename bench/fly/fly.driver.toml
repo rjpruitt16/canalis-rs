@@ -1,0 +1,12 @@
+# Load generator and mock target API (:9000). Private network only; runs
+# are started with fly ssh console -C "/driver run ...". Deploy from
+# bench/fly/driver (fly deploy --config bench/fly/fly.driver.toml bench/fly/driver).
+app = "canalis-bench-driver"
+primary_region = "iad"
+
+[build]
+  dockerfile = "driver/Dockerfile"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4gb"

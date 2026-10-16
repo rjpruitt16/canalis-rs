@@ -57,6 +57,31 @@ pub struct Aqueduct {
     pub default_capacity: i64,
     /// At or above this fullness, an instance gets no new users.
     pub queue_at_percent: u8,
+    /// How long the instance list (records and fullness) read for a claim
+    /// is reused before reading Valkey again (CANALIS_MEMBER_CACHE_MS,
+    /// default 250). Zero reads it on every claim.
+    pub member_cache_ttl: Duration,
+    pub member_cache: std::sync::Arc<MemberCache>,
+}
+
+/// The instance list a claim chooses from, kept briefly so a claim costs
+/// one Valkey round trip (the claim script) instead of four. The script
+/// still checks the chosen instance's live record, and anything this
+/// Canalis learns that changes membership (a registration, an instance
+/// draining or unreachable) drops the cache at once. Fullness reported on
+/// responses can lag by up to the TTL.
+#[derive(Debug, Default)]
+pub struct MemberCache {
+    entry: std::sync::Mutex<Option<(std::time::Instant, Vec<Instance>)>>,
+}
+
+/// An instance's record and the fullness it last reported.
+pub type Instance = (Member, Option<u8>);
+
+impl MemberCache {
+    pub fn invalidate(&self) {
+        *self.entry.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 impl Aqueduct {
@@ -76,6 +101,8 @@ impl Aqueduct {
             instance_ttl: Duration::from_secs(3 * heartbeat),
             default_capacity: crate::env_u64("CANALIS_DEFAULT_USER_CAPACITY", 100).max(1) as i64,
             queue_at_percent: crate::env_u64("CANALIS_QUEUE_AT_PERCENT", 80).clamp(1, 100) as u8,
+            member_cache_ttl: Duration::from_millis(crate::env_u64("CANALIS_MEMBER_CACHE_MS", 250)),
+            member_cache: Default::default(),
         }
     }
 
@@ -339,6 +366,7 @@ pub async fn member(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::Redi
 /// Writes an instance's record and keeps it in the set, same as Aquifer's
 /// own heartbeat. The record expires on its own if heartbeats stop.
 pub async fn heartbeat(valkey: &mut Valkey, aq: &Aqueduct, member: &Member) -> redis::RedisResult<()> {
+    aq.member_cache.invalidate();
     let payload = serde_json::to_string(member)
         .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "encode member", e.to_string())))?;
     let _: () = redis::pipe()
@@ -354,6 +382,7 @@ pub async fn heartbeat(valkey: &mut Valkey, aq: &Aqueduct, member: &Member) -> r
 
 /// Forgets an instance entirely (it said it's offline).
 pub async fn remove_instance(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::RedisResult<()> {
+    aq.member_cache.invalidate();
     let _: () = redis::pipe()
         .atomic()
         .del(aq.instance_key(id))
@@ -373,6 +402,7 @@ pub async fn remove_instance(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> re
 /// could pick the same instance again. Its next heartbeat overwrites this
 /// with whatever it reports itself.
 pub async fn mark_draining(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::RedisResult<()> {
+    aq.member_cache.invalidate();
     if let Some(mut m) = member(valkey, aq, id).await? {
         m.state = Some("draining".into());
         heartbeat(valkey, aq, &m).await?;
@@ -406,6 +436,22 @@ pub async fn fleet(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Fle
     })
 }
 
+// instances(), reused for up to aq.member_cache_ttl.
+async fn cached_instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<Instance>> {
+    if !aq.member_cache_ttl.is_zero() {
+        if let Some((at, list)) = aq.member_cache.entry.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            if at.elapsed() < aq.member_cache_ttl {
+                return Ok(list.clone());
+            }
+        }
+    }
+    let list = instances(valkey, aq).await?;
+    if !aq.member_cache_ttl.is_zero() {
+        *aq.member_cache.entry.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), list.clone()));
+    }
+    Ok(list)
+}
+
 /// Every registered instance with the fullness it last reported, for
 /// GET /metrics.
 pub async fn instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<(Member, Option<u8>)>> {
@@ -426,17 +472,11 @@ pub async fn assign(
     traffic: Traffic,
 ) -> redis::RedisResult<AssignOutcome> {
     let user_id = tenant.user.as_str();
-    let all = members(valkey, aq).await?;
-    let fullness_keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
-    let fullness: Vec<Option<u8>> = if fullness_keys.is_empty() {
-        Vec::new()
-    } else {
-        valkey.mget(&fullness_keys).await?
-    };
+    let all = cached_instances(valkey, aq).await?;
 
     let mut candidates: Vec<&Member> = all
         .iter()
-        .zip(fullness.iter())
+        .map(|(m, full)| (m, full))
         .filter(|(m, full)| {
             m.is_active()
                 && m.serves(&tenant.pool)
@@ -560,6 +600,10 @@ pub(crate) mod tests {
             instance_ttl: Duration::from_secs(60),
             default_capacity: 100,
             queue_at_percent: 80,
+            // Tests read Valkey on every claim, so what they just wrote is
+            // what the next claim sees.
+            member_cache_ttl: Duration::ZERO,
+            member_cache: Default::default(),
         }
     }
 
@@ -702,6 +746,21 @@ pub(crate) mod tests {
 
     fn in_pools(id: &str, pools: &[&str]) -> Member {
         Member { pools: pools.iter().map(|p| p.to_string()).collect(), ..node(id) }
+    }
+
+    #[tokio::test]
+    async fn the_cached_instance_list_drops_a_removed_instance_at_once() {
+        let mut v = test_valkey().await;
+        let aq = Aqueduct { member_cache_ttl: Duration::from_secs(60), ..test_aqueduct() };
+        heartbeat(&mut v, &aq, &node("doomed")).await.unwrap();
+        assert_eq!(assigned(&mut v, &aq, "first").await.as_deref(), Some("doomed"));
+
+        remove_instance(&mut v, &aq, "doomed").await.unwrap();
+        heartbeat(&mut v, &aq, &node("survivor")).await.unwrap();
+        let after = assigned(&mut v, &aq, "second").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(after.as_deref(), Some("survivor"), "a cached list must not offer an instance this node removed");
     }
 
     #[tokio::test]
