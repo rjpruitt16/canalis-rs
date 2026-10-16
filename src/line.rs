@@ -30,6 +30,9 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 // same transaction that took them. A crash in between leaves them here, and
 // the next open puts them back in line instead of losing them.
 const LEASED: TableDefinition<u64, &[u8]> = TableDefinition::new("leased");
+// Jobs waiting per pool, so a new job's place in line is one lookup rather
+// than a scan of the whole line. Rebuilt from ORDER on open.
+const POOL_COUNTS: TableDefinition<&str, u64> = TableDefinition::new("pool_counts");
 
 const NEXT_SEQ: &str = "next_seq";
 const TOTAL_JOBS: &str = "total_jobs";
@@ -189,7 +192,29 @@ pub enum Lookup {
 pub struct Line {
     db: Database,
     limits: LineLimits,
+    // Group commit: enqueues that arrive while one is being written wait
+    // and go in the next transaction together, one disk flush for all of
+    // them (the same idea as Aquifer's batched Pebble flush, without a
+    // timer: at low load a job is written at once).
+    batch: std::sync::Mutex<Batch>,
 }
+
+#[derive(Default)]
+struct Batch {
+    pending: Vec<PendingEnqueue>,
+    writing: bool,
+}
+
+struct PendingEnqueue {
+    job: JobRequest,
+    path: String,
+    pool: String,
+    done: std::sync::Arc<Outcome>,
+}
+
+// Where a batched enqueue's result is handed back to the caller waiting
+// for it.
+type Outcome = (std::sync::Mutex<Option<Result<Enqueued, LineError>>>, std::sync::Condvar);
 
 fn now_unix() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
@@ -219,9 +244,20 @@ impl Line {
             txn.open_table(RESULTS)?;
             txn.open_table(META)?;
             txn.open_table(LEASED)?;
+            // Rebuilt from the line itself, so a file written before this
+            // table existed (or with counts that drifted) is right on open.
+            let mut pool_counts = txn.open_table(POOL_COUNTS)?;
+            pool_counts.retain(|_, _| false)?;
+            let mut counted: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+            for entry in txn.open_table(ORDER)?.range::<u64>(..)? {
+                *counted.entry(Tenant::pool_of_key(entry?.1.value()).to_string()).or_default() += 1;
+            }
+            for (pool, n) in &counted {
+                pool_counts.insert(pool.as_str(), *n)?;
+            }
         }
         txn.commit()?;
-        let line = Self { db, limits };
+        let line = Self { db, limits, batch: Default::default() };
         line.restore_leases()?;
         Ok(line)
     }
@@ -275,7 +311,77 @@ impl Line {
     /// duplicate or the line is full. The dedup check runs before the
     /// limits, so retrying a job that's already waiting never gets a 429
     /// for it. `ahead` counts only jobs waiting in the same pool.
+    ///
+    /// Durable once this returns. Calls that arrive while another is
+    /// writing are committed together in the next transaction.
     pub fn enqueue(&self, job: &JobRequest, path: &str, pool: &str) -> Result<Enqueued, LineError> {
+        let done: std::sync::Arc<Outcome> = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let mut batch = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+        batch.pending.push(PendingEnqueue { job: job.clone(), path: path.into(), pool: pool.into(), done: done.clone() });
+        if batch.writing {
+            // Someone else is writing; they'll take this one next.
+            drop(batch);
+            let (slot, ready) = &*done;
+            let mut result = slot.lock().unwrap_or_else(|e| e.into_inner());
+            while result.is_none() {
+                result = ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            }
+            return result.take().expect("checked above");
+        }
+        // This caller writes, until nothing is left waiting.
+        batch.writing = true;
+        loop {
+            let taken = std::mem::take(&mut batch.pending);
+            if taken.is_empty() {
+                batch.writing = false;
+                break;
+            }
+            drop(batch);
+            self.write_batch(taken);
+            batch = self.batch.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        drop(batch);
+        let (slot, _) = &*done;
+        slot.lock().unwrap_or_else(|e| e.into_inner()).take().expect("written in this caller's own batch")
+    }
+
+    // One transaction for every pending enqueue. If the commit itself
+    // fails, every job in it gets that error (none of them went in).
+    fn write_batch(&self, batch: Vec<PendingEnqueue>) {
+        let deliver = |p: &PendingEnqueue, result: Result<Enqueued, LineError>| {
+            let (slot, ready) = &*p.done;
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            ready.notify_one();
+        };
+        let txn = match self.db.begin_write() {
+            Ok(txn) => txn,
+            Err(err) => {
+                let msg = err.to_string();
+                batch.iter().for_each(|p| deliver(p, Err(LineError::Storage(msg.clone()))));
+                return;
+            }
+        };
+        let mut results = Vec::with_capacity(batch.len());
+        for p in &batch {
+            results.push(self.enqueue_in(&txn, &p.job, &p.path, &p.pool));
+        }
+        // A storage error may have left one job half-written: commit none.
+        if let Some(Err(LineError::Storage(msg))) = results.iter().find(|r| matches!(r, Err(LineError::Storage(_)))) {
+            let msg = msg.clone();
+            drop(txn);
+            batch.iter().for_each(|p| deliver(p, Err(LineError::Storage(msg.clone()))));
+            return;
+        }
+        match txn.commit() {
+            Ok(()) => batch.iter().zip(results).for_each(|(p, r)| deliver(p, r)),
+            Err(err) => {
+                let msg = err.to_string();
+                batch.iter().for_each(|p| deliver(p, Err(LineError::Storage(msg.clone()))));
+            }
+        }
+    }
+
+    fn enqueue_in(&self, txn: &redb::WriteTransaction, job: &JobRequest, path: &str, pool: &str) -> Result<Enqueued, LineError> {
         let payload = serde_json::to_vec(&StoredJob {
             path: path.into(),
             enqueued_at: now_unix(),
@@ -284,58 +390,56 @@ impl Line {
         })?;
         let tenant = Tenant::new(job.user_id.as_str(), pool).key();
         let idem = (tenant.as_str(), job.idempotent_key.as_str());
-        let txn = self.db.begin_write()?;
-        let outcome = {
-            let mut order = txn.open_table(ORDER)?;
-            let mut tenant_jobs = txn.open_table(TENANT_JOBS)?;
-            let mut counts = txn.open_table(TENANT_COUNTS)?;
-            let mut queued_keys = txn.open_table(QUEUED_KEYS)?;
-            let results = txn.open_table(RESULTS)?;
-            let mut meta = txn.open_table(META)?;
+        let mut order = txn.open_table(ORDER)?;
+        let mut tenant_jobs = txn.open_table(TENANT_JOBS)?;
+        let mut counts = txn.open_table(TENANT_COUNTS)?;
+        let mut queued_keys = txn.open_table(QUEUED_KEYS)?;
+        let results = txn.open_table(RESULTS)?;
+        let mut meta = txn.open_table(META)?;
+        let mut pool_counts = txn.open_table(POOL_COUNTS)?;
 
-            if let Some(stored) = results.get(idem)? {
-                let stored: StoredResult = serde_json::from_slice(stored.value())?;
-                if stored.expires_at > now_unix() {
-                    return Ok(Enqueued::AlreadyDone(stored.result));
-                }
+        if let Some(stored) = results.get(idem)? {
+            let stored: StoredResult = serde_json::from_slice(stored.value())?;
+            if stored.expires_at > now_unix() {
+                return Ok(Enqueued::AlreadyDone(stored.result));
             }
-            if let Some(seq) = queued_keys.get(idem)? {
-                let seq = seq.value();
-                let ahead = ahead_in_pool(&order, seq, pool)?;
-                return Ok(Enqueued::AlreadyQueued { ahead, seq });
-            }
-
-            let total_jobs = meta.get(TOTAL_JOBS)?.map(|v| v.value()).unwrap_or(0);
-            let total_bytes = meta.get(TOTAL_BYTES)?.map(|v| v.value()).unwrap_or(0);
-            let tenant_count = counts.get(tenant.as_str())?.map(|v| v.value()).unwrap_or(0);
-
-            if total_jobs >= self.limits.max_jobs {
-                return Err(LineError::Full { reason: "line_jobs", limit: self.limits.max_jobs });
-            }
-            if tenant_count >= self.limits.max_per_tenant {
-                return Err(LineError::Full {
-                    reason: "line_tenant",
-                    limit: self.limits.max_per_tenant,
-                });
-            }
-            if total_bytes + payload.len() as u64 > self.limits.max_bytes {
-                return Err(LineError::Full { reason: "line_bytes", limit: self.limits.max_bytes });
-            }
-
-            let seq = meta.get(NEXT_SEQ)?.map(|v| v.value()).unwrap_or(0);
-            meta.insert(NEXT_SEQ, seq + 1)?;
-            meta.insert(TOTAL_JOBS, total_jobs + 1)?;
-            meta.insert(TOTAL_BYTES, total_bytes + payload.len() as u64)?;
+        }
+        if let Some(seq) = queued_keys.get(idem)? {
+            let seq = seq.value();
             let ahead = ahead_in_pool(&order, seq, pool)?;
-            counts.insert(tenant.as_str(), tenant_count + 1)?;
-            order.insert(seq, tenant.as_str())?;
-            tenant_jobs.insert((tenant.as_str(), seq), payload.as_slice())?;
-            queued_keys.insert(idem, seq)?;
+            return Ok(Enqueued::AlreadyQueued { ahead, seq });
+        }
 
-            Enqueued::Queued { ahead, seq }
-        };
-        txn.commit()?;
-        Ok(outcome)
+        let total_jobs = meta.get(TOTAL_JOBS)?.map(|v| v.value()).unwrap_or(0);
+        let total_bytes = meta.get(TOTAL_BYTES)?.map(|v| v.value()).unwrap_or(0);
+        let tenant_count = counts.get(tenant.as_str())?.map(|v| v.value()).unwrap_or(0);
+
+        if total_jobs >= self.limits.max_jobs {
+            return Err(LineError::Full { reason: "line_jobs", limit: self.limits.max_jobs });
+        }
+        if tenant_count >= self.limits.max_per_tenant {
+            return Err(LineError::Full {
+                reason: "line_tenant",
+                limit: self.limits.max_per_tenant,
+            });
+        }
+        if total_bytes + payload.len() as u64 > self.limits.max_bytes {
+            return Err(LineError::Full { reason: "line_bytes", limit: self.limits.max_bytes });
+        }
+
+        let seq = meta.get(NEXT_SEQ)?.map(|v| v.value()).unwrap_or(0);
+        meta.insert(NEXT_SEQ, seq + 1)?;
+        meta.insert(TOTAL_JOBS, total_jobs + 1)?;
+        meta.insert(TOTAL_BYTES, total_bytes + payload.len() as u64)?;
+        // Everyone already waiting in this pool is ahead of a new job.
+        let ahead = pool_counts.get(pool)?.map(|v| v.value()).unwrap_or(0);
+        pool_counts.insert(pool, ahead + 1)?;
+        counts.insert(tenant.as_str(), tenant_count + 1)?;
+        order.insert(seq, tenant.as_str())?;
+        tenant_jobs.insert((tenant.as_str(), seq), payload.as_slice())?;
+        queued_keys.insert(idem, seq)?;
+
+        Ok(Enqueued::Queued { ahead, seq })
     }
 
     /// Takes the longest-waiting job out of line, skipping tenants (line
@@ -418,6 +522,9 @@ impl Line {
             tenant_jobs.insert((user_id, queued.seq), payload.as_slice())?;
             queued_keys.insert((user_id, queued.job.idempotent_key.as_str()), queued.seq)?;
             txn.open_table(LEASED)?.remove(queued.seq)?;
+            let mut pool_counts = txn.open_table(POOL_COUNTS)?;
+            let in_pool = pool_counts.get(queued.pool.as_str())?.map(|v| v.value()).unwrap_or(0);
+            pool_counts.insert(queued.pool.as_str(), in_pool + 1)?;
         }
         txn.commit()?;
         Ok(())
@@ -573,7 +680,16 @@ fn remove_job(
     let mut queued_keys = txn.open_table(QUEUED_KEYS)?;
     let mut meta = txn.open_table(META)?;
 
-    order.remove(seq)?;
+    if order.remove(seq)?.is_some() {
+        let pool = Tenant::pool_of_key(user_id);
+        let mut pool_counts = txn.open_table(POOL_COUNTS)?;
+        let in_pool = pool_counts.get(pool)?.map(|v| v.value()).unwrap_or(0);
+        if in_pool <= 1 {
+            pool_counts.remove(pool)?;
+        } else {
+            pool_counts.insert(pool, in_pool - 1)?;
+        }
+    }
     let payload = match tenant_jobs.remove((user_id, seq))? {
         Some(payload) => payload.value().to_vec(),
         None => return Ok(None),
@@ -917,5 +1033,43 @@ mod tests {
         assert_eq!(line.len().unwrap(), 2);
         let gpu_key = Tenant::new("acme", "gpu").key();
         assert!(matches!(line.lookup(&gpu_key, "k").unwrap(), Lookup::Queued { ahead: 0 }));
+    }
+
+    #[test]
+    fn concurrent_enqueues_are_committed_together_and_all_land() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = std::sync::Arc::new(Line::open(dir.path().join("line.redb"), LineLimits::default()).unwrap());
+        let handles: Vec<_> = (0..50)
+            .map(|i| {
+                let line = line.clone();
+                std::thread::spawn(move || line.enqueue(&job(&format!("u{i}"), "k"), "/jobs", DEFAULT_POOL).unwrap())
+            })
+            .collect();
+        let mut aheads: Vec<u64> = handles
+            .into_iter()
+            .map(|h| match h.join().unwrap() {
+                Enqueued::Queued { ahead, .. } => ahead,
+                other => panic!("expected Queued, got {other:?}"),
+            })
+            .collect();
+        aheads.sort();
+        assert_eq!(aheads, (0..50).collect::<Vec<u64>>(), "every job gets its own place");
+        assert_eq!(line.len().unwrap(), 50);
+    }
+
+    #[test]
+    fn places_in_line_are_right_after_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("line.redb");
+        {
+            let line = Line::open(&path, LineLimits::default()).unwrap();
+            line.enqueue(&job("a", "1"), "/jobs", "gpu").unwrap();
+            line.enqueue(&job("b", "1"), "/jobs", "gpu").unwrap();
+            line.enqueue(&job("c", "1"), "/jobs", DEFAULT_POOL).unwrap();
+            line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap(); // a, gpu
+        }
+        let line = Line::open(&path, LineLimits::default()).unwrap();
+        assert!(matches!(line.enqueue(&job("d", "1"), "/jobs", "gpu").unwrap(), Enqueued::Queued { ahead: 2, .. }), "b, plus a restored from its lease");
+        assert!(matches!(line.enqueue(&job("e", "1"), "/jobs", DEFAULT_POOL).unwrap(), Enqueued::Queued { ahead: 1, .. }));
     }
 }
