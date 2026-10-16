@@ -136,6 +136,8 @@ Each Canalis keeps its line on its own disk. To keep each tenant in one line, th
 - **If the owner stops heartbeating:** the next node to queue that tenant takes over. Jobs still on the lost node's disk wait for it to come back, and are lost if it never does.
 - **If the owner can't be reached:** the job is queued on the node that got it, never dropped.
 
+Node keys learned through the L8 handshake are shared through Valkey too, so a node that shook hands with one Canalis is trusted by all of them. That holds even with `CANALIS_REQUIRE_SIGNED_REGISTRATION`.
+
 Each node needs an address the others can reach. On Fly that's automatic, from `FLY_PRIVATE_IP`. Elsewhere, set `CANALIS_ADVERTISE_URL` (for example `http://10.0.0.7:8080`). A node without one never claims a tenant, which is how a single Canalis runs. The settings are in [docs/configuration.md](docs/configuration.md#several-canalis-nodes).
 
 ## Pools and WebSockets
