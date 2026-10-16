@@ -79,6 +79,9 @@ pub struct L8 {
     /// after a restart: the node caches its trust and keeps signing
     /// without shaking hands again.
     learned_file: Option<std::path::PathBuf>,
+    // Key ids already warned about (signed by a key nobody learned), so
+    // that's logged once per key rather than on every ping.
+    warned: Mutex<HashSet<String>>,
     seen: Mutex<HashMap<String, Instant>>,
     pub require_signed: bool,
 }
@@ -87,14 +90,14 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default()
 }
 
-fn key_id(public: &[u8; 32]) -> String {
+pub fn key_id(public: &[u8; 32]) -> String {
     B64.encode(&public[..8])
 }
 
 impl L8 {
     pub fn new(key: SigningKey, trusted: Option<HashSet<[u8; 32]>>, require_signed: bool) -> Self {
         let public_b64 = B64.encode(key.verifying_key().as_bytes());
-        Self { key, public_b64, trusted, learned: Mutex::default(), learned_file: None, seen: Mutex::default(), require_signed }
+        Self { key, public_b64, trusted, learned: Mutex::default(), learned_file: None, warned: Mutex::default(), seen: Mutex::default(), require_signed }
     }
 
     /// Keeps learned keys in `path`, loading any already there.
@@ -217,7 +220,9 @@ impl L8 {
             // is no less trustworthy: treat it as unsigned rather than lock
             // the node out until it happens to shake hands again.
             if self.trusted.is_none() && !self.require_signed {
-                tracing::warn!("[L8] ping signed by key {id}, which this node hasn't learned; accepting it as unsigned");
+                if self.warned.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string()) {
+                    tracing::warn!("[L8] pings signed by key {id}, which no Canalis node has learned; accepting them as unsigned");
+                }
                 return Verdict::Unsigned;
             }
             return Verdict::Invalid(format!("key {id} is not trusted"));
@@ -233,6 +238,26 @@ impl L8 {
             return Verdict::Invalid("delivery replayed".into());
         }
         Verdict::Valid { key: B64.encode(key.as_bytes()) }
+    }
+
+    /// The key id of a signed delivery whose key this node hasn't learned
+    /// (and has no allowlist to find it in): one another Canalis node may
+    /// have learned, worth looking up in Valkey before verifying.
+    pub fn unlearned_key_id(&self, headers: &axum::http::HeaderMap) -> Option<String> {
+        if self.trusted.is_some() || !headers.contains_key("X-L8-Signature") {
+            return None;
+        }
+        let id = headers.get("X-L8-Key-Id")?.to_str().ok()?.trim().to_string();
+        let known = self.learned.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&id);
+        (!known).then_some(id)
+    }
+
+    /// Adopts a key another Canalis node learned through the handshake
+    /// (shared in Valkey). Ignored if it isn't a valid key for that id.
+    pub fn adopt(&self, id: &str, public_b64: &str) {
+        if let Some(key) = decode_public_key(public_b64).filter(|k| key_id(k.as_bytes()) == id) {
+            self.remember(key);
+        }
     }
 
     // An allowlisted key by its id, or -- with no allowlist -- one that
@@ -254,6 +279,11 @@ impl L8 {
         seen.retain(|_, at| now.duration_since(*at) < WINDOW);
         seen.insert(token.to_string(), now).is_none()
     }
+}
+
+/// A base64 Ed25519 public key's key id, as X-L8-Key-Id carries it.
+pub fn key_id_of(public_b64: &str) -> Option<String> {
+    decode_public_key(public_b64).map(|k| key_id(k.as_bytes()))
 }
 
 fn decode_public_key(b64: &str) -> Option<VerifyingKey> {

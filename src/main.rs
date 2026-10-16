@@ -567,6 +567,16 @@ async fn register(
         tracing::warn!("refused registration from {}: {why}", remote.ip());
         json_response(StatusCode::UNAUTHORIZED, serde_json::json!({ "error": why }))
     };
+    // A key another Canalis node learned through the handshake is in
+    // Valkey: every node trusts what any of them learned.
+    if let Some(id) = state.l8.unlearned_key_id(&headers) {
+        let shared: redis::RedisResult<Option<String>> = state.valkey.clone().get(l8_learned_key(&state.aqueduct, &id)).await;
+        match shared {
+            Ok(Some(public_b64)) => state.l8.adopt(&id, &public_b64),
+            Ok(None) => {}
+            Err(err) => tracing::warn!("couldn't look up L8 key {id} in Valkey: {err}"),
+        }
+    }
     match state.l8.verify(&headers, &body) {
         l8::Verdict::Valid { .. } => {}
         l8::Verdict::Invalid(why) => return refuse(why),
@@ -626,9 +636,25 @@ async fn l8_well_known(State(state): State<AppState>) -> Json<serde_json::Value>
     Json(state.l8.meta())
 }
 
+// Where a node key one Canalis learned is shared with the others.
+fn l8_learned_key(aq: &assign::Aqueduct, key_id: &str) -> String {
+    format!("{}l8:learned:{key_id}", aq.prefix)
+}
+
 async fn l8_challenge(State(state): State<AppState>, Json(req): Json<l8::ChallengeRequest>) -> Response {
     match state.l8.handle_challenge(&req) {
-        Ok(resp) => Json(resp).into_response(),
+        Ok(resp) => {
+            // Share it, so the node's signed pings verify on whichever
+            // Canalis node they reach, not only this one.
+            if let Some(id) = l8::key_id_of(&req.sender_public_key) {
+                let shared: redis::RedisResult<()> =
+                    state.valkey.clone().set(l8_learned_key(&state.aqueduct, &id), req.sender_public_key.trim()).await;
+                if let Err(err) = shared {
+                    tracing::warn!("couldn't share L8 key {id} in Valkey: {err}");
+                }
+            }
+            Json(resp).into_response()
+        }
         Err(err) => {
             tracing::warn!("refused L8 challenge from key {}: {err}", req.sender_public_key);
             json_response(StatusCode::FORBIDDEN, serde_json::json!({ "error": err }))
@@ -3529,6 +3555,31 @@ mod tests {
 
     async fn is_registered(state: &AppState, id: &str) -> bool {
         assign::member(&mut state.valkey.clone(), &state.aqueduct, id).await.unwrap().is_some()
+    }
+
+    // With signing required and no allowlist, a node that shook hands with
+    // one Canalis node registers on any of them: the learned key is shared
+    // through Valkey.
+    #[tokio::test]
+    async fn a_key_learned_by_one_canalis_node_is_trusted_by_the_others() {
+        let (mut a, _da) = test_state().await;
+        let (mut b, _db) = test_state().await;
+        b.aqueduct = a.aqueduct.clone();
+        a.l8 = Arc::new(l8::L8::new(l8::tests::new_key(), None, true));
+        b.l8 = Arc::new(l8::L8::new(l8::tests::new_key(), None, true));
+        let node = l8::tests::new_key();
+        let body: &'static [u8] = br#"{"port":"7003"}"#;
+
+        let before = ping_via_handler(&b, l8::tests::signed_headers(&node, "d0", body), body).await;
+        let shook = l8_challenge(State(a.clone()), Json(l8::tests::challenge_from(&node, "n1"))).await.status();
+        let at_b = ping_via_handler(&b, l8::tests::signed_headers(&node, "d1", body), body).await;
+        let stranger = ping_via_handler(&b, l8::tests::signed_headers(&l8::tests::new_key(), "d2", body), body).await;
+        cleanup(&a).await;
+
+        assert_eq!(before, StatusCode::UNAUTHORIZED, "nobody has learned the key yet");
+        assert_eq!(shook, StatusCode::OK);
+        assert_eq!(at_b, StatusCode::OK, "node b trusts the key node a learned");
+        assert_eq!(stranger, StatusCode::UNAUTHORIZED, "a key no node learned is still refused");
     }
 
     #[tokio::test]
