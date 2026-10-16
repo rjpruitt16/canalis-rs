@@ -10,6 +10,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 - **Authentication** ([#25](https://github.com/rjpruitt16/canalis-rs/issues/25)): `CANALIS_AUTH=upstream-secret` (trust only your gateway) or `jwt` (verify the caller's token against the provider's JWKS and take the tenant, and optionally the pool, from its claims).
 - **Load shedding:** past `CANALIS_MAX_IN_FLIGHT` (default 5,000) requests in progress, `/proxy` and `/jobs` answer `503` + `Retry-After` instead of slowing down until connections time out.
 - **Several Canalis nodes** ([#19](https://github.com/rjpruitt16/canalis-rs/issues/19)): the first node to queue a tenant holds their line, and the other nodes forward that tenant's queued requests and status lookups to it.
+- **Taking turns** ([#36](https://github.com/rjpruitt16/canalis-rs/issues/36)): while anyone waits in a pool's line, newcomers join the line instead of cutting in, and a user holding a slot past `CANALIS_MAX_HOLD_SECONDS` (10) gives it up on their next request.
 - `CANALIS_LISTEN_ADDR`. Canalis listens on `[::]:8080` by default.
 
 ### Changed

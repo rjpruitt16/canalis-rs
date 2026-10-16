@@ -641,6 +641,12 @@ impl Line {
         Ok((stored.enqueued_at > 0).then(|| now_unix().saturating_sub(stored.enqueued_at)))
     }
 
+    /// Jobs waiting in `pool`.
+    pub fn waiting_in_pool(&self, pool: &str) -> Result<u64, LineError> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(POOL_COUNTS)?.get(pool)?.map(|v| v.value()).unwrap_or(0))
+    }
+
     /// The line keys (Tenant::key) of every tenant with jobs waiting.
     pub fn tenants(&self) -> Result<Vec<String>, LineError> {
         let txn = self.db.begin_read()?;
