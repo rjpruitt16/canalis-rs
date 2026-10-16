@@ -3167,16 +3167,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_signing_required_unsigned_pings_still_work_but_a_bad_signature_never_does() {
+    async fn without_signing_required_unsigned_and_unknown_key_pings_work_but_tampered_ones_dont() {
         let (state, _dir) = test_state().await;
         let body: &'static [u8] = br#"{"port":"7002"}"#;
 
         let unsigned = ping_via_handler(&state, axum::http::HeaderMap::new(), body).await;
-        let forged = ping_via_handler(&state, l8::tests::signed_headers(&l8::tests::new_key(), "d1", body), body).await;
+        // A key this Canalis never learned (it restarted, or it's new): no
+        // less trustworthy than unsigned, which is accepted here.
+        let unknown_key = ping_via_handler(&state, l8::tests::signed_headers(&l8::tests::new_key(), "d1", body), body).await;
+        // A key it knows, signing something other than this body: tampered.
+        let node = l8::tests::new_key();
+        state.l8.handle_challenge(&l8::tests::challenge_from(&node, "n1")).unwrap();
+        let tampered = ping_via_handler(&state, l8::tests::signed_headers(&node, "d2", br#"{"port":"1"}"#), body).await;
         cleanup(&state).await;
 
         assert_eq!(unsigned, StatusCode::OK, "existing deployments keep working");
-        assert_eq!(forged, StatusCode::UNAUTHORIZED, "signed but unverifiable is refused either way");
+        assert_eq!(unknown_key, StatusCode::OK, "a node isn't locked out because this Canalis hasn't learned its key");
+        assert_eq!(tampered, StatusCode::UNAUTHORIZED, "a known key's signature that doesn't match the body is refused");
     }
 
     #[tokio::test]

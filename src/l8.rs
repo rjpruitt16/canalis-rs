@@ -74,6 +74,11 @@ pub struct L8 {
     trusted: Option<HashSet<[u8; 32]>>,
     /// Keys that completed the handshake, by key id.
     learned: Mutex<HashMap<String, VerifyingKey>>,
+    /// Where learned keys are kept (one base64 public key per line), so a
+    /// node that already shook hands with this Canalis is still recognized
+    /// after a restart: the node caches its trust and keeps signing
+    /// without shaking hands again.
+    learned_file: Option<std::path::PathBuf>,
     seen: Mutex<HashMap<String, Instant>>,
     pub require_signed: bool,
 }
@@ -89,7 +94,36 @@ fn key_id(public: &[u8; 32]) -> String {
 impl L8 {
     pub fn new(key: SigningKey, trusted: Option<HashSet<[u8; 32]>>, require_signed: bool) -> Self {
         let public_b64 = B64.encode(key.verifying_key().as_bytes());
-        Self { key, public_b64, trusted, learned: Mutex::default(), seen: Mutex::default(), require_signed }
+        Self { key, public_b64, trusted, learned: Mutex::default(), learned_file: None, seen: Mutex::default(), require_signed }
+    }
+
+    /// Keeps learned keys in `path`, loading any already there.
+    pub fn with_learned_file(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+            for key in text.lines().filter_map(|l| decode_public_key(l.trim())) {
+                learned.insert(key_id(key.as_bytes()), key);
+            }
+            tracing::info!("[L8] remembered {} node keys from {}", learned.len(), path.display());
+        }
+        self.learned_file = Some(path);
+        self
+    }
+
+    fn remember(&self, sender: VerifyingKey) {
+        let id = key_id(sender.as_bytes());
+        let new = self.learned.lock().unwrap_or_else(|e| e.into_inner()).insert(id, sender).is_none();
+        let Some(path) = self.learned_file.as_ref().filter(|_| new) else { return };
+        use std::io::Write;
+        let saved = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut f| writeln!(f, "{}", B64.encode(sender.as_bytes())));
+        if let Err(err) = saved {
+            tracing::warn!("[L8] couldn't save a learned node key to {}: {err}", path.display());
+        }
     }
 
     pub fn from_env() -> Result<Self, String> {
@@ -104,7 +138,8 @@ impl L8 {
         let require_signed = std::env::var("CANALIS_REQUIRE_SIGNED_REGISTRATION")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
-        let l8 = Self::new(key, trusted, require_signed);
+        let key_path = std::env::var("CANALIS_L8_KEY_PATH").unwrap_or_else(|_| ".l8-key".into());
+        let l8 = Self::new(key, trusted, require_signed).with_learned_file(format!("{key_path}.learned"));
         tracing::info!("[L8] public key: {}", l8.public_b64);
         if require_signed && l8.trusted.is_none() {
             tracing::warn!(
@@ -149,7 +184,7 @@ impl L8 {
             return Err("nonce already used".into());
         }
 
-        self.learned.lock().unwrap_or_else(|e| e.into_inner()).insert(key_id(sender.as_bytes()), sender);
+        self.remember(sender);
         Ok(ChallengeResponse {
             challenge_id: req.challenge_id.clone(),
             nonce: req.nonce.clone(),
@@ -176,6 +211,15 @@ impl L8 {
             return Verdict::Invalid("X-L8-Timestamp is too old or in the future".into());
         }
         let Some(key) = self.key_for(id) else {
+            // With no allowlist and signing not required, an unsigned ping
+            // is accepted, so one signed by a key this Canalis hasn't
+            // learned (a new Canalis, or one whose learned keys were lost)
+            // is no less trustworthy: treat it as unsigned rather than lock
+            // the node out until it happens to shake hands again.
+            if self.trusted.is_none() && !self.require_signed {
+                tracing::warn!("[L8] ping signed by key {id}, which this node hasn't learned; accepting it as unsigned");
+                return Verdict::Unsigned;
+            }
             return Verdict::Invalid(format!("key {id} is not trusted"));
         };
         let Some(signature) = decode_signature(signature) else {
@@ -383,12 +427,44 @@ pub(crate) mod tests {
     #[test]
     fn without_an_allowlist_only_keys_that_did_the_handshake_verify() {
         let node = new_key();
-        let canalis = L8::new(new_key(), None, false);
+        let canalis = L8::new(new_key(), None, true);
         let body = b"{}";
         assert!(matches!(canalis.verify(&signed_headers(&node, "d1", body), body), Verdict::Invalid(_)));
 
         canalis.handle_challenge(&challenge_from(&node, "n1")).unwrap();
         assert!(matches!(canalis.verify(&signed_headers(&node, "d2", body), body), Verdict::Valid { .. }));
+    }
+
+    // Signing not required: an unsigned ping would be accepted, so a ping
+    // signed by a key this node never learned is accepted as unsigned too,
+    // instead of locking the node out.
+    #[test]
+    fn without_required_signing_an_unknown_key_counts_as_unsigned() {
+        let canalis = L8::new(new_key(), None, false);
+        let body = b"{}";
+        assert_eq!(canalis.verify(&signed_headers(&new_key(), "d1", body), body), Verdict::Unsigned);
+        // A known key that doesn't match the body is still invalid.
+        let node = new_key();
+        canalis.handle_challenge(&challenge_from(&node, "n1")).unwrap();
+        assert!(matches!(canalis.verify(&signed_headers(&node, "d2", body), b"tampered"), Verdict::Invalid(_)));
+    }
+
+    // A node caches its trust and keeps signing without shaking hands
+    // again, so the keys Canalis learned have to outlive a restart.
+    #[test]
+    fn learned_keys_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(".l8-key.learned");
+        let node = new_key();
+        let before = L8::new(new_key(), None, true).with_learned_file(&file);
+        before.handle_challenge(&challenge_from(&node, "n1")).unwrap();
+        before.handle_challenge(&challenge_from(&node, "n2")).unwrap();
+        drop(before);
+        assert_eq!(std::fs::read_to_string(&file).unwrap().lines().count(), 1, "a key is saved once");
+
+        let after = L8::new(new_key(), None, true).with_learned_file(&file);
+        let body = b"{}";
+        assert!(matches!(after.verify(&signed_headers(&node, "d1", body), body), Verdict::Valid { .. }));
     }
 
     #[test]
