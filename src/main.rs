@@ -1,11 +1,14 @@
 mod assign;
 mod auth;
+mod config;
 mod l8;
 mod lifecycle;
+mod limits;
 mod line;
 mod metrics;
 mod ownership;
 mod scale;
+mod server;
 mod schemas;
 mod websocket;
 
@@ -91,6 +94,54 @@ pub struct AppState {
     ownership: Arc<ownership::Ownership>,
     // How long each tenant has held its slot, for taking turns (Turns).
     turns: Arc<Turns>,
+    // Per-client and per-tenant limits (limits.rs).
+    limits: Arc<limits::Limits>,
+}
+
+/// The client's address (limits.rs), and whether the request came from
+/// another Canalis node on a trusted network (already limited there).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClientIp {
+    pub ip: std::net::IpAddr,
+    pub peer: bool,
+}
+
+async fn limit(State(state): State<AppState>, mut request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let Some(remote) = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
+        return next.run(request).await;
+    };
+    let ip = state.limits.client_ip(remote, request.headers());
+    let peer = request.headers().contains_key(FORWARDED_BY) && state.limits.is_trusted_proxy(remote);
+    request.extensions_mut().insert(ClientIp { ip, peer });
+    if !peer {
+        if let Err(limited) = state.limits.check_ip(ip) {
+            return limited_response(&state, &limited);
+        }
+    }
+    next.run(request).await
+}
+
+pub(crate) fn limited_response(state: &AppState, limited: &limits::Limited) -> Response {
+    state.metrics.inc("canalis_limited_total", &[("reason", limited.reason)]);
+    let mut response = json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        serde_json::json!({ "error": "rate limited; retry later", "limit_reason": limited.reason }),
+    );
+    let secs = limited.retry_after.as_secs_f64().ceil().max(1.0) as u32;
+    response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from(secs));
+    response
+}
+
+// Keeps a stream slot (CANALIS_PER_IP_MAX_STREAMS) for as long as a
+// response's body is being sent.
+fn holding(response: Response, guard: Option<limits::StreamGuard>) -> Response {
+    let Some(guard) = guard else { return response };
+    let (parts, body) = response.into_parts();
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _held = &guard;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
 }
 
 /// Taking turns while others wait (#36). A tenant holds a slot on an
@@ -161,6 +212,7 @@ impl Turns {
 pub(crate) struct Origin {
     forwarded: bool,
     credentials: Vec<(axum::http::HeaderName, axum::http::HeaderValue)>,
+    client: Option<ClientIp>,
 }
 
 const FORWARDED_BY: &str = "X-Canalis-Forwarded-By";
@@ -174,7 +226,18 @@ impl Origin {
                 headers.get(&name).map(|v| (name, v.clone()))
             })
             .collect();
-        Self { forwarded: headers.contains_key(FORWARDED_BY), credentials }
+        Self { forwarded: headers.contains_key(FORWARDED_BY), credentials, client: None }
+    }
+
+    fn with_client(mut self, client: Option<ClientIp>) -> Self {
+        self.client = client;
+        self
+    }
+
+    // Whether this request's limits were already applied by the Canalis
+    // node that forwarded it.
+    fn limited_elsewhere(&self) -> bool {
+        self.client.is_some_and(|c| c.peer)
     }
 }
 
@@ -191,8 +254,11 @@ pub struct Shedder {
 }
 
 impl Shedder {
+    // Default: 5,000 per CPU (one performance-1x vCPU handled about
+    // 2,500 rps healthily in the Fly benchmark).
     fn from_env() -> Self {
-        Self::with_max(env_u64("CANALIS_MAX_IN_FLIGHT", 5000) as usize)
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as u64;
+        Self::with_max(env_u64("CANALIS_MAX_IN_FLIGHT", 5000 * cpus) as usize)
     }
 
     fn with_max(max: usize) -> Self {
@@ -312,6 +378,7 @@ async fn main() {
         Err(err) => tracing::error!("failed to read the line's length: {err}"),
     }
 
+    let file_config = config::FileConfig::from_env().unwrap_or_else(|err| panic!("{err}"));
     let state = AppState {
         valkey,
         http: reqwest::Client::new(),
@@ -332,6 +399,7 @@ async fn main() {
         shedder: Arc::new(Shedder::from_env()),
         ownership: Arc::new(ownership::Ownership::from_env()),
         turns: Arc::new(Turns::from_env()),
+        limits: Arc::new(limits::Limits::from_config(&file_config.limits).unwrap_or_else(|err| panic!("limits: {err}"))),
     };
 
     let room_handout = state.clone();
@@ -382,6 +450,10 @@ async fn main() {
             }
             check_scale(&sweeper_state).await;
             sweeper_state.turns.prune(sweeper_state.aqueduct.assignment_ttl);
+            sweeper_state.limits.prune();
+            if let Ok(n) = sweeper_state.ownership.live_nodes(&mut sweeper_state.valkey.clone(), &sweeper_state.aqueduct).await {
+                sweeper_state.limits.set_live_nodes(n);
+            }
             renew_line_ownership(&sweeper_state).await;
             tokio::time::sleep(sweep_every).await;
         }
@@ -418,15 +490,10 @@ async fn main() {
         let _ = stopped_tx.send(());
     });
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
+    server::serve(listener, app, server::ServerConfig::from_env(), async {
         let _ = stopped_rx.await;
     })
-    .await
-    .expect("server error");
+    .await;
     tracing::info!("canalis-rs stopped");
 }
 
@@ -490,12 +557,13 @@ fn router(state: AppState) -> Router {
         .route("/register", post(register))
         .route("/.well-known/l8", get(l8_well_known))
         .route("/l8/challenge", post(l8_challenge))
-        .route("/proxy", post(proxy).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
-        .route("/jobs", post(jobs).layer(axum::middleware::from_fn_with_state(state.clone(), shed)))
-        .route("/jobs/{idempotent_key}", get(job_status))
-        .route("/websocket", get(websocket::handler))
+        .route("/proxy", post(proxy).layer(axum::middleware::from_fn_with_state(state.clone(), shed)).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
+        .route("/jobs", post(jobs).layer(axum::middleware::from_fn_with_state(state.clone(), shed)).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
+        .route("/jobs/{idempotent_key}", get(job_status).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
+        .route("/websocket", get(websocket::handler).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
         .route("/metrics", get(metrics::handler))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), metrics::track))
+        .layer(axum::extract::DefaultBodyLimit::max(env_u64("CANALIS_MAX_BODY_BYTES", 2 * 1024 * 1024) as usize))
         .with_state(state)
 }
 
@@ -1407,16 +1475,26 @@ pub(crate) struct JobRequest {
     pub(crate) webhook_url: Option<String>,
 }
 
-async fn proxy(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
-    admit_job(state, headers, job, "/proxy").await
+async fn proxy(
+    State(state): State<AppState>,
+    client: Option<axum::Extension<ClientIp>>,
+    headers: axum::http::HeaderMap,
+    Json(job): Json<JobRequest>,
+) -> Response {
+    admit_job(state, headers, client.map(|c| c.0), job, "/proxy").await
 }
 
-async fn jobs(State(state): State<AppState>, headers: axum::http::HeaderMap, Json(job): Json<JobRequest>) -> Response {
-    admit_job(state, headers, job, "/jobs").await
+async fn jobs(
+    State(state): State<AppState>,
+    client: Option<axum::Extension<ClientIp>>,
+    headers: axum::http::HeaderMap,
+    Json(job): Json<JobRequest>,
+) -> Response {
+    admit_job(state, headers, client.map(|c| c.0), job, "/jobs").await
 }
 
 // Draining, then who it's for (auth.rs), then which pool, then forward.
-async fn admit_job(state: AppState, headers: axum::http::HeaderMap, mut job: JobRequest, path: &str) -> Response {
+async fn admit_job(state: AppState, headers: axum::http::HeaderMap, client: Option<ClientIp>, mut job: JobRequest, path: &str) -> Response {
     if state.lifecycle.is_draining() {
         return lifecycle::draining_response();
     }
@@ -1436,7 +1514,13 @@ async fn admit_job(state: AppState, headers: axum::http::HeaderMap, mut job: Job
             pool = token_pool;
         }
     }
-    forward(state, job, path, &pool, &Origin::from_headers(&headers)).await
+    let origin = Origin::from_headers(&headers).with_client(client);
+    if !origin.limited_elsewhere() {
+        if let Err(limited) = state.limits.check_tenant(&assign::Tenant::new(job.user_id.as_str(), pool.as_str())) {
+            return limited_response(&state, &limited);
+        }
+    }
+    forward(state, job, path, &pool, &origin).await
 }
 
 /// 401 for missing or bad credentials, 503 when the provider's keys can't
@@ -1610,6 +1694,9 @@ async fn forward_to_owner(
         .request(method, format!("{owner_url}{path_and_query}"))
         .header(FORWARDED_BY, state.ownership.node_id.as_str())
         .header("X-Aqueduct-Pool", pool);
+    if let Some(client) = origin.client {
+        request = request.header("X-Forwarded-For", client.ip.to_string());
+    }
     for (name, value) in &origin.credentials {
         request = request.header(name.as_str(), value.as_bytes());
     }
@@ -1649,11 +1736,20 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, 
     // another node forwarded here is queued here whatever happens, so it
     // can't bounce; if the owner can't be reached, it's queued here too.
     let tenant = assign::Tenant::new(job.user_id.as_str(), pool);
+    // A waiting-room stream holds one of the client's stream slots until it
+    // ends, wherever the line is (counted at the node the client reached).
+    let guard = match origin.client.filter(|c| !c.peer) {
+        Some(client) => match state.limits.open_stream(client.ip) {
+            Ok(guard) => Some(guard),
+            Err(limited) => return limited_response(&state, &limited),
+        },
+        None => None,
+    };
     match state.ownership.owner_for_queueing(&mut state.valkey.clone(), &state.aqueduct, &tenant).await {
         Ok(ownership::LineOwner::Elsewhere { node, url }) if !origin.forwarded => {
             if let Some(response) = forward_to_owner(&state, &url, reqwest::Method::POST, path, Some(&job), pool, origin).await {
                 state.metrics.inc("canalis_line_forwarded_total", &[]);
-                return response;
+                return holding(response, guard);
             }
             tracing::warn!("couldn't reach Canalis node {node} holding {}'s line; queueing here", job.user_id);
         }
@@ -1739,7 +1835,10 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, 
     });
     drop(tx);
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(move |chunk| {
+        let _held = &guard;
+        Ok::<_, std::io::Error>(chunk)
+    });
     Response::builder()
         .status(StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
@@ -2235,6 +2334,7 @@ mod tests {
             shedder: Arc::new(Shedder::with_max(0)),
             ownership: Arc::new(ownership::tests::node("test-node", None)),
             turns: Arc::new(Turns::new(Duration::ZERO)),
+            limits: Arc::new(limits::Limits::none()),
         };
         (state, dir)
     }
@@ -2459,9 +2559,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>())
-                .await
-                .unwrap();
+            server::serve(listener, router(state), server::ServerConfig::from_env(), std::future::pending()).await;
         });
         addr.to_string()
     }
@@ -3452,7 +3550,7 @@ mod tests {
             state.ownership.heartbeat(&mut state.valkey.clone(), &state.aqueduct).await.unwrap();
             let serving = state.clone();
             tokio::spawn(async move {
-                axum::serve(listener, router(serving).into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+                server::serve(listener, router(serving), server::ServerConfig::from_env(), std::future::pending()).await;
             });
             nodes.push(addr);
         }
@@ -3570,6 +3668,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn behind_a_trusted_proxy_each_client_address_gets_its_own_limit() {
+        let (mut state, _dir) = test_state().await;
+        // The test client connects from 127.0.0.1, standing in for the proxy.
+        state.limits = Arc::new(limits::Limits::new(
+            vec![limits::Cidr::parse("127.0.0.1").unwrap()],
+            Some(limits::Rate::new(1.0, 1.0)),
+            0,
+            None,
+        ));
+        register_node(&state, &start_plain_ok_mock().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let from = |client: &'static str| {
+            http.post(format!("http://{canalis}/proxy")).header("X-Forwarded-For", client).json(&job_for(&unique("u"))).send()
+        };
+
+        let a1 = from("203.0.113.1").await.unwrap().status();
+        let b1 = from("203.0.113.2").await.unwrap().status();
+        let a2 = from("203.0.113.1").await.unwrap().status();
+        let body_a2_reason = from("203.0.113.1").await.unwrap().json::<serde_json::Value>().await.unwrap()["limit_reason"].clone();
+        cleanup(&state).await;
+
+        assert_eq!((a1, b1), (StatusCode::OK, StatusCode::OK), "two clients behind one proxy, a limit each");
+        assert_eq!(a2, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body_a2_reason, "ip_rate");
+    }
+
+    #[tokio::test]
+    async fn a_tenant_past_its_limit_gets_429_with_retry_after() {
+        let (mut state, _dir) = test_state().await;
+        state.limits = Arc::new(limits::Limits::from_config(&config::FileConfig::parse(
+            "limits:\n  tenant: { rps: 1, burst: 2 }\n  tenants:\n    vip: { rps: 0 }\n",
+        ).unwrap().limits).unwrap());
+        register_node(&state, &start_plain_ok_mock().await).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let http = reqwest::Client::new();
+        let send = |user: &str| http.post(format!("http://{canalis}/proxy")).json(&job_for(user)).send();
+
+        let acme: Vec<StatusCode> = vec![send("acme").await.unwrap().status(), send("acme").await.unwrap().status()];
+        let third = send("acme").await.unwrap();
+        let (third_status, retry_after) = (third.status(), third.headers().get("retry-after").cloned());
+        let body: serde_json::Value = third.json().await.unwrap();
+        let mut vip = Vec::new();
+        for _ in 0..5 {
+            vip.push(send("vip").await.unwrap().status());
+        }
+        let metrics = http.get(format!("http://{canalis}/metrics")).send().await.unwrap().text().await.unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(acme, vec![StatusCode::OK, StatusCode::OK], "within its burst");
+        assert_eq!(third_status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(retry_after.is_some());
+        assert_eq!(body["limit_reason"], "tenant_rate");
+        assert!(vip.iter().all(|s| *s == StatusCode::OK), "a tenant given no limit isn't limited: {vip:?}");
+        assert!(metrics.contains("canalis_limited_total{reason=\"tenant_rate\"} 1\n"), "{metrics}");
+    }
+
+    #[tokio::test]
     async fn no_free_instance_puts_the_job_back_in_its_place() {
         let (state, _dir) = test_state().await;
         let first = job_for(&unique("first-in-line"));
@@ -3624,6 +3780,7 @@ mod tests {
             shedder: Arc::new(Shedder::with_max(0)),
             ownership: Arc::new(ownership::tests::node("test-node", None)),
             turns: Arc::new(Turns::new(Duration::ZERO)),
+            limits: Arc::new(limits::Limits::none()),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

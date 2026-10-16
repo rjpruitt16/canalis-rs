@@ -21,11 +21,41 @@ See [Running several Canalis nodes](../README.md#running-several-canalis-nodes) 
 | `CANALIS_PEER_CONNECTIONS` | `32` | HTTP/2 connections this node opens to each other Canalis node for forwarding. Each carries up to 200 waiting-room streams at once. |
 | `CANALIS_LINE_OWNER_TTL_SECONDS` | `30` | How long a node's claim on a tenant's line lasts without renewal. It's renewed every sweep while the tenant has jobs waiting. |
 
+## Config file
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_CONFIG_PATH` | unset | A YAML file read once at startup. Environment variables override what it says. Today it holds `limits` (below). An unreadable or invalid file stops startup. |
+
+```yaml
+limits:
+  tenant: { rps: 1000, burst: 2000 }      # cluster-wide, per tenant
+  per_ip: { rps: 100, burst: 200, max_streams: 200 }
+  tenants:                                # by user id; rps 0 = no limit
+    big-customer: { rps: 5000 }
+    bad-actor: { rps: 2 }
+```
+
+## Limits
+
+Each limit is a token bucket. Past it, the request gets `429` with `Retry-After` and a `limit_reason` (`tenant_rate`, `ip_rate`, `ip_streams`). Registration, health and metrics are never limited.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_TENANT_RPS` | `1000` | Requests a second per tenant, across all Canalis nodes. Each node enforces its share (divided by the live Canalis nodes). `0` turns it off. Tenants can have their own limit under `limits.tenants`. |
+| `CANALIS_TENANT_BURST` | `2000` | How many requests a tenant can send at once before the rate applies. |
+| `CANALIS_TRUSTED_PROXIES` | unset | Comma-separated addresses or CIDR ranges (e.g. `10.0.0.0/8`, `fdaa::/16` on Fly) whose `X-Forwarded-For` is believed. Setting it turns on the per-address limits below. Include your Canalis nodes' network, so requests forwarded between nodes aren't counted twice. |
+| `CANALIS_PER_IP_RPS` | `100` with trusted proxies, else off | Requests a second per client address. Setting it explicitly turns it on, for a Canalis exposed directly to the internet. `0` turns it off. |
+| `CANALIS_PER_IP_BURST` | `200` | Burst per client address. |
+| `CANALIS_PER_IP_MAX_STREAMS` | `200` with trusted proxies, else off | Waiting-room streams and WebSocket sessions one address can hold open. |
+| `CANALIS_MAX_BODY_BYTES` | `2097152` (2 MiB) | Largest request body accepted (`413` past it). |
+| `CANALIS_HEADER_READ_TIMEOUT_SECONDS` | `10` | A client that doesn't finish sending request headers within this is disconnected (slowloris). |
+
 ## Load shedding
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `CANALIS_MAX_IN_FLIGHT` | `5000` | Past this many `/proxy` and `/jobs` requests in progress, new ones get `503` + `Retry-After: 1` at once instead of slowing everything down. A request counts until its response starts, so a slow target API keeps requests in progress longer: raise it if yours answer slowly. `0` turns shedding off. Registration, health and metrics are never shed. |
+| `CANALIS_MAX_IN_FLIGHT` | `5000` per CPU | Past this many `/proxy` and `/jobs` requests in progress, new ones get `503` + `Retry-After: 1` at once instead of slowing everything down. A request counts until its response starts, so a slow target API keeps requests in progress longer: raise it if yours answer slowly. `0` turns shedding off. Registration, health and metrics are never shed. |
 
 ## Valkey and the shared pool
 
