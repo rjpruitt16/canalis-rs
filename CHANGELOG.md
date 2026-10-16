@@ -15,6 +15,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 ### Changed
 
 - **Lower latency:** the instance list used for claims is reused for `CANALIS_MEMBER_CACHE_MS` (250), so a request costs one Valkey round trip instead of four. The p50 Canalis adds went from about 5 ms to about 1.6 ms; see [BENCHMARKS.md](BENCHMARKS.md).
+- **Forwarding between Canalis nodes uses HTTP/2** over a small pool of connections per peer (`CANALIS_PEER_CONNECTIONS`, 32), instead of one connection per waiting caller, and the image raises the open-file limit. Both nodes ran out of open files in the second Fly benchmark without this.
 - **Line writes are batched:** enqueues that arrive while one is being written share the next disk flush, and a new job's place in line is a lookup instead of a scan.
 - **Faster when the fleet is full:** the line drains at `CANALIS_DRAIN_RPS` / `CANALIS_DRAIN_MAX_CONCURRENT` (100/s, 10 at once per tenant) instead of 2/s one at a time, and a tenant's slot is freed as soon as its backlog drains.
 - With no allowlist and signing not required, a registration signed by a key Canalis hasn't learned is accepted as unsigned instead of refused.

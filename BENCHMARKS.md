@@ -1,6 +1,63 @@
 # Benchmarks
 
-## Fly.io, 2026-10-16
+## Fly.io, 2026-10-16, run 2: two Canalis nodes
+
+The same harness as run 1 below, with two Canalis machines (each with its own volume) and line ownership ([#33](https://github.com/rjpruitt16/canalis-rs/pull/33)). It ran 60 minutes, and every app was destroyed afterwards.
+
+### Throughput
+
+The load was spread across both Canalis nodes, with 100 users fitting within capacity.
+
+| Load | Two Canalis nodes, p50 / p99 | One node (run 1, with the instance cache) |
+|---|---|---|
+| 1,000 rps | 5.4 / 16 ms | 3.7 / 55 ms |
+| 2,500 rps | 5.7 / 72 ms | 7.4 / 84 ms |
+| 4,000–5,000 rps | the **two Aquifer machines** saturate (queueing in Aquifer; direct calls collapse too) | — |
+
+The two Aquifer instances give out before two Canalis nodes do, so this setup can't measure the two-node ceiling.
+
+### One line per tenant across nodes
+
+This run had capacity for 40 users and sent 199 users at 500 rps for 30 s. Each user's requests alternated between the two nodes.
+
+| | Result |
+|---|---|
+| Forwarded to the node holding the tenant's line | ~2,950 per node, about half of what each received |
+| Line empty after | ~90 s (65 s of that is the burst's slot holders idling out, as in run 1) |
+| Delivered to the target API | **15,001 of 15,001**, in every repeat (six runs, including two node restarts) |
+| Responsiveness while filling | every 2 s sample answered (run 1, single node: a ~30 s gap) |
+
+### Found and fixed during this run
+
+- **Open files.** Both nodes hit the process limit of 10,240 open files about 28 s in, then accepted nothing, `/metrics` included, for two minutes. Two things used them up:
+  - every waiting caller holds a connection;
+  - each forwarded request held its own HTTP/1.1 connection to the owner. About 5,000 more of these stayed idle in the pool after a run.
+
+  The fixes:
+  - forwarding now uses HTTP/2, over `CANALIS_PEER_CONNECTIONS` (32) connections per peer;
+  - the image raises the open-file limit (to 1,048,576 where allowed, else 65,536).
+
+  After the fixes, a run peaked at about 6,000 open files (the waiting callers) and dropped to about 220 afterwards.
+- **200-stream steps.** With a single HTTP/2 connection per peer, forwarding moved in steps of exactly 200, the server's default concurrent streams per connection. That's why there's a pool of connections.
+
+### Losing a Canalis node
+
+The run SIGKILLed one of the two Canalis nodes 19 s into the same run, while both lines were filling:
+
+| | |
+|---|---|
+| Failed requests | 794 of 15,001, all in seconds 18–21 (connections cut by the kill) |
+| The killed node | restarted by Fly within ~4 s; its ~3,200 queued jobs survived on its volume and drained |
+| Accepted (200) | 14,207, and **all of them delivered** |
+| Delivered | 14,208: one job was saved before its caller's connection died, so the caller saw an error but the job ran. That's at-least-once delivery; retrying with the same idempotency key is caught as a duplicate |
+
+### Still open
+
+- **Signing across nodes.** An Aquifer node does its L8 handshake with whichever Canalis answers, so the other node never learns its key. Today it accepts those pings as unsigned, and logs that on every ping. With `CANALIS_REQUIRE_SIGNED_REGISTRATION` on, it would refuse them. Learned keys should be shared through Valkey.
+- **Slot-holder fairness during bursts**, as in run 1.
+- **Not covered yet:** WebSockets, slow target APIs, a soak.
+
+## Fly.io, 2026-10-16, run 1: one Canalis node
 
 This run was one Canalis in front of two Aquifer instances on Fly's private network in `iad`. The harness is in [`bench/fly/`](bench/fly/).
 

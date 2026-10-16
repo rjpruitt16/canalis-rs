@@ -18,6 +18,7 @@ See [Running several Canalis nodes](../README.md#running-several-canalis-nodes) 
 | --- | --- | --- |
 | `CANALIS_ADVERTISE_URL` | `http://[$FLY_PRIVATE_IP]:8080` on Fly, else unset | How other Canalis nodes reach this one. Unset means this node doesn't take part: it never claims a tenant's line, so a single Canalis behaves as before. |
 | `CANALIS_NODE_ID` | `$FLY_MACHINE_ID`, else random per start | This node's id among the Canalis nodes sharing Valkey. |
+| `CANALIS_PEER_CONNECTIONS` | `32` | HTTP/2 connections this node opens to each other Canalis node for forwarding. Each carries up to 200 waiting-room streams at once. |
 | `CANALIS_LINE_OWNER_TTL_SECONDS` | `30` | How long a node's claim on a tenant's line lasts without renewal. It's renewed every sweep while the tenant has jobs waiting. |
 
 ## Load shedding
