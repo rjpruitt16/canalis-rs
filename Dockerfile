@@ -1,4 +1,6 @@
-FROM rust:1.88-slim AS builder
+# Bookworm, to match the runtime image below: a binary built on a newer
+# Debian needs a newer glibc than the runtime has.
+FROM rust:1.99-slim-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

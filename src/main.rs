@@ -113,11 +113,10 @@ async fn limit(State(state): State<AppState>, mut request: axum::extract::Reques
     let ip = state.limits.client_ip(remote, request.headers());
     let peer = request.headers().contains_key(FORWARDED_BY) && state.limits.is_trusted_proxy(remote);
     request.extensions_mut().insert(ClientIp { ip, peer });
-    if !peer {
-        if let Err(limited) = state.limits.check_ip(ip) {
+    if !peer
+        && let Err(limited) = state.limits.check_ip(ip) {
             return limited_response(&state, &limited);
         }
-    }
     next.run(request).await
 }
 
@@ -1284,13 +1283,11 @@ async fn dispatch_drained_job(
     let mut waiter = take_waiter(waiters, job, &queued.pool);
     // A /jobs answer is the node's acknowledgment (201 + job_id); the
     // caller learns about the assignment once that id is known, below.
-    if !follows_job_stream {
-        if let Some(tx) = &waiter {
-            if tx.send(sse_event("canalis_assigned", serde_json::json!({}))).await.is_err() {
+    if !follows_job_stream
+        && let Some(tx) = &waiter
+            && tx.send(sse_event("canalis_assigned", serde_json::json!({}))).await.is_err() {
                 waiter = None;
             }
-        }
-    }
 
     // Read the node's response chunk by chunk: each one goes to the waiting
     // caller as it arrives (live, not buffered) and into the cached copy.
@@ -1300,15 +1297,13 @@ async fn dispatch_drained_job(
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 body.extend_from_slice(&chunk);
-                if streams {
-                    if let Some(tx) = &waiter {
-                        if tx.send(chunk).await.is_err() {
+                if streams
+                    && let Some(tx) = &waiter
+                        && tx.send(chunk).await.is_err() {
                             // Caller hung up; keep reading so the result
                             // is still cached for GET /jobs/{key}.
                             waiter = None;
                         }
-                    }
-                }
             }
             Ok(None) => break,
             Err(err) => {
@@ -1515,11 +1510,10 @@ async fn admit_job(state: AppState, headers: axum::http::HeaderMap, client: Opti
         }
     }
     let origin = Origin::from_headers(&headers).with_client(client);
-    if !origin.limited_elsewhere() {
-        if let Err(limited) = state.limits.check_tenant(&assign::Tenant::new(job.user_id.as_str(), pool.as_str())) {
+    if !origin.limited_elsewhere()
+        && let Err(limited) = state.limits.check_tenant(&assign::Tenant::new(job.user_id.as_str(), pool.as_str())) {
             return limited_response(&state, &limited);
         }
-    }
     forward(state, job, path, &pool, &origin).await
 }
 
@@ -1770,11 +1764,10 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, 
     }
 
     let unregister = |state: &AppState| {
-        if let Ok(mut waiters) = state.waiters.lock() {
-            if waiters.get(&key).is_some_and(|w| w.id == id) {
+        if let Ok(mut waiters) = state.waiters.lock()
+            && waiters.get(&key).is_some_and(|w| w.id == id) {
                 waiters.remove(&key);
             }
-        }
     };
 
     let (queued_job, path, queued_pool) = (job.clone(), path.to_string(), pool.to_string());
@@ -1797,12 +1790,11 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, 
     };
     tracing::info!("no instance free for {}; in line with {ahead} ahead", job.user_id);
 
-    if let Ok(mut waiters) = state.waiters.lock() {
-        if let Some(waiter) = waiters.get_mut(&key).filter(|w| w.id == id) {
+    if let Ok(mut waiters) = state.waiters.lock()
+        && let Some(waiter) = waiters.get_mut(&key).filter(|w| w.id == id) {
             waiter.seq = seq;
             waiter.last_ahead = Some(ahead);
         }
-    }
     let mut status_url = format!("/jobs/{}?user_id={}", job.idempotent_key, job.user_id);
     if pool != assign::DEFAULT_POOL {
         status_url.push_str(&format!("&pool={pool}"));
@@ -2220,14 +2212,13 @@ async fn job_status(
     let found = on_line(&state.line, move |l| l.lookup(&user_id, &key_for_lookup)).await;
     // Not here: maybe it's waiting on the node that holds this tenant's line.
     let origin = Origin::from_headers(&headers);
-    if matches!(found, Ok(line::Lookup::Unknown)) && !origin.forwarded {
-        if let Ok(Some((_, url))) = state.ownership.other_owner(&mut state.valkey.clone(), &state.aqueduct, &tenant).await {
+    if matches!(found, Ok(line::Lookup::Unknown)) && !origin.forwarded
+        && let Ok(Some((_, url))) = state.ownership.other_owner(&mut state.valkey.clone(), &state.aqueduct, &tenant).await {
             let path = format!("/jobs/{}?user_id={}&pool={}", idempotent_key, urlencode(&tenant.user), urlencode(&tenant.pool));
             if let Some(response) = forward_to_owner(&state, &url, reqwest::Method::GET, &path, None, &tenant.pool, &origin).await {
                 return response;
             }
         }
-    }
     match found {
         Ok(line::Lookup::Done(cached)) => cached_result_response(cached),
         Ok(line::Lookup::Queued { ahead }) => json_response(

@@ -273,15 +273,14 @@ impl Jwt {
         if !found.is_empty() && !stale {
             return Ok(found);
         }
-        if !recently {
-            if let Err(err) = self.fetch().await {
+        if !recently
+            && let Err(err) = self.fetch().await {
                 if self.keys.lock().unwrap_or_else(|e| e.into_inner()).fetched_at.is_none() {
                     return Err(Rejection::Unavailable(err));
                 }
                 tracing::warn!("{err}; using the keys already loaded");
                 return Ok(found);
             }
-        }
         Ok(self.cached(kid).0)
     }
 

@@ -175,11 +175,10 @@ impl L8 {
             return Err("timestamp expired".into());
         }
         let sender = decode_public_key(&req.sender_public_key).ok_or("invalid sender_public_key")?;
-        if let Some(trusted) = &self.trusted {
-            if !trusted.contains(sender.as_bytes()) {
+        if let Some(trusted) = &self.trusted
+            && !trusted.contains(sender.as_bytes()) {
                 return Err("sender key is not in CANALIS_L8_TRUSTED_NODE_KEYS".into());
             }
-        }
         let signature = decode_signature(&req.signature).ok_or("invalid signature encoding")?;
         let message = format!("{}:{}", req.challenge_id, req.nonce);
         sender.verify(message.as_bytes(), &signature).map_err(|_| "signature verification failed")?;
