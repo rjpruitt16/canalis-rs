@@ -10,10 +10,17 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
   - per tenant, on by default: 1,000 req/s and bursts of 2,000 cluster-wide, enforced as each node's share, with per-tenant overrides;
   - per client address (100 req/s, 200 open streams), on with `CANALIS_TRUSTED_PROXIES`, which also makes `X-Forwarded-For` trusted from those proxies;
   - a configurable body limit, and a header-read timeout against slow clients.
+- **Webhook plugins:** `POST /hooks/<name>`, served by sandboxed WebAssembly plugins (Extism) from `CANALIS_PLUGINS_DIR`.
+  - The plugin verifies the provider's signature.
+  - Canalis deduplicates by the provider's event id, writes the event to the line before answering 200, and delivers it through Aquifer.
+  - Shopify comes from Inlet's own provider code (Inlet's `plugins/canalis`).
+  - See `docs/plugins.md`.
 - **Config file** (`CANALIS_CONFIG_PATH`, YAML, read at startup; environment variables override it).
 
 ### Changed
 
+- Rust 1.99.1, pinned in `rust-toolchain.toml`.
+- A job being handed off from the line is still found by its idempotency key, so a retry arriving meanwhile is a duplicate instead of a second copy.
 - `CANALIS_MAX_IN_FLIGHT` defaults to 5,000 per CPU instead of 5,000.
 - Canalis runs its own HTTP server loop (hyper) instead of `axum::serve`, for the header-read timeout and 10,000 concurrent HTTP/2 streams per connection.
 - **Behavior change:** a single tenant sending more than 1,000 req/s (sustained) is now limited. Set `CANALIS_TENANT_RPS=0` to turn it off, or give that tenant its own limit.

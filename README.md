@@ -129,6 +129,16 @@ How Canalis answers:
 
 All the settings are in [docs/configuration.md](docs/configuration.md#who-a-request-is-for).
 
+## Webhooks
+
+Canalis can receive providers' webhooks itself, with no Lambda needed. Each provider is a **plugin**, a sandboxed WebAssembly module that checks the provider's signature:
+1. Drop `shopify.wasm` into `/plugins` and set its secret and `CANALIS_HOOK_SHOPIFY_TARGET`.
+2. Point Shopify at `/hooks/shopify`.
+
+Canalis verifies each delivery, deduplicates retries by the provider's event id, and writes the event to its line before answering the provider. It then delivers through Aquifer, fairly per shop.
+
+Plugins can be written in TypeScript, Rust or Go. Inlet's providers build into them from the same code, so the two verify webhooks identically. See [docs/plugins.md](docs/plugins.md).
+
 ## Limits
 
 Volumetric floods are the edge's job: the cloud load balancer, or a CDN. Canalis enforces the limits only it can see:
