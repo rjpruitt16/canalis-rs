@@ -445,7 +445,7 @@ pub async fn handler(
                 state.metrics.inc("canalis_reroutes_total", &[]);
                 skip = Some(node.id);
             }
-            Err(Refused::Answered(response)) => return response,
+            Err(Refused::Answered(response)) => return *response,
             Err(Refused::Unreachable(err)) => {
                 tracing::warn!("{} is unreachable for a WebSocket session; removed it until it registers again: {err}", node.id);
                 let _ = assign::remove_instance(&mut state.valkey.clone(), &state.aqueduct, &node.id).await;
@@ -461,11 +461,10 @@ pub async fn handler(
 
 // The gateway's X-Aqueduct-User-ID, else the session id.
 fn routing_key(headers: &HeaderMap, query: &str) -> Option<String> {
-    if let Some(user) = headers.get("X-Aqueduct-User-ID").and_then(|v| v.to_str().ok()).map(str::trim) {
-        if !user.is_empty() {
+    if let Some(user) = headers.get("X-Aqueduct-User-ID").and_then(|v| v.to_str().ok()).map(str::trim)
+        && !user.is_empty() {
             return Some(user.to_string());
         }
-    }
     query_param(query, "session_id")
 }
 
@@ -495,7 +494,7 @@ type Upstream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsSt
 
 enum Refused {
     Draining,
-    Answered(Response),
+    Answered(Box<Response>),
     Unreachable(String),
 }
 
@@ -537,7 +536,7 @@ async fn connect(node: &assign::Node, query: &str, headers: &HeaderMap) -> Resul
                 .body(axum::body::Body::from(body.unwrap_or_default()))
                 .unwrap_or_else(|_| error(StatusCode::BAD_GATEWAY, "invalid instance response"));
             crate::relay_headers(&parts.headers, response.headers_mut());
-            Err(Refused::Answered(response))
+            Err(Refused::Answered(Box::new(response)))
         }
         Err(err) => Err(Refused::Unreachable(err.to_string())),
     }

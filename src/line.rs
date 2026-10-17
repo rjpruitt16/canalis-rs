@@ -941,7 +941,8 @@ mod tests {
 
         line.enqueue(&job("a", "1"), "/jobs", DEFAULT_POOL).unwrap();
         line.enqueue(&job("b", "1"), "/jobs", DEFAULT_POOL).unwrap();
-        assert_eq!(line.oldest_wait_seconds().unwrap(), Some(0));
+        // Whole seconds: the clock can tick over between enqueue and read.
+        assert!(matches!(line.oldest_wait_seconds().unwrap(), Some(0 | 1)));
 
         let taken = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
         assert!(taken.enqueued_at > 0);

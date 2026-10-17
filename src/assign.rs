@@ -450,13 +450,11 @@ pub async fn fleet(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Fle
 
 // instances(), reused for up to aq.member_cache_ttl.
 async fn cached_instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<Instance>> {
-    if !aq.member_cache_ttl.is_zero() {
-        if let Some((at, list)) = aq.member_cache.entry.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            if at.elapsed() < aq.member_cache_ttl {
+    if !aq.member_cache_ttl.is_zero()
+        && let Some((at, list)) = aq.member_cache.entry.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+            && at.elapsed() < aq.member_cache_ttl {
                 return Ok(list.clone());
             }
-        }
-    }
     let list = instances(valkey, aq).await?;
     if !aq.member_cache_ttl.is_zero() {
         *aq.member_cache.entry.lock().unwrap_or_else(|e| e.into_inner()) = Some((std::time::Instant::now(), list.clone()));
