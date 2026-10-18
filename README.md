@@ -1,4 +1,4 @@
-# Canalis — a sticky load balancer for pacing, fairness, and agentic burst
+# Canalis — Agentic burst Gateway
 
 **Scale a fleet of Aquifer/Spillway instances without breaking what makes either of them work.**
 
