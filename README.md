@@ -1,4 +1,4 @@
-# Canalis — Agentic burst Gateway
+# Canalis — Admission Control Gateway
 
 **Scale a fleet of Aquifer/Spillway instances without breaking what makes either of them work.**
 
