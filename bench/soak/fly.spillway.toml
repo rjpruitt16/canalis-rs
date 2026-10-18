@@ -1,0 +1,41 @@
+# The Spillway instance behind Canalis, in the same pool as the two
+# Aquifers: Canalis should treat them alike. Settings follow Spillway's own
+# soak target. Needs a SECRET_KEY_BASE secret. Private network only.
+app = "canalis-soak-spillway"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 30
+
+[build]
+  dockerfile = "Dockerfile.spillway"
+
+[env]
+  SOAK_DATA_DIR = "/data/run-1"
+  SPILLWAY_STORE_DIR = "/data/run-1/store"
+  SPILLWAY_REGISTRY_URL = "http://canalis-soak.internal:8080/register"
+  SPILLWAY_REGISTRY_INTERVAL_SECONDS = "5"
+  SOAK_VALKEY = "1"
+  SOAK_VALKEY_MAXMEMORY = "600mb"
+  SPILLWAY_VALKEY_URL = "redis://127.0.0.1:6379"
+  SPILLWAY_DEFAULT_RPS = "5000"
+  SPILLWAY_MEMORY_LIMIT_MB = "1200"
+  SPILLWAY_DB_MAX_BYTES = "3500000000"
+  SPILLWAY_WS_STREAM_MAX_EVENTS = "500"
+  SPILLWAY_WS_STREAM_TTL_SECONDS = "3600"
+  SPILLWAY_WS_MAX_CLIENT_CONNECTIONS = "3000"
+  SPILLWAY_WS_MAX_UPSTREAM_CONNECTIONS = "3000"
+  SPILLWAY_WS_MAX_WAITING_CONNECTIONS = "3000"
+  SPILLWAY_WS_CONNECT_RPS = "200"
+  SPILLWAY_WS_SLOW_START_RPS = "20"
+
+[[mounts]]
+  source = "spillway_data"
+  destination = "/data"
+  initial_size = "5gb"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4gb"

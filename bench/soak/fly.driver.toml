@@ -1,0 +1,48 @@
+# The soak driver: load through the two Canalis nodes, the misbehaving
+# target API and webhook receiver, the job ledger, the failure schedule,
+# and the Valkey the Canalis nodes share (6379, private network only).
+# Only the read-only status pages (8081) are public; posting a report
+# needs SOAK_REPORT_TOKEN (a secret).
+#
+# SOAK_NODES and SOAK_BACKENDS name machines by id, known only after the
+# targets are deployed: set them with fly secrets set (see README).
+app = "canalis-soak-driver"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.driver"
+
+[env]
+  SOAK_NAME = "Canalis"
+  SOAK_SELF = "http://canalis-soak-driver.internal:8080"
+  SOAK_DATA = "/data/run-1"
+
+# Arguments to the image's /driver entrypoint.
+# - Steady 500 jobs/s with the soak's hourly bursts and daily 04:00 UTC
+#   ramp, here to 6,000/s: two Canalis nodes, three instances.
+# - The target API and webhook receiver misbehave (-chaos) but the soak's
+#   own random kills are pushed out of the week: every failure is one from
+#   the schedule (scenarios.py), across all five nodes and Valkey.
+# - WebSocket sessions go through Canalis's /websocket.
+[processes]
+  app = "-valkey -rate=500 -burst-rate=2500 -ramp-steps=500,1000,1500,2000,3000,4000,5000,6000 -users=50 -kill-min=10000h -kill-max=10000h -reboot-every=0 -scenarios=120m:kill:b,79m:hold:q1+q2:5m,81m:hold:a:5m,113m:valkey:2m,151m:kill:q1,84m:drain:a,10m:drain:b,93m:freeze:b:20s,132m:kill:b,163m:kill:a,127m:kill:s,110m:kill:a,166m:kill:q2,99m:kill:b,115m:kill:q2,72m:hold:q1+q2+s:3m,72m:hold:a:5m,85m:valkey:2m,127m:hold:q1+q2:5m,104m:kill:b,94m:drain:a,10m:drain:b,118m:kill:s,107m:kill:q1,93m:kill:a,137m:freeze:b:20s,128m:kill:a,83m:drain:a,10m:drain:b,112m:kill:a,145m:hold:q1+q2:5m,87m:kill:s,119m:kill:q2,76m:kill:a,136m:hold:a:5m,145m:freeze:b:20s,127m:kill:q1,156m:valkey:2m,102m:kill:b,139m:kill:b,124m:kill:s,154m:freeze:b:20s,139m:kill:a,92m:hold:q1+q2:5m,101m:kill:a,126m:kill:q2,68m:kill:b,107m:kill:q1,81m:drain:a,10m:drain:b,77m:kill:b,72m:hold:q1+q2+s:3m,135m:hold:a:5m,78m:valkey:2m,155m:kill:q2,99m:freeze:b:20s,112m:kill:a,106m:valkey:2m,157m:kill:q1,164m:hold:q1+q2:5m,86m:kill:a,89m:kill:b,94m:hold:a:5m,94m:drain:a,10m:drain:b,119m:kill:s,129m:kill:b,107m:kill:b,144m:drain:a,10m:drain:b,151m:hold:a:5m,127m:kill:b,116m:hold:q1+q2:5m,102m:valkey:2m,101m:kill:q2,109m:freeze:b:20s,102m:kill:s,83m:kill:a,154m:kill:a,106m:hold:q1+q2+s:3m,76m:kill:q1,86m:kill:s,96m:hold:a:5m,105m:kill:b,107m:kill:q2,84m:kill:q1,153m:freeze:b:20s,167m:hold:q1+q2:5m,117m:kill:a,118m:drain:a,10m:drain:b,80m:kill:b,82m:kill:a,105m:valkey:2m"
+
+[http_service]
+  internal_port = 8081
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+[[mounts]]
+  source = "canalis_soak_driver_data"
+  destination = "/data"
+  initial_size = "5gb"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4gb"

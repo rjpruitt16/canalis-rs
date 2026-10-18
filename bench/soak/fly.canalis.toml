@@ -1,0 +1,31 @@
+# The two Canalis nodes under test: one app, two machines, each with its
+# own volume for its line. One app so that canalis-soak.internal names both:
+# instances register there (they take one URL), and Go's dialer moves on to
+# the next address when one node is down. The driver addresses each machine
+# by <machine id>.vm.canalis-soak.internal. Private network only.
+app = "canalis-soak"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = 35
+
+[build]
+  dockerfile = "Dockerfile.canalis"
+
+[env]
+  # The Valkey on the driver, so a scenario can take it down.
+  CANALIS_VALKEY_URL = "redis://canalis-soak-driver.internal:6379"
+  RUST_LOG = "warn,canalis_rs=info"
+  # The driver's 50 users each send about 10-60 jobs/s; the tenant limit
+  # (1,000/s by default) stays out of the way except in ramps' top steps.
+
+[[mounts]]
+  source = "canalis_soak_data"
+  destination = "/data"
+  initial_size = "3gb"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "performance-1x"
+  memory = "2gb"
