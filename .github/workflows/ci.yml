@@ -53,6 +53,12 @@ jobs:
           repository: rjpruitt16/spillway
           path: spillway
 
+      - name: Checkout inlet
+        uses: actions/checkout@v4
+        with:
+          repository: rjpruitt16/inlet
+          path: inlet
+
       - name: Pick the aqueduct-runner branch
         id: runner
         env:
@@ -126,6 +132,17 @@ jobs:
             --spillway-source=./spillway
             --canalis-source=./canalis-rs
             --websocket-dir=./aqueduct-runner/websocket
+
+      - name: Contract test -- Shopify webhooks through the plugin built from Inlet
+        uses: dagger/dagger-for-github@v8.4.1
+        with:
+          version: "0.21.8"
+          module: ./aqueduct-runner
+          call: >-
+            test-canalis-hooks
+            --inlet-source=./inlet
+            --aquifer-source=./aquifer
+            --canalis-source=./canalis-rs
 
       - name: Contract test -- Canalis and Aquifer claim users with the same Lua
         uses: dagger/dagger-for-github@v8.4.1
