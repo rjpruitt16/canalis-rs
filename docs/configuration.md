@@ -51,6 +51,16 @@ Each limit is a token bucket. Past it, the request gets `429` with `Retry-After`
 | `CANALIS_MAX_BODY_BYTES` | `2097152` (2 MiB) | Largest request body accepted (`413` past it). |
 | `CANALIS_HEADER_READ_TIMEOUT_SECONDS` | `10` | A client that doesn't finish sending request headers within this is disconnected (slowloris). |
 
+## Webhook plugins
+
+See [docs/plugins.md](plugins.md).
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `CANALIS_PLUGINS_DIR` | `plugins` (`/plugins` in the image) | Where `*.wasm` webhook plugins are loaded from at startup. Each is served at `POST /hooks/<name>`. A missing directory means no plugins. |
+| `CANALIS_PLUGIN_TIMEOUT_MS` | `1000` | How long a plugin's `verify` may run. |
+| `CANALIS_HOOK_<NAME>_TARGET` | unset | Where a plugin's verified events are delivered, unless the plugin names a target itself. `<NAME>` is the plugin's name, uppercased, with `-` as `_`. |
+
 ## Load shedding
 
 | Variable | Default | What it does |

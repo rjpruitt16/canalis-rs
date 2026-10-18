@@ -1,6 +1,7 @@
 mod assign;
 mod auth;
 mod config;
+mod hooks;
 mod l8;
 mod lifecycle;
 mod limits;
@@ -96,6 +97,8 @@ pub struct AppState {
     turns: Arc<Turns>,
     // Per-client and per-tenant limits (limits.rs).
     limits: Arc<limits::Limits>,
+    // Webhook plugins, by name (hooks.rs).
+    hooks: Arc<hooks::Hooks>,
 }
 
 /// The client's address (limits.rs), and whether the request came from
@@ -399,6 +402,7 @@ async fn main() {
         ownership: Arc::new(ownership::Ownership::from_env()),
         turns: Arc::new(Turns::from_env()),
         limits: Arc::new(limits::Limits::from_config(&file_config.limits).unwrap_or_else(|err| panic!("limits: {err}"))),
+        hooks: Arc::new(hooks::Hooks::from_env().unwrap_or_else(|err| panic!("{err}"))),
     };
 
     let room_handout = state.clone();
@@ -560,6 +564,12 @@ fn router(state: AppState) -> Router {
         .route("/jobs", post(jobs).layer(axum::middleware::from_fn_with_state(state.clone(), shed)).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
         .route("/jobs/{idempotent_key}", get(job_status).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
         .route("/websocket", get(websocket::handler).layer(axum::middleware::from_fn_with_state(state.clone(), limit)))
+        .route(
+            "/hooks/{plugin}",
+            post(hook)
+                .layer(axum::middleware::from_fn_with_state(state.clone(), shed))
+                .layer(axum::middleware::from_fn_with_state(state.clone(), limit)),
+        )
         .route("/metrics", get(metrics::handler))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), metrics::track))
         .layer(axum::extract::DefaultBodyLimit::max(env_u64("CANALIS_MAX_BODY_BYTES", 2 * 1024 * 1024) as usize))
@@ -1547,6 +1557,121 @@ pub(crate) fn auth_rejected(state: &AppState, rejection: &auth::Rejection) -> Re
     }
 }
 
+// A provider's webhook, through the plugin that recognizes it (hooks.rs).
+// Answered 200 only once the event is in the line on disk, so the
+// provider's retry is the only copy if this node fails before then; a
+// retry of an event already taken is answered 200 again and not queued
+// twice (the plugin name plus the provider's event id is the job's key).
+async fn hook(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    client: Option<axum::Extension<ClientIp>>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    use base64::Engine as _;
+    if state.lifecycle.is_draining() {
+        return lifecycle::draining_response();
+    }
+    let Some(plugin) = state.hooks.get(&name) else {
+        return json_response(StatusCode::NOT_FOUND, serde_json::json!({ "error": format!("no plugin named {name}") }));
+    };
+    let lowercase: HashMap<String, String> = headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_ascii_lowercase(), v.to_str().ok()?.to_string())))
+        .collect();
+    let checked = plugin.clone();
+    let (method, path, query) = (method.to_string(), uri.path().to_string(), uri.query().unwrap_or("").to_string());
+    let raw = body.clone();
+    let verdict = tokio::task::spawn_blocking(move || {
+        checked.verify(&hooks::VerifyInput {
+            method: &method,
+            path: &path,
+            query: &query,
+            headers: lowercase,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(&raw),
+            secrets: &checked.secrets,
+        })
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    let outcome = |o: &'static str| state.metrics.inc("canalis_hooks_total", &[("plugin", name.as_str()), ("outcome", o)]);
+    let verified = match verdict {
+        Ok(hooks::Verdict::Ok(verified)) => verified,
+        Ok(hooks::Verdict::Reject(rejected)) => {
+            outcome("rejected");
+            let status = StatusCode::from_u16(rejected.status).ok().filter(|s| s.is_client_error()).unwrap_or(StatusCode::UNAUTHORIZED);
+            return json_response(status, serde_json::json!({ "error": rejected.reason }));
+        }
+        Err(err) => {
+            outcome("failed");
+            tracing::error!("{err}");
+            // The provider retries a 5xx later.
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "the plugin couldn't check this webhook" }));
+        }
+    };
+    let Some(target) = verified.target.clone().or_else(|| plugin.default_target.clone()) else {
+        outcome("failed");
+        tracing::error!("plugin {name} verified an event but there's nowhere to send it: set CANALIS_HOOK_{}_TARGET", name.to_ascii_uppercase().replace('-', "_"));
+        return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "no target configured for this plugin" }));
+    };
+    let tenant = verified.tenant.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| format!("hook:{name}"));
+    let pool = assign::DEFAULT_POOL.to_string();
+    if !client.is_some_and(|c| c.peer)
+        && let Err(limited) = state.limits.check_tenant(&assign::Tenant::new(tenant.as_str(), pool.as_str())) {
+            outcome("limited");
+            return limited_response(&state, &limited);
+        }
+    let mut forward_headers = verified.headers.clone();
+    forward_headers
+        .entry("content-type".into())
+        .or_insert_with(|| lowercase_header(&headers, "content-type").unwrap_or_else(|| "application/json".into()));
+    if let Some(event_type) = &verified.event_type {
+        forward_headers.insert("x-canalis-event-type".into(), event_type.clone());
+    }
+    let job = JobRequest {
+        user_id: tenant,
+        idempotent_key: format!("{name}:{}", verified.event_id),
+        url: target,
+        method: "POST".into(),
+        headers: forward_headers,
+        body: Some(String::from_utf8_lossy(&body).into_owned()),
+        webhook_url: None,
+    };
+    match on_line(&state.line, move |l| l.enqueue(&job, "/jobs", &pool)).await {
+        Ok(line::Enqueued::Queued { .. }) => {
+            outcome("accepted");
+            // Hand it out now rather than at the next sweep.
+            let drain_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(err) = try_drain_one(drain_state).await {
+                    tracing::warn!("couldn't hand a webhook event out yet: {err}");
+                }
+            });
+            json_response(StatusCode::OK, serde_json::json!({ "status": "accepted", "event_id": verified.event_id }))
+        }
+        Ok(line::Enqueued::AlreadyQueued { .. } | line::Enqueued::AlreadyDone(_)) => {
+            outcome("duplicate");
+            json_response(StatusCode::OK, serde_json::json!({ "status": "duplicate", "event_id": verified.event_id }))
+        }
+        Err(line::LineError::Full { reason, limit }) => {
+            outcome("full");
+            line_full_response(reason, limit, state.line.limits().retry_after_seconds)
+        }
+        Err(err) => {
+            outcome("failed");
+            tracing::error!("failed to queue a {name} webhook: {err}");
+            json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" }))
+        }
+    }
+}
+
+fn lowercase_header(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+}
+
 /// The pool a request is for: X-Aqueduct-Pool (or, where given, a `pool`
 /// query parameter), else the default pool. None for a malformed name
 /// (answer with bad_pool_response).
@@ -2326,6 +2451,7 @@ mod tests {
             ownership: Arc::new(ownership::tests::node("test-node", None)),
             turns: Arc::new(Turns::new(Duration::ZERO)),
             limits: Arc::new(limits::Limits::none()),
+            hooks: Arc::default(),
         };
         (state, dir)
     }
@@ -3772,6 +3898,7 @@ mod tests {
             ownership: Arc::new(ownership::tests::node("test-node", None)),
             turns: Arc::new(Turns::new(Duration::ZERO)),
             limits: Arc::new(limits::Limits::none()),
+            hooks: Arc::default(),
         };
         let cleanup_state = state.clone();
         let mock_addr = start_plain_ok_mock().await;

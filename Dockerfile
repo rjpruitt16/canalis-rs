@@ -18,8 +18,11 @@ ENV CANALIS_L8_KEY_PATH=/data/.l8-key
 # Created here, not left to VOLUME: plain `docker run` makes the mount
 # point, but not every runtime does (Dagger, which the contract tests use,
 # doesn't), and the line can't open in a directory that isn't there.
-RUN mkdir -p /data
+RUN mkdir -p /data /plugins
 VOLUME /data
+# Webhook plugins (*.wasm): mount a directory here or COPY them in a
+# derived image. See docs/plugins.md.
+ENV CANALIS_PLUGINS_DIR=/plugins
 EXPOSE 8080
 # Every caller waiting in line holds a connection, so the default limit
 # of open files (often 1,024 or 10,240) is the first ceiling a busy

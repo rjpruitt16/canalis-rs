@@ -26,11 +26,12 @@ use std::time::{Duration, Instant};
 
 const BUCKETS: [f64; 11] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-const COUNTERS: [(&str, &str); 10] = [
+const COUNTERS: [(&str, &str); 11] = [
     ("canalis_http_responses_total", "Responses sent, by route and status."),
     ("canalis_line_rejected_total", "Jobs turned away because the line was at a limit, by limit."),
     ("canalis_reroutes_total", "Requests and sessions re-routed because their instance was draining or unreachable."),
     ("canalis_scale_signals_total", "canalis_scale_up webhooks sent."),
+    ("canalis_hooks_total", "Webhooks received through plugins, by plugin and outcome (accepted, duplicate, rejected, limited, full, failed)."),
     ("canalis_limited_total", "Requests refused by a per-client or per-tenant limit, by limit (ip_rate, ip_streams, tenant_rate)."),
     ("canalis_turns_given_up_total", "Slots handed back because their tenant held one past CANALIS_MAX_HOLD_SECONDS while others waited."),
     ("canalis_line_forwarded_total", "Requests passed on to the Canalis node holding their tenant's line."),

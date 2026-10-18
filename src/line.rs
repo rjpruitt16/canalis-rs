@@ -291,7 +291,18 @@ impl Line {
     /// outcome recorded. Until then a restart puts it back in line.
     pub fn finish(&self, seq: u64) -> Result<(), LineError> {
         let txn = self.db.begin_write()?;
-        txn.open_table(LEASED)?.remove(seq)?;
+        {
+            let mut leased = txn.open_table(LEASED)?;
+            let job = leased.remove(seq)?.map(|v| v.value().to_vec());
+            if let Some(stored) = job.and_then(|payload| serde_json::from_slice::<StoredJob>(&payload).ok()) {
+                let tenant = Tenant::new(stored.job.user_id.as_str(), stored.pool.as_str()).key();
+                let mut queued_keys = txn.open_table(QUEUED_KEYS)?;
+                let key = (tenant.as_str(), stored.job.idempotent_key.as_str());
+                if queued_keys.get(key)?.is_some_and(|v| v.value() == seq) {
+                    queued_keys.remove(key)?;
+                }
+            }
+        }
         txn.commit()?;
         Ok(())
     }
@@ -679,9 +690,15 @@ fn ahead_in_pool(order: &impl ReadableTable<u64, &'static str>, seq: u64, pool: 
     Ok(ahead)
 }
 
+// A job taken out of line stays known by its idempotency key until it's
+// finished, so a retry that arrives while it's being handed off (a
+// provider re-sending a webhook, a client re-submitting) is a duplicate,
+// not a second copy.
 fn lease(txn: &redb::WriteTransaction, seq: u64, job: Option<&StoredJob>) -> Result<(), LineError> {
     if let Some(job) = job {
         txn.open_table(LEASED)?.insert(seq, serde_json::to_vec(job)?.as_slice())?;
+        let tenant = Tenant::new(job.job.user_id.as_str(), job.pool.as_str()).key();
+        txn.open_table(QUEUED_KEYS)?.insert((tenant.as_str(), job.job.idempotent_key.as_str()), seq)?;
     }
     Ok(())
 }
@@ -1089,5 +1106,33 @@ mod tests {
         let line = Line::open(&path, LineLimits::default()).unwrap();
         assert!(matches!(line.enqueue(&job("d", "1"), "/jobs", "gpu").unwrap(), Enqueued::Queued { ahead: 2, .. }), "b, plus a restored from its lease");
         assert!(matches!(line.enqueue(&job("e", "1"), "/jobs", DEFAULT_POOL).unwrap(), Enqueued::Queued { ahead: 1, .. }));
+    }
+
+    #[test]
+    fn a_retry_while_its_job_is_being_handed_off_is_a_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = Line::open(dir.path().join("line.redb"), LineLimits::default()).unwrap();
+        line.enqueue(&job("shop", "wh-1"), "/jobs", DEFAULT_POOL).unwrap();
+        let taken = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
+
+        let retry = line.enqueue(&job("shop", "wh-1"), "/jobs", DEFAULT_POOL).unwrap();
+        assert!(matches!(retry, Enqueued::AlreadyQueued { .. }), "in flight: {retry:?}");
+        assert_eq!(line.len().unwrap(), 0, "not queued a second time");
+
+        let result = CachedResult { status: 200, content_type: String::new(), body: String::new(), ..Default::default() };
+        line.store_result("shop", "wh-1", &result).unwrap();
+        line.finish(taken.seq).unwrap();
+        assert!(matches!(line.enqueue(&job("shop", "wh-1"), "/jobs", DEFAULT_POOL).unwrap(), Enqueued::AlreadyDone(_)), "done");
+    }
+
+    #[test]
+    fn a_requeued_job_is_still_found_by_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = Line::open(dir.path().join("line.redb"), LineLimits::default()).unwrap();
+        line.enqueue(&job("a", "k"), "/jobs", DEFAULT_POOL).unwrap();
+        let taken = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
+        line.requeue(&taken).unwrap();
+        assert!(matches!(line.enqueue(&job("a", "k"), "/jobs", DEFAULT_POOL).unwrap(), Enqueued::AlreadyQueued { .. }));
+        assert_eq!(line.len().unwrap(), 1);
     }
 }
