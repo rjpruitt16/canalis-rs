@@ -31,6 +31,10 @@ Everything you need is on the soak driver's read-only status pages at https://{{
 
 Fetch with curl. Never send anything to these pages except your one report.
 
+Two things that are easy to misread:
+- The soak supervisor labels every process it runs as "aquifer" in its log lines ("supervisor: aquifer exited", "started aquifer pid"). On nodes `a` and `b` that process is Canalis, so a panic in `src/main.rs` there is Canalis's. Only `q1` runs Aquifer.
+- The run started at 2026-10-21T01:20:16Z. The Canalis nodes were deployed a few minutes before the driver that runs their Valkey. They panicked and restarted until Valkey existed: about 16 restarts on `a` and 14 on `b` before the run began. Treat each node's restart count at the run's start as its baseline, and look only at increases after it. Canalis panicking at startup while Valkey is unreachable is already open as canalis-rs#44. Mention new occurrences there, for example after a kill during a Valkey outage, but don't open another issue for it.
+
 How to judge it:
 
 1. Lost jobs are the most important number. `ledger.counters.lost` counts jobs that disappeared without finishing, and `lost_in_gateway_line` counts jobs Canalis put in its line that were never seen again. Both should be 0, and any increase since your last report is a problem.
