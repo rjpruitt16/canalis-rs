@@ -71,7 +71,7 @@ See [docs/plugins.md](plugins.md).
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `CANALIS_VALKEY_URL` | `redis://127.0.0.1:6379` | Valkey (or Redis) holding the shared assignment table. |
+| `CANALIS_VALKEY_URL` | `redis://127.0.0.1:6379` | Valkey (or Redis) holding the shared assignment table. If it can't be reached at startup, Canalis waits for it: `GET /health` answers `{"status":"starting"}`, and everything else (`GET /ready` included) answers `503` with `Retry-After: 5`. |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Key prefix for the pool. Use the same value as Aquifer's cluster mode so they share one pool. |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' expected ping interval. A registration expires after 3 missed pings. |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long a user's assignment to an instance survives without traffic. |
@@ -96,6 +96,9 @@ See [docs/plugins.md](plugins.md).
 | `CANALIS_DRAIN_RPS` | `100` | How fast one tenant's waiting jobs are handed to their instance once it has room, until the instance says otherwise with `X-Aqueduct-Rps`. |
 | `CANALIS_DRAIN_MAX_CONCURRENT` | `10` | How many of one tenant's waiting jobs are handed over at once (at most 50), until the instance says otherwise with `X-Aqueduct-Max-Concurrent`. |
 | `CANALIS_INSTANCE_RETRY_BASE_DELAY_MS` | `200` | Backoff between the 3 attempts to reach an instance, doubling each time. |
+| `CANALIS_INSTANCE_CONNECT_TIMEOUT_SECONDS` | `5` | How long Canalis waits to connect to an instance. |
+| `CANALIS_INSTANCE_READ_TIMEOUT_SECONDS` | `300` | How long a connection to an instance may go quiet before Canalis gives up on it. Long enough for a slow, unstreamed answer behind `/proxy`; Aquifer's job streams send a keepalive every 30 s. |
+| `CANALIS_HANDOFF_TIMEOUT_SECONDS` | `30` | Overall limit on handing a job to an instance's `POST /jobs`, which answers as soon as the job is stored. A hand-off that runs out goes back in line. |
 
 ## WebSockets
 

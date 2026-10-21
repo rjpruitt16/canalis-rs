@@ -25,6 +25,15 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 - Canalis runs its own HTTP server loop (hyper) instead of `axum::serve`, for the header-read timeout and 10,000 concurrent HTTP/2 streams per connection.
 - **Behavior change:** a single tenant sending more than 1,000 req/s (sustained) is now limited. Set `CANALIS_TENANT_RPS=0` to turn it off, or give that tenant its own limit.
 
+### Fixed
+
+Found by the first Canalis soak test:
+
+- **Jobs were lost from the line when an instance couldn't take them.** A `/jobs` hand-off answered `429`, `408` or `5xx`, or with no answer at all, had that error cached as the job's result, and the job left the line undelivered. Now the job goes back in line for a later try (the instance deduplicates retries by idempotency key). The instance stays in rotation, and the tenant keeps its line. `/proxy` hand-offs are unchanged: their answer is the call's own result, and it goes to the caller.
+- **Calls to instances had no timeouts.** An instance that stopped answering could hold a tenant's drain forever. There's now a connect timeout, an idle timeout, and an overall limit on `/jobs` hand-offs (see `docs/configuration.md`).
+- **A webhook could be lost when a caller hung up mid-relay.** When Canalis hands a job from its line to Aquifer while the caller listens, it relays Aquifer's job stream. If the caller hung up, Canalis kept the stream until its next event, and Aquifer counted the result as delivered and sent no webhook. Canalis now lets go of the stream as soon as its caller leaves, so the webhook goes out.
+- **Canalis crash-looped when Valkey was unreachable at startup** ([#44](https://github.com/rjpruitt16/canalis-rs/issues/44)). It now waits for Valkey, answering `/health` as starting and everything else with `503` + `Retry-After`.
+
 ## [0.2.0] - 2026-10-16
 
 Pools, authentication, several Canalis nodes, and the fixes from two rounds of Fly benchmarks ([BENCHMARKS.md](BENCHMARKS.md)). New settings are in [docs/configuration.md](docs/configuration.md); existing deployments keep working unchanged.

@@ -365,9 +365,10 @@ async fn main() {
     let valkey_url =
         std::env::var("CANALIS_VALKEY_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
     let client = redis::Client::open(valkey_url).expect("invalid Valkey connection URL");
-    let valkey: Valkey = redis::aio::ConnectionManager::new(client)
-        .await
-        .expect("failed to connect to Valkey");
+    // Listen first, so a Canalis that can't reach Valkey yet is up and
+    // says so (unready) instead of crash-looping.
+    let listener = bind_listener().await;
+    let (valkey, listener) = connect_valkey(client, listener).await;
 
     let line_path =
         std::env::var("CANALIS_LINE_PATH").unwrap_or_else(|_| "canalis-line.redb".into());
@@ -383,7 +384,7 @@ async fn main() {
     let file_config = config::FileConfig::from_env().unwrap_or_else(|err| panic!("{err}"));
     let state = AppState {
         valkey,
-        http: reqwest::Client::new(),
+        http: instance_client(),
         peers: Arc::new(PeerClients::from_env()),
         line: Arc::new(line),
         draining: Arc::default(),
@@ -464,8 +465,6 @@ async fn main() {
 
     let state_for_shutdown = state.clone();
     let app = router(state);
-
-    let listener = bind_listener().await;
 
     tracing::info!("canalis-rs listening on {}", listener.local_addr().unwrap());
 
@@ -758,6 +757,57 @@ fn instance_address(ip: std::net::IpAddr, port: &str) -> Option<String> {
 // CANALIS_LISTEN_ADDR, default [::]:8080 -- every IPv6 and (dual-stack, the
 // Linux default) IPv4 address, so private IPv6 networks such as Fly's reach
 // it. Falls back to 0.0.0.0:8080 where IPv6 is switched off.
+// Connects to Valkey, waiting as long as it takes. Until it answers, the
+// port is served by a stand-in: GET /health says Canalis is up but
+// starting, and everything else (GET /ready included) answers 503 with
+// Retry-After, so load balancers and callers back off rather than see
+// connection refused or a crash loop. Returns the connection and the
+// listener, for the real server to take over.
+async fn connect_valkey(client: redis::Client, listener: tokio::net::TcpListener) -> (Valkey, tokio::net::TcpListener) {
+    match redis::aio::ConnectionManager::new(client.clone()).await {
+        Ok(valkey) => return (valkey, listener),
+        Err(err) => tracing::warn!("can't reach Valkey yet ({err}); serving 503 until it answers"),
+    }
+    let std_listener = listener.into_std().expect("listener into std");
+    let stand_in = std_listener.try_clone().expect("clone listener for the stand-in");
+    let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener from std");
+    let stand_in = tokio::net::TcpListener::from_std(stand_in).expect("stand-in listener from std");
+    let (connected, stop_stand_in) = tokio::sync::oneshot::channel::<()>();
+    let stand_in = tokio::spawn(server::serve(stand_in, starting_router(), server::ServerConfig::from_env(), async {
+        let _ = stop_stand_in.await;
+    }));
+    let mut delay = Duration::from_millis(500);
+    let valkey = loop {
+        tokio::time::sleep(delay).await;
+        match redis::aio::ConnectionManager::new(client.clone()).await {
+            Ok(valkey) => break valkey,
+            Err(err) => {
+                tracing::warn!("still can't reach Valkey: {err}");
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    };
+    tracing::info!("Valkey answered; starting");
+    let _ = connected.send(());
+    let _ = stand_in.await;
+    (valkey, listener)
+}
+
+fn starting_router() -> Router {
+    async fn starting_health() -> Response {
+        json_response(StatusCode::OK, serde_json::json!({ "status": "starting", "valkey": "down" }))
+    }
+    async fn not_yet() -> Response {
+        let mut response = json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({ "error": "starting: waiting for Valkey" }),
+        );
+        response.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("5"));
+        response
+    }
+    Router::new().route("/health", get(starting_health)).fallback(not_yet)
+}
+
 async fn bind_listener() -> tokio::net::TcpListener {
     if let Ok(addr) = std::env::var("CANALIS_LISTEN_ADDR") {
         return tokio::net::TcpListener::bind(addr.trim())
@@ -1053,12 +1103,17 @@ async fn claim_next(
         let guard = DrainGuard { draining: state.draining.clone(), user_id: tenant.key() };
 
         match assign::assign(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http).await {
-            Ok(assign::AssignOutcome::Assigned(node)) => return Ok(Some((queued, node, guard))),
+            Ok(assign::AssignOutcome::Assigned(node)) => {
+                tracing::debug!(tenant = %tenant.user, pool = %tenant.pool, node = %node.id, "claimed a slot to drain");
+                return Ok(Some((queued, node, guard)));
+            }
             Ok(assign::AssignOutcome::PoolExhausted) => {
+                tracing::debug!(tenant = %tenant.user, pool = %tenant.pool, "no instance free in pool; line waits");
                 on_line(&state.line, move |l| l.requeue(&queued)).await?;
                 blocked.insert(tenant.pool);
             }
             Err(err) => {
+                tracing::debug!(tenant = %tenant.user, "claiming a slot failed: {err}");
                 on_line(&state.line, move |l| l.requeue(&queued)).await?;
                 return Err(err.into());
             }
@@ -1096,6 +1151,11 @@ async fn sweep_once(mut state: AppState) -> Result<usize, BoxError> {
         });
         started += 1;
     }
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let waiting = on_line(&state.line, |l| l.len()).await.unwrap_or(0);
+        let draining = state.draining.lock().map(|d| d.len()).unwrap_or(0);
+        tracing::debug!(started, waiting, draining, blocked_pools = ?blocked, "line sweep");
+    }
     Ok(started)
 }
 
@@ -1128,6 +1188,8 @@ async fn drain_tenant_backlog(
 ) -> Result<(), BoxError> {
     let tenant = assign::Tenant::new(first.job.user_id.as_str(), first.pool.as_str());
     let user_id = tenant.key();
+    tracing::debug!(tenant = %tenant.user, node = %node.id, "drain started");
+    let mut handed_over = 0u64;
     let mut pending = Some(first);
     let (mut rps, mut max_concurrent) = default_drain_pace();
     let mut last_dispatch_at: Option<Instant> = None;
@@ -1135,12 +1197,16 @@ async fn drain_tenant_backlog(
     // Set once the instance says it's draining: stop taking more jobs out
     // of line, let what's in flight finish, then hand the tenant back.
     let mut node_draining = false;
+    // Set once the instance couldn't take a job right now (busy, an error,
+    // no answer): the same, but the instance stays in rotation and the
+    // tenant's line stays theirs; a later sweep tries again.
+    let mut paused = false;
     // Every request through Canalis renews the user's assignment; a long
     // drain does too, so it can't idle out from under the drain.
     let mut last_renewed = Instant::now();
 
     loop {
-        while !node_draining && !state.lifecycle.is_draining() && in_flight.len() < max_concurrent {
+        while !node_draining && !paused && !state.lifecycle.is_draining() && in_flight.len() < max_concurrent {
             let job = match pending.take() {
                 Some(job) => job,
                 None => {
@@ -1165,6 +1231,7 @@ async fn drain_tenant_backlog(
                 last_renewed = Instant::now();
             }
 
+            handed_over += 1;
             in_flight.spawn(dispatch_drained_job(
                 state.clone(),
                 node.clone(),
@@ -1180,7 +1247,11 @@ async fn drain_tenant_backlog(
 
         let outcome = joined.map_err(|err| format!("drain dispatch task panicked: {err}"))?;
         if let Some(job) = outcome.back_in_line {
-            node_draining = true;
+            if outcome.instance_draining {
+                node_draining = true;
+            } else {
+                paused = true;
+            }
             on_line(&state.line, move |l| l.requeue(&job)).await?;
         }
         let signal = outcome.pacing;
@@ -1193,6 +1264,7 @@ async fn drain_tenant_backlog(
         }
     }
 
+    tracing::debug!(tenant = %tenant.user, node = %node.id, handed_over, node_draining, paused, "drain finished");
     if node_draining {
         // The rest of this tenant's line stays where it is; marking the
         // node draining and releasing the assignment means the next claim
@@ -1200,6 +1272,11 @@ async fn drain_tenant_backlog(
         assign::mark_draining(&mut state.valkey, &state.aqueduct, &node.id).await?;
         assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
         tracing::info!("{} is draining; {user_id}'s remaining jobs stay in line for another node", node.id);
+    } else if paused {
+        // The instance couldn't take a job just now. Give the slot back so
+        // the next sweep can claim again (to this instance or another), but
+        // keep the tenant's line: their jobs are still here.
+        assign::release(&mut state.valkey, &state.aqueduct, &tenant, assign::Traffic::Http, &node.id).await?;
     } else {
         // Their backlog is done: give the slot back now rather than after
         // the assignment idles out (idle seconds plus two heartbeats), so
@@ -1214,11 +1291,32 @@ async fn drain_tenant_backlog(
 }
 
 // What one drained dispatch hands back to drain_tenant_backlog: the
-// instance's pacing signal, plus the job itself if the instance turned out
-// to be draining and it has to go back in line instead of being finished.
+// instance's pacing signal, plus the job itself if the instance never
+// really took it and it has to go back in line instead of being finished.
+// instance_draining says why: the instance is going away (stop handing it
+// work), or it only couldn't take this one right now (429, 5xx, a
+// timeout), so try again on a later sweep.
 struct DispatchOutcome {
     pacing: PacingSignal,
     back_in_line: Option<line::QueuedJob>,
+    instance_draining: bool,
+}
+
+impl DispatchOutcome {
+    fn handed_over(pacing: PacingSignal) -> Self {
+        Self { pacing, back_in_line: None, instance_draining: false }
+    }
+}
+
+// An answer to a /jobs hand-off that means the instance didn't store the
+// job: it's busy (429), timed out (408), or failed (5xx). The job goes back
+// in line rather than having the error cached as its result; retrying is
+// safe, since the instance deduplicates by the job's idempotency key. A
+// /proxy hand-off is different: its answer is the call's own result (the
+// target API's, or the instance refusing a synchronous call), so it goes to
+// the caller, and re-sending could repeat a call that isn't safe to repeat.
+fn instance_did_not_take_it(path: &str, status: u16) -> bool {
+    path == "/jobs" && (status == 429 || status == 408 || status >= 500)
 }
 
 // One job's worth of the drain, run as its own task so up to
@@ -1242,13 +1340,19 @@ async fn dispatch_drained_job(
     // caller gets the job accepted on the node.
     let target_url = format!("{}{}", node.base_url, queued.path);
     let follows_job_stream = queued.path == "/jobs";
-    let response = http.post(&target_url).json(job).send().await;
+    let response = with_handoff_timeout(http.post(&target_url), &queued.path).json(job).send().await;
 
     let mut resp = match response {
         Ok(resp) if node_is_draining(resp.status().as_u16(), resp.headers()) => {
             // Back in line; the caller (if any) stays registered and keeps
             // getting position updates until another node takes the job.
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: true };
+        }
+        Ok(resp) if instance_did_not_take_it(&queued.path, resp.status().as_u16()) => {
+            let status = resp.status().as_u16();
+            tracing::debug!(node = %addr, status, tenant = %job.user_id, key = %job.idempotent_key, "instance didn't take the job; back in line");
+            state.metrics.inc("canalis_handoffs_retried_total", &[("reason", if status == 429 { "busy" } else { "error" })]);
+            return DispatchOutcome { pacing: PacingSignal::from_headers(resp.headers()), back_in_line: Some(queued), instance_draining: false };
         }
         Ok(resp) => resp,
         // Never reached the instance: it's gone. Take it out of rotation
@@ -1260,8 +1364,19 @@ async fn dispatch_drained_job(
                 tracing::error!("failed to remove unreachable instance {addr}: {err}");
             }
             state.metrics.inc("canalis_reroutes_total", &[]);
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued) };
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: true };
         }
+        // Reached the instance but got no answer (a timeout, a dropped
+        // connection): it may or may not have the job. A /jobs hand-off
+        // goes back in line; the instance deduplicates the retry by its
+        // idempotency key.
+        Err(err) if queued.path == "/jobs" => {
+            tracing::warn!("no answer from {addr} for a drained job; back in line: {err}");
+            state.metrics.inc("canalis_handoffs_retried_total", &[("reason", "no_answer")]);
+            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: false };
+        }
+        // A /proxy call may already have reached the target API: don't
+        // send it again. The caller hears it failed.
         Err(err) => {
             tracing::error!("failed to dispatch drained job to {addr}: {err}");
             let cached = line::CachedResult {
@@ -1273,7 +1388,7 @@ async fn dispatch_drained_job(
             };
             let waiter = take_waiter(waiters, job, &queued.pool);
             finish_drained_job(line, &queued, cached, waiter, false).await;
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: None };
+            return DispatchOutcome::handed_over(PacingSignal::none());
         }
     };
 
@@ -1282,6 +1397,7 @@ async fn dispatch_drained_job(
     observe_schema_hash(&state, &job.url, resp.headers());
     let stored_headers = headers_to_store(resp.headers());
     let status = resp.status().as_u16();
+    tracing::debug!(node = %addr, status, tenant = %job.user_id, key = %job.idempotent_key, "hand-off answered");
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -1366,7 +1482,7 @@ async fn dispatch_drained_job(
     }
 
     finish_drained_job(line, &queued, cached, waiter, already_streamed).await;
-    DispatchOutcome { pacing, back_in_line: None }
+    DispatchOutcome::handed_over(pacing)
 }
 
 // Splices the node's GET /jobs/{id}/stream into a waiting caller's stream.
@@ -1391,7 +1507,20 @@ async fn follow_job_stream(
         }
     };
     loop {
-        match resp.chunk().await {
+        // Watch the caller as well as the node. When the caller hangs up,
+        // let go of the node's stream at once: dropping it closes the
+        // subscription, so the node sees no one listening when the job
+        // finishes and sends the job's webhook instead. Holding on until
+        // the next event would swallow the result, since the node counts
+        // a result streamed to us as delivered.
+        let chunk = tokio::select! {
+            chunk = resp.chunk() => chunk,
+            () = tx.closed() => {
+                tracing::debug!("caller left; let go of {url} so its webhook goes out");
+                return true;
+            }
+        };
+        match chunk {
             Ok(Some(chunk)) => {
                 if tx.send(chunk).await.is_err() {
                     return true; // caller hung up; nothing left to tell them
@@ -1746,6 +1875,32 @@ async fn forward(state: AppState, job: JobRequest, target_path: &str, pool: &str
     forward_in_pool(state, job, target_path, pool, origin, &RetryConfig::from_env()).await
 }
 
+// Canalis's client for instances. Without timeouts, a hand-off to an
+// instance that stops answering holds its tenant's drain forever, and
+// with it every job behind them in line. A connection gets 5 s
+// (CANALIS_INSTANCE_CONNECT_TIMEOUT_SECONDS) and may go quiet for up to
+// 300 s (CANALIS_INSTANCE_READ_TIMEOUT_SECONDS): long enough for a slow,
+// unstreamed answer behind /proxy, and Aquifer's job streams send a
+// keepalive every 30 s.
+fn instance_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(env_u64("CANALIS_INSTANCE_CONNECT_TIMEOUT_SECONDS", 5).max(1)))
+        .read_timeout(Duration::from_secs(env_u64("CANALIS_INSTANCE_READ_TIMEOUT_SECONDS", 300).max(1)))
+        .build()
+        .unwrap_or_default()
+}
+
+// An instance answers POST /jobs as soon as the job is stored, so a
+// /jobs hand-off gets 30 s in all (CANALIS_HANDOFF_TIMEOUT_SECONDS).
+// /proxy has no overall limit: it waits for the target API's own answer.
+fn with_handoff_timeout(request: reqwest::RequestBuilder, path: &str) -> reqwest::RequestBuilder {
+    if path == "/jobs" {
+        request.timeout(Duration::from_secs(env_u64("CANALIS_HANDOFF_TIMEOUT_SECONDS", 30).max(1)))
+    } else {
+        request
+    }
+}
+
 pub struct PeerClients {
     clients: Vec<reqwest::Client>,
     next: AtomicU64,
@@ -2089,7 +2244,7 @@ async fn forward_attempt(
         if attempt > 0 {
             tokio::time::sleep(config.instance_retry_base_delay * 2u32.pow(attempt - 1)).await;
         }
-        match state.http.post(&target_url).json(&job).send().await {
+        match with_handoff_timeout(state.http.post(&target_url), target_path).json(&job).send().await {
             Ok(resp) => {
                 upstream = Some(resp);
                 break;
@@ -3350,6 +3505,192 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr.to_string()
+    }
+
+    // An instance whose POST /jobs answers each status in turn (then 201
+    // for good), counting the attempts.
+    async fn start_flaky_jobs_mock(answers: Vec<u16>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/jobs",
+                post(|AxumState((answers, calls)): AxumState<(Arc<Vec<u16>>, Arc<std::sync::atomic::AtomicUsize>)>| async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    let status = answers.get(n).copied().unwrap_or(201);
+                    let body = if status == 201 { r#"{"job_id":"j1","status":"queued"}"# } else { r#"{"error":"not now"}"# };
+                    Response::builder()
+                        .status(status)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .expect("a hardcoded response should always build")
+                }),
+            )
+            .with_state((Arc::new(answers), calls.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr.to_string(), calls)
+    }
+
+    // The soak lost thousands of jobs this way: an instance that answered
+    // 429 or 5xx had that answer cached as the job's result, and the job
+    // left the line undelivered. Now the job waits for a later sweep, and
+    // the instance stays in rotation.
+    #[tokio::test]
+    async fn a_busy_or_failing_instance_doesnt_cost_the_job() {
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-flaky");
+        let job = job_for(&user_id);
+        let (mock_addr, calls) = start_flaky_jobs_mock(vec![429, 503, 500]).await;
+        register_node(&state, &mock_addr).await;
+        state.line.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
+
+        for answer in [429, 503, 500] {
+            assert!(try_drain_one(state.clone()).await.unwrap(), "the job should be claimable again after a {answer}");
+            assert_eq!(state.line.len().unwrap(), 1, "a {answer} puts the job back in line");
+            assert!(state.line.get_result(&user_id, &job.idempotent_key).unwrap().is_none(), "a {answer} isn't the job's result");
+            let member = assign::member(&mut state.valkey.clone(), &state.aqueduct, &mock_addr).await.unwrap();
+            assert!(member.is_some_and(|m| m.is_active()), "a {answer} doesn't take the instance out of rotation");
+        }
+        assert!(try_drain_one(state.clone()).await.unwrap());
+        let result = state.line.get_result(&user_id, &job.idempotent_key).unwrap();
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(state.line.len().unwrap(), 0);
+        assert_eq!(result.expect("the 201 is the job's result").status, 201);
+    }
+
+    // A hand-off that reaches the instance but gets no answer (here the
+    // instance reads the request and drops the connection, as one dying
+    // mid-request would) goes back in line, instead of being cached as a
+    // 502 against the job's key.
+    #[tokio::test]
+    async fn a_hand_off_with_no_answer_goes_back_in_line() {
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                drop(socket);
+            }
+        });
+        register_node(&state, &mock_addr).await;
+        let user_id = unique("user-silent");
+        let job = job_for(&user_id);
+        state.line.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
+
+        let drained = tokio::time::timeout(Duration::from_secs(10), try_drain_one(state.clone())).await;
+        let result = state.line.get_result(&user_id, &job.idempotent_key).unwrap();
+        let member = assign::member(&mut state.valkey.clone(), &state.aqueduct, &mock_addr).await.unwrap();
+        cleanup(&cleanup_state).await;
+
+        assert!(drained.expect("the drain must not hang").unwrap());
+        assert_eq!(state.line.len().unwrap(), 1, "the job waits for another try");
+        assert!(result.is_none(), "no 502 cached against the job's key");
+        assert!(member.is_some_and(|m| m.is_active()), "one dropped request doesn't take the instance out of rotation");
+    }
+
+    // Aquifer counts a result streamed to a subscriber as delivered and
+    // sends no webhook. So when the caller hangs up mid-relay, Canalis must
+    // let go of the node's stream at once; holding it until the next event
+    // would swallow the result. The mock notices when its stream is closed.
+    #[tokio::test]
+    async fn when_the_caller_hangs_up_canalis_lets_go_of_the_nodes_stream() {
+        struct Closed(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Closed {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let app = Router::new()
+            .route(
+                "/jobs",
+                post(|| async {
+                    Response::builder()
+                        .status(201)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"job_id":"node-job-1","status":"queued"}"#))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/jobs/{id}/stream",
+                get(|AxumState(closed): AxumState<Arc<std::sync::atomic::AtomicBool>>| async move {
+                    // One event, then silence until the job finishes (never,
+                    // here), as Aquifer's stream is while a job waits.
+                    let guard = Closed(closed);
+                    let events = futures_util::stream::unfold((0, guard), |(n, guard)| async move {
+                        if n == 0 {
+                            Some((Ok::<_, std::io::Error>(Bytes::from_static(b"event: queued\ndata: {\"job_id\":\"node-job-1\"}\n\n")), (1, guard)))
+                        } else {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(events))
+                        .unwrap()
+                }),
+            )
+            .with_state(closed.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let task_state = state.clone();
+        let task_addr = mock_addr.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            register_node(&task_state, &task_addr).await;
+            let _ = try_drain_one(task_state).await;
+        });
+
+        let response = forward_with_config(state, job_for(&unique("user-hangs-up")), "/jobs", &generous_wait_retry_config()).await;
+        let mut body = response.into_body().into_data_stream();
+        let mut seen = String::new();
+        while !seen.contains("event: queued") {
+            let chunk = tokio::time::timeout(Duration::from_secs(5), futures_util::StreamExt::next(&mut body))
+                .await
+                .expect("the node's stream should start being relayed")
+                .expect("stream ended early")
+                .unwrap();
+            seen.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        drop(body); // the caller hangs up mid-relay
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !closed.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cleanup(&cleanup_state).await;
+        assert!(closed.load(Ordering::SeqCst), "Canalis kept the node's stream open after its caller left");
+    }
+
+    #[tokio::test]
+    async fn while_starting_canalis_is_alive_but_not_ready() {
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = starting_router();
+        let health = app.clone().oneshot(Request::get("/health").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = health.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap()["status"], "starting");
+        for path in ["/ready", "/jobs", "/proxy"] {
+            let response = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "5", "{path}");
+        }
     }
 
     #[tokio::test]
