@@ -1,25 +1,28 @@
-You monitor a week-long soak test of Canalis, a Rust gateway that sits in front of job-queue instances (Aquifer and Spillway). Canalis assigns each tenant to an instance, keeps a durable waiting line on disk (redb) when every instance is full or down, and hands the line out fairly per tenant. Several Canalis nodes share one Valkey; the node that holds a tenant's line owns it, and the others forward to it.
+You monitor a four-day soak test of Canalis, a Rust gateway in front of job-queue instances (Aquifer). Canalis assigns each tenant to an instance, and keeps a durable waiting line on disk (redb) when no instance has room. It hands the line out fairly per tenant. Two Canalis nodes share one Valkey; the node holding a tenant's line owns it, and the other forwards to it.
 
-On Fly, under hostile synthetic load:
+This soak is for what only time shows: memory or file-descriptor leaks, a line file that doesn't shrink back, and latency drift. Aquifer itself has had its own soak; here it's the steady instance Canalis hands work to.
 
-- two Canalis nodes (`a`, `b`) in front of two Aquifer instances (`q1`, `q2`) and one Spillway instance (`s`), all in one pool;
-- HTTP jobs at 500/s through both Canalis nodes, a burst at the top of every hour, and a daily ramp at 04:00 UTC to find the ceiling;
-- WebSocket sessions through Canalis's /websocket;
-- a target API and webhook receiver that misbehave on purpose (slow, 503s, 429s, outages);
-- a fixed schedule of failures, about 13 a day:
-  - kill -9 of each Canalis node and each instance;
-  - a Canalis node held down for 5 minutes (its line ownership must move), and one frozen for 20 s;
+On Fly, under synthetic load:
+
+- two Canalis nodes (`a`, `b`) in front of one Aquifer instance (`q1`);
+- HTTP jobs at 300/s through both Canalis nodes, a 1,000/s burst at the top of every hour, and a daily ramp at 04:00 UTC to 2,000/s, which is past what one Aquifer takes, so the line fills and drains;
+- WebSocket sessions through node `a`;
+- a target API that misbehaves on purpose (slow, 503s, 429s, outages); the webhook receiver stays healthy;
+- a fixed schedule of eight failures a day:
+  - a kill -9 of each Canalis node;
+  - node `a` held down for 5 minutes, so its lines move to `b`;
+  - node `b` frozen for 20 s;
   - a 2-minute Valkey outage;
-  - both Aquifers held down for 5 minutes, leaving only Spillway, so the line fills;
-  - a rolling restart (drain a, then b);
-  - every other day, every instance down for 3 minutes, so the line holds everything.
+  - the Aquifer held down for 5 minutes, so the line fills;
+  - a kill -9 of the Aquifer;
+  - a rolling restart (drain `a`, then `b`).
 
 Your job is to tell the maintainer, in a few lines, whether Canalis is holding up, and to say plainly when it is not.
 
 Everything you need is on the soak driver's read-only status pages at https://{{HOST}}:
 
-- /status: alerts, the job ledger, the last minute and hour, daily summaries, the cluster section (each scheduled failure and what the ledger counted while it lasted), recent events, and the latest report;
-- /status/hourly?n=168: hourly summaries. Use these for trends;
+- /status: alerts, the job ledger, the last minute and hour, daily summaries, the cluster section (each scheduled failure and what the ledger counted while it lasted, and `accepted_into_gateway_line`), recent events, and the latest report;
+- /status/hourly?n=96: hourly summaries. Use these for trends. Each has a `nodes` section with every node's own `rss_mb_end`, `rss_mb_max`, `open_fds_end`, `store_mb_end` (for `a` and `b`, the line's file) and `restarts_total`;
 - /status/minutes?n=180: the last three hours, minute by minute;
 - /status/daily: one line per day, including the daily ramp ceiling;
 - /events?n=200: scheduled failures, bursts, ramps, kills and restarts;
@@ -30,7 +33,7 @@ Fetch with curl. Never send anything to these pages except your one report.
 
 How to judge it:
 
-1. Lost jobs are the most important number. `ledger.counters.lost` counts jobs Canalis accepted that disappeared without finishing. It should be 0, and any increase since your last report is a problem.
+1. Lost jobs are the most important number. `ledger.counters.lost` counts jobs that disappeared without finishing, and `lost_in_gateway_line` counts jobs Canalis put in its line that were never seen again. Both should be 0, and any increase since your last report is a problem.
    - Look up `ledger.recent_lost`.
    - Find which scheduled failure was running when they were accepted: the cluster section's per-failure deltas, and `/events`.
    - Grep the logs around those times and for their job IDs.
@@ -38,7 +41,8 @@ How to judge it:
    Canalis writes a job to its line before answering, so a kill -9 of a Canalis node should lose nothing it accepted. A loss during an instance kill points at the instance's own flush window (Aquifer syncs every 100ms), not Canalis; say which it was.
 2. Some outcomes are expected, and you should not alarm on them:
    - 429s while the line is full, and 503s from load shedding during bursts and ramps;
-   - `finished_without_webhook`, while the webhook receiver's "down" mode outlasts webhook retries;
+   - `finished_without_webhook`: the webhook receiver stays healthy in this soak, so this is a known gap rather than receiver downtime. When Canalis hands a job over while its caller is waiting, it relays the instance's stream. If the caller hangs up mid-relay, the instance has already counted the result as delivered and sends no webhook. A local rehearsal saw 8 in 19,800 jobs, all after a backend hold. Report the count, and call it a warning only if it's far out of that proportion or happens outside backlogs;
+   - `completed_on_stream` / `failed_on_stream`: jobs whose result came back on Canalis's line stream instead of as a webhook. Expected whenever the line is in use;
    - `duplicate_webhooks` (delivery is at-least-once; duplicates cluster after kills);
    - failed jobs that follow the target API's "down" or error modes;
    - gateway errors (502/504) and retries during a hold or freeze of a Canalis node.
@@ -47,8 +51,8 @@ How to judge it:
 3. Recovery matters as much as survival. After each scheduled failure, completions should return to their earlier rate within a few minutes, and the line should drain back to near empty. A line that stays long after the instances are back, or a tenant whose jobs stop finishing while others' do, is a problem. So is a node that keeps failing health checks after its restart.
 4. WebSocket sessions have their own ledger under `websocket.ledger` on /status. `lost_commands` should stay 0, and so should `messages_for_unknown_commands`. Expected, unless out of proportion: rejected handshakes and disconnects around kills, holds, drains and backend "down" slots.
 5. Trends matter more than snapshots. Compare the hourly history across days of the same pattern:
-   - RSS and open file descriptors should plateau, not climb day over day;
-   - the line's store size (reported as `pebble_mb_end` / `pebble_files_end`; it is Canalis's redb line, not Pebble) should shrink back after the line drains;
+   - each node's RSS and open file descriptors (the `nodes` section of each hourly row) should plateau, not climb day over day. Compare the same hour across days, since load follows a daily pattern. Check `a` and `b` separately: a leak on one is easy to miss in a total;
+   - each Canalis node's `store_mb_end` (its line file) should shrink back after the line drains, not ratchet up;
    - accept and end-to-end p99 in comparable quiet phases should not drift up;
    - the ramp ceiling on /status/daily should not fall from one day to the next.
 

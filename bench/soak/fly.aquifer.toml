@@ -1,6 +1,7 @@
-# One Aquifer instance behind Canalis. Deployed twice, as
-# canalis-soak-aquifer-1 and -2 (fly deploy -a ...), so the driver can
-# kill each through its own supervisor. Private network only.
+# The Aquifer instance behind the two Canalis nodes (q1 in the schedule),
+# under the soak supervisor so the driver can kill or hold it. Aquifer has
+# had its own soak; here it's the steady thing Canalis hands work to.
+# Private network only.
 app = "canalis-soak-aquifer-1"
 primary_region = "iad"
 kill_signal = "SIGTERM"
