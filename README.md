@@ -186,7 +186,8 @@ Pools share one set of `aqueduct:` keys rather than a prefix each. So an instanc
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |
 | `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this fullness, an instance gets no new users; when every instance is there, new users wait in line |
-| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | Users an instance takes when its record doesn't say (drain-mode instances take 1) |
+| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | HTTP users an instance takes when it doesn't report `http_capacity` (drain-mode instances take 1) |
+| `CANALIS_DEFAULT_WS_CAPACITY` | `1000` | WebSocket sessions an instance takes when it doesn't report `ws_capacity`; counted apart from HTTP users |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long an idle user keeps their instance before it's released |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Valkey key prefix for the shared assignment table; must match `AQUIFER_CLUSTER_VALKEY_PREFIX` |
 | `CANALIS_L8_SCHEMA_VALIDATION` | `false` | Check each job's body against the JSON Schema its upstream publishes for that route ([L8 v0.2 `request_schemas`](https://rjpruitt16.github.io/l8-protocol/)) and answer `422` on a mismatch, before the job reaches the line or any instance. External `$ref`s are refused. Off by default because it fetches `/.well-known/l8` from each job's upstream |

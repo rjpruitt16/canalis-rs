@@ -671,8 +671,10 @@ async fn valkey_check(State(mut state): State<AppState>) -> String {
 // The optional fields (see Aquifer's and Spillway's REGISTRATION.md):
 // `reserved_for` dedicates the instance to one user, `role` says which
 // traffic it's for (`ws` instances aren't given HTTP traffic), `drain_state`
-// is drain mode's own state (`unassigned` = free for the next tenant), and
-// `fullness` is 0-100, the same number as X-Aqueduct-Fullness.
+// is drain mode's own state (`unassigned` = free for the next tenant),
+// `fullness` is 0-100, the same number as X-Aqueduct-Fullness, and
+// `http_users`/`http_capacity`/`ws_sessions`/`ws_capacity` are its load
+// (see assign::Load).
 #[derive(Deserialize, Default)]
 struct RegisterRequest {
     port: String,
@@ -691,6 +693,8 @@ struct RegisterRequest {
     // pool is just the next ping.
     #[serde(default)]
     pools: Vec<String>,
+    #[serde(default, flatten)]
+    load: assign::Load,
 }
 
 // Reads the raw body first: an L8 signature covers the exact bytes sent,
@@ -888,6 +892,7 @@ async fn handle_registration(
         role: payload.role.clone().filter(|s| !s.is_empty()),
         drain_state: payload.drain_state.clone(),
         pools: registered_pools(address, &payload.pools),
+        load: payload.load,
         ..Default::default()
     };
     assign::heartbeat(&mut state.valkey, &aq, &member).await?;
@@ -957,15 +962,44 @@ fn fullness_header(headers: &reqwest::header::HeaderMap) -> Option<u8> {
         .map(|v| v.min(100) as u8)
 }
 
-fn remember_fullness(state_valkey: &Valkey, aq: &Arc<assign::Aqueduct>, node_id: &str, headers: &reqwest::header::HeaderMap) {
-    if let Some(fullness) = fullness_header(headers) {
-        let (mut valkey, aq, id) = (state_valkey.clone(), aq.clone(), node_id.to_string());
-        tokio::spawn(async move {
-            if let Err(err) = assign::record_fullness(&mut valkey, &aq, &id, fullness).await {
-                tracing::warn!("failed to record fullness for {id}: {err}");
-            }
-        });
+// The load an instance reports on its responses (see assign::Load); empty
+// when it sends none of the four headers.
+fn load_headers(headers: &reqwest::header::HeaderMap) -> assign::Load {
+    let read = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+    };
+    assign::Load {
+        http_users: read("X-Aqueduct-Http-Users"),
+        http_capacity: read("X-Aqueduct-Http-Capacity"),
+        ws_sessions: read("X-Aqueduct-WS-Sessions"),
+        ws_capacity: read("X-Aqueduct-WS-Capacity"),
     }
+}
+
+// Fullness and load from an instance's response, recorded in the
+// background so the response isn't held up.
+fn remember_instance_report(state_valkey: &Valkey, aq: &Arc<assign::Aqueduct>, node_id: &str, headers: &reqwest::header::HeaderMap) {
+    let (fullness, load) = (fullness_header(headers), load_headers(headers));
+    if fullness.is_none() && load.is_empty() {
+        return;
+    }
+    let (mut valkey, aq, id) = (state_valkey.clone(), aq.clone(), node_id.to_string());
+    tokio::spawn(async move {
+        if let Some(fullness) = fullness
+            && let Err(err) = assign::record_fullness(&mut valkey, &aq, &id, fullness).await
+        {
+            tracing::warn!("failed to record fullness for {id}: {err}");
+        }
+        if !load.is_empty()
+            && let Err(err) = assign::record_load(&mut valkey, &aq, &id, load).await
+        {
+            tracing::warn!("failed to record load for {id}: {err}");
+        }
+    });
 }
 
 // Aquifer answers 503 with X-Aqueduct-Node-State: draining (Spillway the
@@ -1393,7 +1427,7 @@ async fn dispatch_drained_job(
     };
 
     let pacing = PacingSignal::from_headers(resp.headers());
-    remember_fullness(&state.valkey, &state.aqueduct, &node.id, resp.headers());
+    remember_instance_report(&state.valkey, &state.aqueduct, &node.id, resp.headers());
     observe_schema_hash(&state, &job.url, resp.headers());
     let stored_headers = headers_to_store(resp.headers());
     let status = resp.status().as_u16();
@@ -2297,7 +2331,7 @@ async fn forward_attempt(
         }
     };
 
-    remember_fullness(&state.valkey, &state.aqueduct, &node.id, upstream.headers());
+    remember_instance_report(&state.valkey, &state.aqueduct, &node.id, upstream.headers());
     observe_schema_hash(&state, &job.url, upstream.headers());
     if node_is_draining(upstream.status().as_u16(), upstream.headers()) {
         let mut response = json_response(
@@ -3281,7 +3315,8 @@ mod tests {
         let (state, _dir) = test_state().await;
         // One ws instance with room for one session, already taken.
         let instance = start_ws_instance().await;
-        let member = assign::Member { role: Some("ws".into()), capacity: 1, ..assign::tests::node(&instance) };
+        let load = assign::Load { ws_capacity: Some(1), ..Default::default() };
+        let member = assign::Member { role: Some("ws".into()), load, ..assign::tests::node(&instance) };
         assign::heartbeat(&mut state.valkey.clone(), &state.aqueduct, &member).await.unwrap();
         assert!(matches!(
             assign::assign(&mut state.valkey.clone(), &state.aqueduct, &assign::Tenant::user("busy"), assign::Traffic::WebSocket).await.unwrap(),
@@ -4550,6 +4585,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_ping_reports_the_nodes_load() {
+        let (state, _dir) = test_state().await;
+        let addr = unique("node");
+        let body = br#"{"port":"0","state":"active","http_users":3,"http_capacity":3,"ws_sessions":0,"ws_capacity":500}"#;
+        let payload: RegisterRequest = serde_json::from_slice(body).unwrap();
+
+        handle_registration(state.clone(), &addr, &payload).await.unwrap();
+        let newcomer = claim(&state, "newcomer").await;
+        let member = assign::member(&mut state.valkey.clone(), &state.aqueduct, &addr).await.unwrap().unwrap();
+        cleanup(&state).await;
+
+        assert_eq!(newcomer, None, "3 of 3 HTTP users");
+        assert_eq!(member.load.ws_capacity, Some(500));
+    }
+
+    #[tokio::test]
     async fn a_drain_mode_node_takes_one_tenant_and_is_freed_by_unassigned() {
         let (state, _dir) = test_state().await;
         let addr = unique("drain-node");
@@ -4600,6 +4651,20 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         addr.to_string()
+    }
+
+    #[test]
+    fn load_headers_are_read_and_bad_values_ignored() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("X-Aqueduct-Http-Users", "12".parse().unwrap());
+        headers.insert("X-Aqueduct-Http-Capacity", " 40 ".parse().unwrap());
+        headers.insert("X-Aqueduct-WS-Sessions", "-3".parse().unwrap());
+        headers.insert("X-Aqueduct-WS-Capacity", "lots".parse().unwrap());
+
+        let load = load_headers(&headers);
+
+        assert_eq!(load, assign::Load { http_users: Some(12), http_capacity: Some(40), ws_sessions: None, ws_capacity: None });
+        assert!(load_headers(&reqwest::header::HeaderMap::new()).is_empty());
     }
 
     #[tokio::test]

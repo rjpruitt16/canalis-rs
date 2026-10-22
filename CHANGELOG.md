@@ -16,6 +16,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
   - Shopify comes from Inlet's own provider code (Inlet's `plugins/canalis`).
   - See `docs/plugins.md`.
 - **Config file** (`CANALIS_CONFIG_PATH`, YAML, read at startup; environment variables override it).
+- **Instances report their load:** `http_users`, `http_capacity`, `ws_sessions` and `ws_capacity`, in the registration ping and as `X-Aqueduct-Http-Users`, `X-Aqueduct-Http-Capacity`, `X-Aqueduct-WS-Sessions` and `X-Aqueduct-WS-Capacity` on responses. Aquifer and Spillway work them out from their own CPU and memory. Canalis claims against those numbers, falling back to `CANALIS_DEFAULT_USER_CAPACITY` (100) and the new `CANALIS_DEFAULT_WS_CAPACITY` (1,000).
 
 ### Changed
 
@@ -29,6 +30,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 
 Found by the first Canalis soak test:
 
+- **WebSocket sessions could leave no room for HTTP users.** An instance's sessions and HTTP users shared one capacity, 100 unless the instance said otherwise. 100 open sessions held every place for as long as they stayed open, so no HTTP tenant could claim one: the line filled to its cap next to an idle instance. Sessions now have their own capacity, and are claimed with the same script under `aqueduct:ws:`, so Aquifer's cluster mode never counts them. **Behavior change:** `user_capacity` no longer limits WebSocket sessions; use `ws_capacity` or `CANALIS_DEFAULT_WS_CAPACITY`.
 - **A tenant's line stalled behind callers still listening.** When a job left the line while its caller was still connected, Canalis relayed the job's stream for as long as the job ran, holding one of the tenant's drain slots the whole time. Ten such callers stopped the rest of the tenant's line. Every new request joined that line, so it couldn't shrink under load, and it filled to its cap next to an idle instance. The slot is now freed once the instance accepts the job, and the relay runs on its own.
 - **Jobs were lost from the line when an instance couldn't take them.** A `/jobs` hand-off answered `429`, `408` or `5xx`, or with no answer at all, had that error cached as the job's result, and the job left the line undelivered. Now the job goes back in line for a later try (the instance deduplicates retries by idempotency key). The instance stays in rotation, and the tenant keeps its line. `/proxy` hand-offs are unchanged: their answer is the call's own result, and it goes to the caller.
 - **Calls to instances had no timeouts.** An instance that stopped answering could hold a tenant's drain forever. There's now a connect timeout, an idle timeout, and an overall limit on `/jobs` hand-offs (see `docs/configuration.md`).

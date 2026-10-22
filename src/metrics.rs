@@ -165,8 +165,12 @@ pub async fn handler(State(state): State<AppState>) -> Response {
         };
         gauge(&mut out, "canalis_instance_up", "Each registered instance, labelled with its state.", &each(&|_| Some(1.0)));
         gauge(&mut out, "canalis_instance_fullness_percent", "Fullness the instance last reported (X-Aqueduct-Fullness).", &each(&|i| instances[i].1.map(f64::from)));
-        gauge(&mut out, "canalis_instance_active_users", "Users the instance reported as active.", &each(&|i| Some(instances[i].0.active_users as f64)));
-        gauge(&mut out, "canalis_instance_user_capacity", "Users the instance said it can hold.", &each(&|i| Some(instances[i].0.capacity as f64)));
+        let aq = &state.aqueduct;
+        let (http, ws) = (assign::Traffic::Http, assign::Traffic::WebSocket);
+        gauge(&mut out, "canalis_instance_active_users", "HTTP users the instance reported as active.", &each(&|i| Some(instances[i].0.reported_in_use(http) as f64)));
+        gauge(&mut out, "canalis_instance_user_capacity", "HTTP users the instance takes: what it reported, or the default.", &each(&|i| Some(instances[i].0.capacity_for(http, aq) as f64)));
+        gauge(&mut out, "canalis_instance_ws_sessions", "WebSocket sessions the instance reported as open.", &each(&|i| Some(instances[i].0.reported_in_use(ws) as f64)));
+        gauge(&mut out, "canalis_instance_ws_capacity", "WebSocket sessions the instance takes: what it reported, or the default.", &each(&|i| Some(instances[i].0.capacity_for(ws, aq) as f64)));
     }
 
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")], out).into_response()
