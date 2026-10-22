@@ -1439,7 +1439,7 @@ async fn dispatch_drained_job(
         }
     }
 
-    let mut already_streamed = streams && read_failed.is_none();
+    let already_streamed = streams && read_failed.is_none();
     let cached = match read_failed {
         None => line::CachedResult {
             status,
@@ -1464,21 +1464,34 @@ async fn dispatch_drained_job(
     // is safe, the node replays the states already passed. What gets
     // cached is the acknowledgment; the outcome itself is the node's
     // (webhook, or its own GET /jobs/{id}).
-    if follows_job_stream {
+    //
+    // Following that stream lasts as long as the job does, so it runs on
+    // its own task: the hand-off is done once the node has answered, and
+    // this drain's slot goes back to the line now. Holding the slot for the
+    // relay let ten listening callers stop their tenant's whole line until
+    // their jobs finished.
+    if follows_job_stream && let Some(tx) = waiter.take() {
         let job_id = (cached.status == 201)
             .then(|| serde_json::from_str::<serde_json::Value>(&cached.body).ok())
             .flatten()
             .and_then(|v| v.get("job_id").and_then(|id| id.as_str()).map(str::to_string));
-        if let Some(tx) = waiter.take() {
+        let result = result_event(&cached);
+        finish_drained_job(line, &queued, cached, None, false).await;
+        let (http, base_url) = (http.clone(), node.base_url.clone());
+        tokio::spawn(async move {
             let assigned = serde_json::json!({ "job_id": job_id });
-            if tx.send(sse_event("canalis_assigned", assigned)).await.is_ok() {
-                already_streamed = match &job_id {
-                    Some(id) => follow_job_stream(http, &node.base_url, id, &tx).await,
-                    None => false,
-                };
-                waiter = Some(tx);
+            if tx.send(sse_event("canalis_assigned", assigned)).await.is_err() {
+                return;
             }
-        }
+            let streamed = match &job_id {
+                Some(id) => follow_job_stream(&http, &base_url, id, &tx).await,
+                None => false,
+            };
+            if !streamed {
+                let _ = tx.send(result).await;
+            }
+        });
+        return DispatchOutcome::handed_over(pacing);
     }
 
     finish_drained_job(line, &queued, cached, waiter, already_streamed).await;
@@ -1557,6 +1570,20 @@ fn waiter_key(job: &JobRequest, pool: &str) -> (String, String) {
 // carried it -- tells a still-waiting caller with a `canalis_result` event.
 // Cache first: the caller's stream ends when its sender is dropped here,
 // and a caller who checks GET /jobs/{key} right after must find the result.
+// The job's cached result as the waiting room's last event, for a caller
+// who didn't get it streamed.
+fn result_event(cached: &line::CachedResult) -> Bytes {
+    sse_event(
+        "canalis_result",
+        serde_json::json!({
+            "status": cached.status,
+            "content_type": cached.content_type,
+            "headers": cached.headers.iter().cloned().collect::<HashMap<_, _>>(),
+            "body": cached.body,
+        }),
+    )
+}
+
 async fn finish_drained_job(
     line: &Arc<line::Line>,
     queued: &line::QueuedJob,
@@ -1564,17 +1591,7 @@ async fn finish_drained_job(
     waiter: Option<mpsc::Sender<Bytes>>,
     already_streamed: bool,
 ) {
-    let event = (waiter.is_some() && !already_streamed).then(|| {
-        sse_event(
-            "canalis_result",
-            serde_json::json!({
-                "status": cached.status,
-                "content_type": cached.content_type,
-                "headers": cached.headers.iter().cloned().collect::<HashMap<_, _>>(),
-                "body": cached.body,
-            }),
-        )
-    });
+    let event = (waiter.is_some() && !already_streamed).then(|| result_event(&cached));
     let (job, seq) = (&queued.job, queued.seq);
     let (user_id, key) = waiter_key(job, &queued.pool);
     if let Err(err) = on_line(line, move |l| {
@@ -2068,7 +2085,7 @@ async fn wait_in_line(state: AppState, job: JobRequest, path: &str, pool: &str, 
             return json_response(StatusCode::INTERNAL_SERVER_ERROR, serde_json::json!({ "error": "internal error" }));
         }
     };
-    tracing::info!("no instance free for {}; in line with {ahead} ahead", job.user_id);
+    tracing::info!("{} waits in line ({reason}) with {ahead} ahead", job.user_id);
 
     if let Ok(mut waiters) = state.waiters.lock()
         && let Some(waiter) = waiters.get_mut(&key).filter(|w| w.id == id) {
@@ -3675,6 +3692,96 @@ mod tests {
         }
         cleanup(&cleanup_state).await;
         assert!(closed.load(Ordering::SeqCst), "Canalis kept the node's stream open after its caller left");
+    }
+
+    // The first soak's stall: a drained job whose caller is still listening
+    // gets its node stream relayed for as long as the job runs. That relay
+    // held one of the tenant's drain slots, so ten listening callers with
+    // slow jobs stopped the rest of the tenant's line.
+    #[tokio::test]
+    async fn listening_callers_with_slow_jobs_do_not_stop_their_tenants_line() {
+        let app = Router::new()
+            .route(
+                "/jobs",
+                post(|| async {
+                    Response::builder()
+                        .status(201)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"job_id":"node-job-1","status":"queued"}"#))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/jobs/{id}/stream",
+                get(|| async {
+                    // One event, then nothing: a job that hasn't finished.
+                    let events = futures_util::stream::unfold(0, |n| async move {
+                        if n == 0 {
+                            Some((Ok::<_, std::io::Error>(Bytes::from_static(b"event: queued\ndata: {}\n\n")), 1))
+                        } else {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                    });
+                    Response::builder()
+                        .status(200)
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(events))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (state, _dir) = test_state().await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-listening");
+        // More listening callers than the drain has slots, then more jobs.
+        let jobs: Vec<JobRequest> = (0..25).map(|_| job_for(&user_id)).collect();
+        let mut listeners = Vec::new();
+        for (i, job) in jobs.iter().enumerate() {
+            let seq = match state.line.enqueue(job, "/jobs", assign::DEFAULT_POOL).unwrap() {
+                line::Enqueued::Queued { seq, .. } => seq,
+                other => panic!("job {i} should be newly queued, got {other:?}"),
+            };
+            if i < 12 {
+                let (tx, rx) = mpsc::channel::<Bytes>(64);
+                state.waiters.lock().unwrap().insert(
+                    waiter_key(job, assign::DEFAULT_POOL),
+                    Waiter { id: i as u64, seq, tx, last_ahead: None },
+                );
+                listeners.push(rx);
+            }
+        }
+
+        register_node(&state, &mock_addr).await;
+        let line = state.line.clone();
+        let drained = tokio::time::timeout(Duration::from_secs(10), try_drain_one(state)).await;
+        cleanup(&cleanup_state).await;
+        assert!(drained.is_ok(), "the drain stalled behind its listening callers' jobs");
+
+        for (i, job) in jobs.iter().enumerate() {
+            let cached = line
+                .get_result(&user_id, &job.idempotent_key)
+                .unwrap()
+                .unwrap_or_else(|| panic!("job {i} was never handed over"));
+            assert_eq!(cached.status, 201, "job {i}");
+        }
+        assert_eq!(line.len().unwrap(), 0);
+
+        // Each listening caller still gets the node's stream relayed.
+        for (i, rx) in listeners.iter_mut().enumerate() {
+            let mut seen = String::new();
+            while !seen.contains("event: queued") {
+                let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("caller {i} heard nothing from the node's stream"))
+                    .unwrap_or_else(|| panic!("caller {i}'s stream ended early"));
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+            assert!(seen.contains("event: canalis_assigned"), "caller {i}: {seen}");
+        }
     }
 
     #[tokio::test]
