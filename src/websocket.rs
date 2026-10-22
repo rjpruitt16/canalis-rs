@@ -262,6 +262,7 @@ async fn wait_for_instance(
                 told = None;
             }
             Err(Refused::Answered(response)) => {
+                let _ = assign::release(&mut state.valkey.clone(), &state.aqueduct, &pending.user, assign::Traffic::WebSocket, &node.id).await;
                 let reason = format!("the instance refused the session ({})", response.status());
                 close(&mut client, 1011, &reason).await;
                 return;
@@ -445,7 +446,12 @@ pub async fn handler(
                 state.metrics.inc("canalis_reroutes_total", &[]);
                 skip = Some(node.id);
             }
-            Err(Refused::Answered(response)) => return *response,
+            Err(Refused::Answered(response)) => {
+                // The instance turned the session away itself (its own
+                // limit, say): the place claimed for it isn't used.
+                let _ = assign::release(&mut state.valkey.clone(), &state.aqueduct, &user, assign::Traffic::WebSocket, &node.id).await;
+                return *response;
+            }
             Err(Refused::Unreachable(err)) => {
                 tracing::warn!("{} is unreachable for a WebSocket session; removed it until it registers again: {err}", node.id);
                 let _ = assign::remove_instance(&mut state.valkey.clone(), &state.aqueduct, &node.id).await;
@@ -612,6 +618,11 @@ async fn pipe(state: AppState, client: WebSocket, upstream: Upstream, node: assi
     }
     let _ = client_tx.lock().await.close().await;
     let _ = upstream_tx.lock().await.close().await;
+    // Free the place now rather than when the claim expires: an instance
+    // reports few enough places that a closed session holding one for the
+    // claim's TTL keeps the next one out. Another session of the same user
+    // on this instance claims it back on its next renewal.
+    let _ = assign::release(&mut state.valkey.clone(), &state.aqueduct, &user, assign::Traffic::WebSocket, &node.id).await;
     tracing::debug!("WebSocket session for {} in pool {} on {} closed", user.user, user.pool, node.id);
 }
 

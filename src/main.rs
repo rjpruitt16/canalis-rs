@@ -3052,6 +3052,39 @@ mod tests {
         }
     }
 
+    // An instance reports only so many session places, so a closed session
+    // gives its place back at once instead of holding it until the claim
+    // expires.
+    #[tokio::test]
+    async fn a_closed_websocket_session_frees_its_place() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (state, _dir) = test_state().await;
+        let instance = start_ws_instance().await;
+        register_ws_node(&state, &instance).await;
+        let canalis = serve_canalis(state.clone()).await;
+        let acme = assign::Tenant::user("acme");
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(ws_request(&canalis, "session_id=s1&after=0-0")).await.unwrap();
+        let _ = futures_util::StreamExt::next(&mut socket).await;
+        let held = assign::current(&mut state.valkey.clone(), &state.aqueduct, &acme, assign::Traffic::WebSocket).await.unwrap();
+        // "bye" makes the instance close the session.
+        socket.send(Message::text("bye")).await.unwrap();
+        while let Some(Ok(_)) = futures_util::StreamExt::next(&mut socket).await {}
+        let mut freed = None;
+        for _ in 0..50 {
+            freed = assign::current(&mut state.valkey.clone(), &state.aqueduct, &acme, assign::Traffic::WebSocket).await.unwrap();
+            if freed.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        cleanup(&state).await;
+
+        assert_eq!(held.as_deref(), Some(instance.as_str()), "an open session holds a place");
+        assert_eq!(freed, None, "a closed one gives it back");
+    }
+
     #[tokio::test]
     async fn a_websocket_session_assigned_to_a_dead_instance_is_moved_to_a_live_one() {
         let (state, _dir) = test_state().await;
