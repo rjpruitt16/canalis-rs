@@ -91,6 +91,8 @@ See [docs/plugins.md](plugins.md).
 | `CANALIS_LINE_MAX_BYTES` | `268435456` (256 MiB) | Total size of waiting jobs. |
 | `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full line's 429. |
 | `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a handed-off job's result is kept for `GET /jobs/{key}` and repeat requests. |
+| `CANALIS_LINE_MAX_FAILED_HANDOFFS` | `5` | Hand-offs an instance can fail (5xx, 408) before the job is given up on and the last failure becomes its result. A 429 doesn't count. `0`: no limit. |
+| `CANALIS_LINE_MAX_WAIT_SECONDS` | `600` | How long a job can wait, from joining the line, before a refused hand-off of any kind (429 included) answers it with a 504. A job only waiting its turn is never given up on. `0`: no limit. |
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked for jobs that can be handed out. |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position`. |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream waits in line before `canalis_timeout`. The job stays in line. |

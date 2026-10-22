@@ -182,6 +182,8 @@ Pools share one set of `aqueduct:` keys rather than a prefix each. So an instanc
 | `CANALIS_LINE_MAX_BYTES` | `268435456` (256MB) | Total size of queued job bodies |
 | `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full-line `429` |
 | `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a drained job's result stays available |
+| `CANALIS_LINE_MAX_FAILED_HANDOFFS` | `5` | Failed hand-offs (5xx, 408) before a job is given up on |
+| `CANALIS_LINE_MAX_WAIT_SECONDS` | `600` | Wait after which a refused hand-off gives a job up with a 504 |
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked against free instances (also runs at startup, which is crash recovery) |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |

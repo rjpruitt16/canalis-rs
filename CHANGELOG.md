@@ -24,6 +24,7 @@ Canalis follows [semantic versioning](https://semver.org). Before 1.0, a minor v
 - A job being handed off from the line is still found by its idempotency key, so a retry arriving meanwhile is a duplicate instead of a second copy.
 - `CANALIS_MAX_IN_FLIGHT` defaults to 5,000 per CPU instead of 5,000.
 - Canalis runs its own HTTP server loop (hyper) instead of `axum::serve`, for the header-read timeout and 10,000 concurrent HTTP/2 streams per connection.
+- **Behavior change:** a job an instance won't take no longer waits in line forever. After 5 failed hand-offs (5xx or 408; `CANALIS_LINE_MAX_FAILED_HANDOFFS`), the last failure is its result. After 10 minutes in line (`CANALIS_LINE_MAX_WAIT_SECONDS`), the next refusal of any kind, 429 included, answers it with a 504. Either way the result is kept against its idempotency key like any other. Metric: `canalis_handoffs_given_up_total{reason}`.
 - **Behavior change:** a single tenant sending more than 1,000 req/s (sustained) is now limited. Set `CANALIS_TENANT_RPS=0` to turn it off, or give that tenant its own limit.
 
 ### Fixed

@@ -1278,12 +1278,14 @@ async fn drain_tenant_backlog(
         };
 
         let outcome = joined.map_err(|err| format!("drain dispatch task panicked: {err}"))?;
-        if let Some(job) = outcome.back_in_line {
+        if outcome.refused {
             if outcome.instance_draining {
                 node_draining = true;
             } else {
                 paused = true;
             }
+        }
+        if let Some(job) = outcome.back_in_line {
             on_line(&state.line, move |l| l.requeue(&job)).await?;
         }
         let signal = outcome.pacing;
@@ -1323,27 +1325,83 @@ async fn drain_tenant_backlog(
 }
 
 // What one drained dispatch hands back to drain_tenant_backlog: the
-// instance's pacing signal, plus the job itself if the instance never
-// really took it and it has to go back in line instead of being finished.
-// instance_draining says why: the instance is going away (stop handing it
-// work), or it only couldn't take this one right now (429, 5xx, a
-// timeout), so try again on a later sweep.
+// instance's pacing signal, and whether the instance refused the job --
+// then the job itself, unless it was given up on (see refused), to go
+// back in line instead of being finished. instance_draining says why it
+// was refused: the instance is going away (stop handing it work), or it
+// only couldn't take this one right now (429, 5xx, a timeout), so try
+// again on a later sweep.
 struct DispatchOutcome {
     pacing: PacingSignal,
+    refused: bool,
     back_in_line: Option<line::QueuedJob>,
     instance_draining: bool,
 }
 
 impl DispatchOutcome {
     fn handed_over(pacing: PacingSignal) -> Self {
-        Self { pacing, back_in_line: None, instance_draining: false }
+        Self { pacing, refused: false, back_in_line: None, instance_draining: false }
     }
+}
+
+// The instance didn't take the job, and it goes back in line -- unless
+// it's been refused enough: max_failed_handoffs failed hand-offs (5xx,
+// 408; the last failure becomes its result), or max_wait_seconds since it
+// joined the line (a 504, whatever the refusal). Then it's finished like
+// any other job: the caller hears, and its key answers with that result
+// rather than being tried again until the result expires. A 429 never
+// counts as a failure: the instance is busy, not broken.
+async fn refused(
+    state: &AppState,
+    mut queued: line::QueuedJob,
+    failure: Option<line::CachedResult>,
+    pacing: PacingSignal,
+    instance_draining: bool,
+) -> DispatchOutcome {
+    let limits = state.line.limits();
+    let mut give_up = None;
+    if let Some(failure) = failure {
+        queued.failed_handoffs = queued.failed_handoffs.saturating_add(1);
+        if limits.max_failed_handoffs > 0 && queued.failed_handoffs >= limits.max_failed_handoffs {
+            give_up = Some(("failed", failure));
+        }
+    }
+    if give_up.is_none()
+        && limits.max_wait_seconds > 0
+        && let Some(waited) = queued.waited_seconds()
+        && waited >= limits.max_wait_seconds
+    {
+        give_up = Some((
+            "waited",
+            line::CachedResult {
+                status: 504,
+                content_type: "application/json".into(),
+                body: serde_json::json!({ "error": format!("no instance took the job within {waited}s") }).to_string(),
+                headers: Vec::new(),
+            },
+        ));
+    }
+    let back_in_line = match give_up {
+        None => Some(queued),
+        Some((reason, result)) => {
+            tracing::warn!(
+                tenant = %queued.job.user_id, key = %queued.job.idempotent_key, failed_handoffs = queued.failed_handoffs,
+                "gave up on a job no instance would take ({reason}); answering {}", result.status
+            );
+            state.metrics.inc("canalis_handoffs_given_up_total", &[("reason", reason)]);
+            let waiter = take_waiter(&state.waiters, &queued.job, &queued.pool);
+            finish_drained_job(&state.line, &queued, result, waiter, false).await;
+            None
+        }
+    };
+    DispatchOutcome { pacing, refused: true, back_in_line, instance_draining }
 }
 
 // An answer to a /jobs hand-off that means the instance didn't store the
 // job: it's busy (429), timed out (408), or failed (5xx). The job goes back
-// in line rather than having the error cached as its result; retrying is
-// safe, since the instance deduplicates by the job's idempotency key. A
+// in line rather than having the error cached as its result, up to the
+// line's limits (see refused); retrying is safe, since the instance
+// deduplicates by the job's idempotency key. A
 // /proxy hand-off is different: its answer is the call's own result (the
 // target API's, or the instance refusing a synchronous call), so it goes to
 // the caller, and re-sending could repeat a call that isn't safe to repeat.
@@ -1378,13 +1436,27 @@ async fn dispatch_drained_job(
         Ok(resp) if node_is_draining(resp.status().as_u16(), resp.headers()) => {
             // Back in line; the caller (if any) stays registered and keeps
             // getting position updates until another node takes the job.
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: true };
+            return refused(&state, queued, None, PacingSignal::none(), true).await;
         }
         Ok(resp) if instance_did_not_take_it(&queued.path, resp.status().as_u16()) => {
             let status = resp.status().as_u16();
             tracing::debug!(node = %addr, status, tenant = %job.user_id, key = %job.idempotent_key, "instance didn't take the job; back in line");
             state.metrics.inc("canalis_handoffs_retried_total", &[("reason", if status == 429 { "busy" } else { "error" })]);
-            return DispatchOutcome { pacing: PacingSignal::from_headers(resp.headers()), back_in_line: Some(queued), instance_draining: false };
+            let pacing = PacingSignal::from_headers(resp.headers());
+            let failure = if status == 429 {
+                None
+            } else {
+                let headers = headers_to_store(resp.headers());
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let body = resp.text().await.unwrap_or_default();
+                Some(line::CachedResult { status, content_type, body, headers })
+            };
+            return refused(&state, queued, failure, pacing, false).await;
         }
         Ok(resp) => resp,
         // Never reached the instance: it's gone. Take it out of rotation
@@ -1396,7 +1468,7 @@ async fn dispatch_drained_job(
                 tracing::error!("failed to remove unreachable instance {addr}: {err}");
             }
             state.metrics.inc("canalis_reroutes_total", &[]);
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: true };
+            return refused(&state, queued, None, PacingSignal::none(), true).await;
         }
         // Reached the instance but got no answer (a timeout, a dropped
         // connection): it may or may not have the job. A /jobs hand-off
@@ -1405,7 +1477,7 @@ async fn dispatch_drained_job(
         Err(err) if queued.path == "/jobs" => {
             tracing::warn!("no answer from {addr} for a drained job; back in line: {err}");
             state.metrics.inc("canalis_handoffs_retried_total", &[("reason", "no_answer")]);
-            return DispatchOutcome { pacing: PacingSignal::none(), back_in_line: Some(queued), instance_draining: false };
+            return refused(&state, queued, None, PacingSignal::none(), false).await;
         }
         // A /proxy call may already have reached the target API: don't
         // send it again. The caller hears it failed.
@@ -3610,6 +3682,55 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(state.line.len().unwrap(), 0);
         assert_eq!(result.expect("the 201 is the job's result").status, 201);
+    }
+
+    // An instance that keeps failing the hand-off doesn't keep the job in
+    // line forever: after max_failed_handoffs failures (429s don't count),
+    // the last one is the job's result, and the job leaves the line.
+    #[tokio::test]
+    async fn a_job_an_instance_keeps_failing_is_given_up_on() {
+        let (state, _dir) = test_state_with(line::LineLimits { max_failed_handoffs: 2, ..line::LineLimits::default() }).await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-broken");
+        let job = job_for(&user_id);
+        let (mock_addr, calls) = start_flaky_jobs_mock(vec![429, 429, 500, 503]).await;
+        register_node(&state, &mock_addr).await;
+        state.line.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
+
+        for answer in [429, 429, 500] {
+            assert!(try_drain_one(state.clone()).await.unwrap());
+            assert_eq!(state.line.len().unwrap(), 1, "after a {answer} the job is still in line");
+        }
+        assert!(try_drain_one(state.clone()).await.unwrap());
+        let result = state.line.get_result(&user_id, &job.idempotent_key).unwrap();
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert_eq!(state.line.len().unwrap(), 0, "the second failure gives it up");
+        let result = result.expect("the last failure is the job's result");
+        assert_eq!(result.status, 503);
+        assert!(result.body.contains("not now"), "the instance's own answer: {}", result.body);
+    }
+
+    // Nor does a busy one: once the job has waited max_wait_seconds, a
+    // refusal of any kind answers it with a 504.
+    #[tokio::test]
+    async fn a_job_waiting_too_long_is_given_up_on_when_refused() {
+        let (state, _dir) = test_state_with(line::LineLimits { max_wait_seconds: 1, ..line::LineLimits::default() }).await;
+        let cleanup_state = state.clone();
+        let user_id = unique("user-waited");
+        let job = job_for(&user_id);
+        let (mock_addr, _calls) = start_flaky_jobs_mock(vec![429]).await;
+        register_node(&state, &mock_addr).await;
+        state.line.enqueue(&job, "/jobs", assign::DEFAULT_POOL).unwrap();
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+
+        assert!(try_drain_one(state.clone()).await.unwrap());
+        let result = state.line.get_result(&user_id, &job.idempotent_key).unwrap();
+        cleanup(&cleanup_state).await;
+
+        assert_eq!(state.line.len().unwrap(), 0);
+        assert_eq!(result.expect("a 504 is the job's result").status, 504);
     }
 
     // A hand-off that reaches the instance but gets no answer (here the

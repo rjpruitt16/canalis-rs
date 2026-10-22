@@ -48,6 +48,13 @@ pub struct LineLimits {
     pub max_bytes: u64,
     pub retry_after_seconds: u64,
     pub result_ttl_seconds: u64,
+    /// Hand-offs an instance can fail (5xx, 408) before the job is given
+    /// up on and that failure becomes its result. 0: no limit.
+    pub max_failed_handoffs: u32,
+    /// How long a job can wait, from joining the line, before a refused
+    /// hand-off (any kind, 429 included) gives it up with a 504. 0: no
+    /// limit. A job that's only waiting its turn is never given up on.
+    pub max_wait_seconds: u64,
 }
 
 impl Default for LineLimits {
@@ -58,6 +65,8 @@ impl Default for LineLimits {
             max_bytes: 256 * 1024 * 1024,
             retry_after_seconds: 5,
             result_ttl_seconds: 300,
+            max_failed_handoffs: 5,
+            max_wait_seconds: 600,
         }
     }
 }
@@ -74,6 +83,13 @@ impl LineLimits {
                 d.retry_after_seconds,
             ),
             result_ttl_seconds: crate::env_u64("CANALIS_RESULT_TTL_SECONDS", d.result_ttl_seconds),
+            max_failed_handoffs: crate::env_u64(
+                "CANALIS_LINE_MAX_FAILED_HANDOFFS",
+                d.max_failed_handoffs.into(),
+            )
+            .try_into()
+            .unwrap_or(u32::MAX),
+            max_wait_seconds: crate::env_u64("CANALIS_LINE_MAX_WAIT_SECONDS", d.max_wait_seconds),
         }
     }
 }
@@ -111,6 +127,17 @@ pub struct QueuedJob {
     /// When it joined the line (unix seconds; 0 if stored before this
     /// was recorded). Kept across a requeue.
     pub enqueued_at: u64,
+    /// Hand-offs an instance failed (5xx, 408) so far. Kept across a
+    /// requeue.
+    pub failed_handoffs: u32,
+}
+
+impl QueuedJob {
+    /// How long it's been since the job joined the line; None if it was
+    /// stored before that was recorded.
+    pub fn waited_seconds(&self) -> Option<u64> {
+        (self.enqueued_at > 0).then(|| now_unix().saturating_sub(self.enqueued_at))
+    }
 }
 
 // What's stored per job. `job` is flattened so an entry written before
@@ -121,6 +148,8 @@ struct StoredJob {
     path: String,
     #[serde(default)]
     enqueued_at: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    failed_handoffs: u32,
     // Jobs stored before pools read back as the default pool.
     #[serde(default = "default_pool")]
     pool: String,
@@ -130,6 +159,10 @@ struct StoredJob {
 
 fn default_pool() -> String {
     DEFAULT_POOL.into()
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 fn default_path() -> String {
@@ -274,7 +307,7 @@ impl Line {
             for entry in table.range::<u64>(..)? {
                 let (seq, payload) = entry?;
                 let stored: StoredJob = serde_json::from_slice(payload.value())?;
-                leased.push(QueuedJob { seq: seq.value(), job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at });
+                leased.push(QueuedJob { seq: seq.value(), job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at, failed_handoffs: stored.failed_handoffs });
             }
             leased
         };
@@ -396,6 +429,7 @@ impl Line {
         let payload = serde_json::to_vec(&StoredJob {
             path: path.into(),
             enqueued_at: now_unix(),
+            failed_handoffs: 0,
             pool: pool.into(),
             job: job.clone(),
         })?;
@@ -478,7 +512,7 @@ impl Line {
         let job = remove_job(&txn, &user_id, seq)?;
         lease(&txn, seq, job.as_ref())?;
         txn.commit()?;
-        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at, failed_handoffs: stored.failed_handoffs }))
     }
 
     /// Takes a tenant's own oldest job out of line (by line key, see
@@ -499,7 +533,7 @@ impl Line {
         let job = remove_job(&txn, user_id, seq)?;
         lease(&txn, seq, job.as_ref())?;
         txn.commit()?;
-        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at }))
+        Ok(job.map(|stored| QueuedJob { seq, job: stored.job, path: stored.path, pool: stored.pool, enqueued_at: stored.enqueued_at, failed_handoffs: stored.failed_handoffs }))
     }
 
     /// Puts a job back at its original place in line -- used when a job was
@@ -510,6 +544,7 @@ impl Line {
             serde_json::to_vec(&StoredJob {
                 path: queued.path.clone(),
                 enqueued_at: queued.enqueued_at,
+                failed_handoffs: queued.failed_handoffs,
                 pool: queued.pool.clone(),
                 job: queued.job.clone(),
             })?;
@@ -949,6 +984,17 @@ mod tests {
         let line = Line::open(&path, LineLimits::default()).unwrap();
         assert_eq!(line.len().unwrap(), 0);
         assert!(path.exists());
+    }
+
+    #[test]
+    fn a_requeue_keeps_the_failed_hand_off_count() {
+        let (line, _dir) = open(LineLimits::default());
+        line.enqueue(&job("a", "1"), "/jobs", DEFAULT_POOL).unwrap();
+        let mut taken = line.pop_oldest(&HashSet::new(), &HashSet::new()).unwrap().unwrap();
+        assert_eq!(taken.failed_handoffs, 0);
+        taken.failed_handoffs = 3;
+        line.requeue(&taken).unwrap();
+        assert_eq!(line.pop_for("a").unwrap().unwrap().failed_handoffs, 3);
     }
 
     #[test]
