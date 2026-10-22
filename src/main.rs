@@ -1443,6 +1443,9 @@ async fn dispatch_drained_job(
             tracing::debug!(node = %addr, status, tenant = %job.user_id, key = %job.idempotent_key, "instance didn't take the job; back in line");
             state.metrics.inc("canalis_handoffs_retried_total", &[("reason", if status == 429 { "busy" } else { "error" })]);
             let pacing = PacingSignal::from_headers(resp.headers());
+            // A busy instance's answer carries its load too, likely the
+            // most telling one.
+            remember_instance_report(&state.valkey, &state.aqueduct, &node.id, resp.headers());
             let failure = if status == 429 {
                 None
             } else {
