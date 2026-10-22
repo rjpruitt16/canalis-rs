@@ -768,10 +768,6 @@ fn instance_address(ip: std::net::IpAddr, port: &str) -> Option<String> {
 // connection refused or a crash loop. Returns the connection and the
 // listener, for the real server to take over.
 async fn connect_valkey(client: redis::Client, listener: tokio::net::TcpListener) -> (Valkey, tokio::net::TcpListener) {
-    match redis::aio::ConnectionManager::new(client.clone()).await {
-        Ok(valkey) => return (valkey, listener),
-        Err(err) => tracing::warn!("can't reach Valkey yet ({err}); serving 503 until it answers"),
-    }
     let std_listener = listener.into_std().expect("listener into std");
     let stand_in = std_listener.try_clone().expect("clone listener for the stand-in");
     let listener = tokio::net::TcpListener::from_std(std_listener).expect("listener from std");
@@ -781,12 +777,14 @@ async fn connect_valkey(client: redis::Client, listener: tokio::net::TcpListener
         let _ = stop_stand_in.await;
     }));
     let mut delay = Duration::from_millis(500);
+    // The stand-in is up before the first try, which can itself take a
+    // while against a Valkey that doesn't answer.
     let valkey = loop {
-        tokio::time::sleep(delay).await;
         match redis::aio::ConnectionManager::new(client.clone()).await {
             Ok(valkey) => break valkey,
             Err(err) => {
-                tracing::warn!("still can't reach Valkey: {err}");
+                tracing::warn!("can't reach Valkey yet ({err}); serving 503 until it answers");
+                tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(5));
             }
         }
