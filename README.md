@@ -182,11 +182,14 @@ Pools share one set of `aqueduct:` keys rather than a prefix each. So an instanc
 | `CANALIS_LINE_MAX_BYTES` | `268435456` (256MB) | Total size of queued job bodies |
 | `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full-line `429` |
 | `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a drained job's result stays available |
+| `CANALIS_LINE_MAX_FAILED_HANDOFFS` | `5` | Failed hand-offs (5xx, 408) before a job is given up on |
+| `CANALIS_LINE_MAX_WAIT_SECONDS` | `600` | Wait after which a refused hand-off gives a job up with a 504 |
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked against free instances (also runs at startup, which is crash recovery) |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream stays open in line before `canalis_timeout` |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position` updates |
 | `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this fullness, an instance gets no new users; when every instance is there, new users wait in line |
-| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | Users an instance takes when its record doesn't say (drain-mode instances take 1) |
+| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | HTTP users an instance takes when it doesn't report `http_capacity` (drain-mode instances take 1) |
+| `CANALIS_DEFAULT_WS_CAPACITY` | `1000` | WebSocket sessions an instance takes when it doesn't report `ws_capacity`; counted apart from HTTP users |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long an idle user keeps their instance before it's released |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Valkey key prefix for the shared assignment table; must match `AQUIFER_CLUSTER_VALKEY_PREFIX` |
 | `CANALIS_L8_SCHEMA_VALIDATION` | `false` | Check each job's body against the JSON Schema its upstream publishes for that route ([L8 v0.2 `request_schemas`](https://rjpruitt16.github.io/l8-protocol/)) and answer `422` on a mismatch, before the job reaches the line or any instance. External `$ref`s are refused. Off by default because it fetches `/.well-known/l8` from each job's upstream |

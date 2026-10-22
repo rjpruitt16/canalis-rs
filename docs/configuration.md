@@ -71,11 +71,12 @@ See [docs/plugins.md](plugins.md).
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `CANALIS_VALKEY_URL` | `redis://127.0.0.1:6379` | Valkey (or Redis) holding the shared assignment table. |
+| `CANALIS_VALKEY_URL` | `redis://127.0.0.1:6379` | Valkey (or Redis) holding the shared assignment table. If it can't be reached at startup, Canalis waits for it: `GET /health` answers `{"status":"starting"}`, and everything else (`GET /ready` included) answers `503` with `Retry-After: 5`. |
 | `CANALIS_AQUEDUCT_PREFIX` | `aqueduct:` | Key prefix for the pool. Use the same value as Aquifer's cluster mode so they share one pool. |
 | `CANALIS_REGISTRATION_INTERVAL_SECONDS` | `15` | Instances' expected ping interval. A registration expires after 3 missed pings. |
 | `CANALIS_ASSIGNMENT_IDLE_SECONDS` | `300` | How long a user's assignment to an instance survives without traffic. |
-| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | User capacity for instances that don't report `user_capacity`. |
+| `CANALIS_DEFAULT_USER_CAPACITY` | `100` | HTTP users an instance takes when it reports neither `http_capacity` nor `user_capacity`. |
+| `CANALIS_DEFAULT_WS_CAPACITY` | `1000` | WebSocket sessions an instance takes when it doesn't report `ws_capacity`. Sessions are counted apart from HTTP users. |
 | `CANALIS_MEMBER_CACHE_MS` | `250` | How long the instance list used for claims is reused before Valkey is read again. Registrations and instances this node finds draining or unreachable take effect at once; fullness may lag by this much. `0` reads Valkey on every claim. |
 | `CANALIS_MAX_HOLD_SECONDS` | `10` | While anyone waits in a pool's line, a tenant that has held its slot longer than this gives it up on its next request, which joins the back of the line. `0`: holders keep their slots for as long as they're active. Whatever this is set to, while anyone waits, a tenant without a slot joins the line instead of taking a slot that frees up. |
 | `CANALIS_QUEUE_AT_PERCENT` | `80` | At or above this `X-Aqueduct-Fullness`, an instance gets no new users. When every instance is past it, new users wait in line. |
@@ -90,12 +91,17 @@ See [docs/plugins.md](plugins.md).
 | `CANALIS_LINE_MAX_BYTES` | `268435456` (256 MiB) | Total size of waiting jobs. |
 | `CANALIS_LINE_RETRY_AFTER_SECONDS` | `5` | `Retry-After` on a full line's 429. |
 | `CANALIS_RESULT_TTL_SECONDS` | `300` | How long a handed-off job's result is kept for `GET /jobs/{key}` and repeat requests. |
+| `CANALIS_LINE_MAX_FAILED_HANDOFFS` | `5` | Hand-offs an instance can fail (5xx, 408) before the job is given up on and the last failure becomes its result. A 429 doesn't count. `0`: no limit. |
+| `CANALIS_LINE_MAX_WAIT_SECONDS` | `600` | How long a job can wait, from joining the line, before a refused hand-off of any kind (429 included) answers it with a 504. A job only waiting its turn is never given up on. `0`: no limit. |
 | `CANALIS_LINE_SWEEP_SECONDS` | `5` | How often the line is checked for jobs that can be handed out. |
 | `CANALIS_POSITION_INTERVAL_MS` | `1000` | How often waiting callers get `canalis_position`. |
 | `CANALIS_POOL_WAIT_TIMEOUT_MS` | `30000` | How long a caller's stream waits in line before `canalis_timeout`. The job stays in line. |
 | `CANALIS_DRAIN_RPS` | `100` | How fast one tenant's waiting jobs are handed to their instance once it has room, until the instance says otherwise with `X-Aqueduct-Rps`. |
 | `CANALIS_DRAIN_MAX_CONCURRENT` | `10` | How many of one tenant's waiting jobs are handed over at once (at most 50), until the instance says otherwise with `X-Aqueduct-Max-Concurrent`. |
 | `CANALIS_INSTANCE_RETRY_BASE_DELAY_MS` | `200` | Backoff between the 3 attempts to reach an instance, doubling each time. |
+| `CANALIS_INSTANCE_CONNECT_TIMEOUT_SECONDS` | `5` | How long Canalis waits to connect to an instance. |
+| `CANALIS_INSTANCE_READ_TIMEOUT_SECONDS` | `300` | How long a connection to an instance may go quiet before Canalis gives up on it. Long enough for a slow, unstreamed answer behind `/proxy`; Aquifer's job streams send a keepalive every 30 s. |
+| `CANALIS_HANDOFF_TIMEOUT_SECONDS` | `30` | Overall limit on handing a job to an instance's `POST /jobs`, which answers as soon as the job is stored. A hand-off that runs out goes back in line. |
 
 ## WebSockets
 

@@ -11,6 +11,7 @@
 //! aqueduct:instance:<id>:assignments         zset: user-scope hash -> expiry (ms)
 //! aqueduct:assignment:<sha256(user_id)>      instance id, expires after idling
 //! aqueduct:instance:<id>:fullness            0-100 as last reported (Canalis's own)
+//! aqueduct:ws:...                            the same shape again, for WebSocket sessions
 //! ```
 //!
 //! Claims run in the same Lua script Aquifer uses, so concurrent claims
@@ -25,6 +26,22 @@
 //! already on one stays -- the script keeps live assignments sticky), an
 //! instance reserved for one user is only offered to that user, and a
 //! `ws`-role instance isn't offered HTTP traffic.
+//!
+//! HTTP users and WebSocket sessions are counted separately, each against
+//! its own capacity: they cost an instance different things (a session is
+//! mostly memory while it's idle), and 100 open sessions must not leave no
+//! room for HTTP tenants. An instance reports both counts and capacities
+//! (`http_users`/`http_capacity`, `ws_sessions`/`ws_capacity`) in its
+//! registration ping and on its responses, worked out from its own CPU and
+//! memory; see [`Load`]. One that doesn't report them gets
+//! CANALIS_DEFAULT_USER_CAPACITY users and CANALIS_DEFAULT_WS_CAPACITY
+//! sessions.
+//!
+//! Sessions are claimed with the same script, under `<prefix>ws:`: there
+//! each instance has a copy of its record with its session count as
+//! `active_users`, written with every heartbeat, and its own assignment
+//! set. The script stays Aquifer's, unchanged, and Aquifer's cluster mode
+//! never sees sessions.
 //!
 //! Pools: an instance lists the pools it serves (`pools`, from the node's
 //! AQUIFER_REGISTRY_POOLS / SPILLWAY_REGISTRY_POOLS); one that lists none
@@ -55,6 +72,9 @@ pub struct Aqueduct {
     /// Users an instance takes when it doesn't say (drain-mode instances
     /// always take exactly one).
     pub default_capacity: i64,
+    /// WebSocket sessions an instance takes when it doesn't say. Aquifer's
+    /// and Spillway's own session ceiling defaults to 1,000.
+    pub default_ws_capacity: i64,
     /// At or above this fullness, an instance gets no new users.
     pub queue_at_percent: u8,
     /// How long the instance list (records and fullness) read for a claim
@@ -82,6 +102,12 @@ impl MemberCache {
     pub fn invalidate(&self) {
         *self.entry.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+
+    // The load instance id had when the list was last read, if it's cached.
+    fn load_of(&self, id: &str) -> Option<Load> {
+        let entry = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        entry.as_ref()?.1.iter().find(|(m, _)| m.id == id).map(|(m, _)| m.load)
+    }
 }
 
 impl Aqueduct {
@@ -100,6 +126,7 @@ impl Aqueduct {
             ),
             instance_ttl: Duration::from_secs(3 * heartbeat),
             default_capacity: crate::env_u64("CANALIS_DEFAULT_USER_CAPACITY", 100).max(1) as i64,
+            default_ws_capacity: crate::env_u64("CANALIS_DEFAULT_WS_CAPACITY", 1000).max(1) as i64,
             queue_at_percent: crate::env_u64("CANALIS_QUEUE_AT_PERCENT", 80).clamp(1, 100) as u8,
             member_cache_ttl: Duration::from_millis(crate::env_u64("CANALIS_MEMBER_CACHE_MS", 250)),
             member_cache: Default::default(),
@@ -115,11 +142,25 @@ impl Aqueduct {
     fn assignments_key(&self, id: &str) -> String {
         format!("{}instance:{id}:assignments", self.prefix)
     }
+    /// Where claims for this kind of traffic live: the shared prefix for
+    /// HTTP, `<prefix>ws:` for WebSocket sessions.
+    fn space(&self, traffic: Traffic) -> String {
+        match traffic {
+            Traffic::Http => self.prefix.clone(),
+            Traffic::WebSocket => format!("{}ws:", self.prefix),
+        }
+    }
+    fn traffic_instance_key(&self, id: &str, traffic: Traffic) -> String {
+        format!("{}instance:{id}", self.space(traffic))
+    }
+    fn traffic_assignments_key(&self, id: &str, traffic: Traffic) -> String {
+        format!("{}instance:{id}:assignments", self.space(traffic))
+    }
+    fn traffic_assignment_key(&self, scope_hash: &str, traffic: Traffic) -> String {
+        format!("{}assignment:{scope_hash}", self.space(traffic))
+    }
     fn fullness_key(&self, id: &str) -> String {
         format!("{}instance:{id}:fullness", self.prefix)
-    }
-    fn assignment_key(&self, scope_hash: &str) -> String {
-        format!("{}assignment:{scope_hash}", self.prefix)
     }
 }
 
@@ -147,6 +188,44 @@ pub struct Member {
     /// Pools this instance serves; empty means just `default`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<String>,
+    /// What the instance last reported about its load, if anything.
+    #[serde(default, flatten)]
+    pub load: Load,
+}
+
+/// How many HTTP users and WebSocket sessions an instance has and how many
+/// it can take, as it reports them: in its registration ping, and on its
+/// responses as `X-Aqueduct-Http-Users`, `X-Aqueduct-Http-Capacity`,
+/// `X-Aqueduct-WS-Sessions` and `X-Aqueduct-WS-Capacity`. The instance
+/// works the capacities out from its own CPU and memory, so whichever kind
+/// of traffic it isn't busy with leaves room for the other. Absent fields
+/// fall back to what Canalis counts itself and its defaults.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Load {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_users: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_capacity: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_sessions: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_capacity: Option<i64>,
+}
+
+impl Load {
+    pub fn is_empty(&self) -> bool {
+        *self == Load::default()
+    }
+
+    /// `newer`'s fields where it has them, this one's otherwise.
+    pub fn overlaid_with(self, newer: Load) -> Load {
+        Load {
+            http_users: newer.http_users.or(self.http_users),
+            http_capacity: newer.http_capacity.or(self.http_capacity),
+            ws_sessions: newer.ws_sessions.or(self.ws_sessions),
+            ws_capacity: newer.ws_capacity.or(self.ws_capacity),
+        }
+    }
 }
 
 pub const DEFAULT_POOL: &str = "default";
@@ -222,6 +301,39 @@ impl Member {
 
     pub fn serves(&self, pool: &str) -> bool {
         if self.pools.is_empty() { pool == DEFAULT_POOL } else { self.pools.iter().any(|p| p == pool) }
+    }
+
+    /// How many of this kind of traffic the instance takes: one tenant at a
+    /// time for a drain-mode instance, otherwise what it reported, otherwise
+    /// the default.
+    /// The copy of this record WebSocket claims read: sessions as its
+    /// users, and no capacity of its own, so the claim takes the one
+    /// Canalis passes.
+    fn sessions_copy(&self) -> Member {
+        Member { active_users: self.reported_in_use(Traffic::WebSocket), capacity: 0, ..self.clone() }
+    }
+
+    pub fn capacity_for(&self, traffic: Traffic, aq: &Aqueduct) -> i64 {
+        let reported = match traffic {
+            Traffic::Http if self.drain_state.is_some() => return 1,
+            Traffic::Http => self.load.http_capacity.or((self.capacity > 0).then_some(self.capacity)),
+            Traffic::WebSocket => self.load.ws_capacity,
+        };
+        let default = match traffic {
+            Traffic::Http => aq.default_capacity,
+            Traffic::WebSocket => aq.default_ws_capacity,
+        };
+        reported.filter(|c| *c > 0).unwrap_or(default)
+    }
+
+    /// How many of this kind of traffic the instance says it already has;
+    /// the claim counts the larger of this and its own assignments.
+    pub fn reported_in_use(&self, traffic: Traffic) -> i64 {
+        match traffic {
+            Traffic::Http => self.load.http_users.unwrap_or(self.active_users),
+            Traffic::WebSocket => self.load.ws_sessions.unwrap_or_default(),
+        }
+        .max(0)
     }
 }
 
@@ -360,13 +472,40 @@ pub async fn members(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<V
             _ => stale.push(id.clone()),
         }
     }
+    refresh_session_copies(valkey, aq, &members).await?;
     if !stale.is_empty() {
         let _: () = valkey.srem(aq.instances_key(), &stale).await?;
         for id in &stale {
-            let _: () = valkey.del(aq.assignments_key(id)).await?;
+            let _: () = valkey.del(&[aq.assignments_key(id), aq.traffic_assignments_key(id, Traffic::WebSocket)]).await?;
         }
     }
     Ok(members)
+}
+
+// Writes the WebSocket copy of any record that has none, or whose state or
+// load it no longer matches: an instance Aquifer's own cluster mode
+// registered never pings Canalis, so its copy is made here.
+async fn refresh_session_copies(valkey: &mut Valkey, aq: &Aqueduct, members: &[Member]) -> redis::RedisResult<()> {
+    if members.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = members.iter().map(|m| aq.traffic_instance_key(&m.id, Traffic::WebSocket)).collect();
+    let copies: Vec<Option<String>> = valkey.mget(&keys).await?;
+    let mut pipe = redis::pipe();
+    let mut stale = 0;
+    for ((m, key), copy) in members.iter().zip(&keys).zip(copies) {
+        let copy = copy.and_then(|c| serde_json::from_str::<Member>(&c).ok());
+        if copy.is_none_or(|c| c.state != m.state || c.load != m.load) {
+            let payload = serde_json::to_string(&m.sessions_copy())
+                .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "encode member", e.to_string())))?;
+            pipe.set_ex(key, payload, aq.instance_ttl.as_secs().max(1)).ignore();
+            stale += 1;
+        }
+    }
+    if stale > 0 {
+        let _: () = pipe.query_async(valkey).await?;
+    }
+    Ok(())
 }
 
 /// The record last written for one instance, if it's still live.
@@ -379,13 +518,20 @@ pub async fn member(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redis::Redi
 /// own heartbeat. The record expires on its own if heartbeats stop.
 pub async fn heartbeat(valkey: &mut Valkey, aq: &Aqueduct, member: &Member) -> redis::RedisResult<()> {
     aq.member_cache.invalidate();
-    let payload = serde_json::to_string(member)
-        .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "encode member", e.to_string())))?;
+    let encode = |m: &Member| {
+        serde_json::to_string(m)
+            .map_err(|e| redis::RedisError::from((redis::ErrorKind::Client, "encode member", e.to_string())))
+    };
+    let sessions = member.sessions_copy();
+    let users = Member { active_users: member.reported_in_use(Traffic::Http), ..member.clone() };
+    let ttl = aq.instance_ttl.as_secs().max(1);
     let _: () = redis::pipe()
         .atomic()
         .sadd(aq.instances_key(), &member.id)
         .ignore()
-        .set_ex(aq.instance_key(&member.id), payload, aq.instance_ttl.as_secs().max(1))
+        .set_ex(aq.instance_key(&member.id), encode(&users)?, ttl)
+        .ignore()
+        .set_ex(aq.traffic_instance_key(&member.id, Traffic::WebSocket), encode(&sessions)?, ttl)
         .ignore()
         .query_async(valkey)
         .await?;
@@ -398,6 +544,8 @@ pub async fn remove_instance(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> re
     let _: () = redis::pipe()
         .atomic()
         .del(aq.instance_key(id))
+        .ignore()
+        .del(aq.traffic_instance_key(id, Traffic::WebSocket))
         .ignore()
         .del(aq.fullness_key(id))
         .ignore()
@@ -428,6 +576,51 @@ pub async fn mark_draining(valkey: &mut Valkey, aq: &Aqueduct, id: &str) -> redi
 pub async fn record_fullness(valkey: &mut Valkey, aq: &Aqueduct, id: &str, percent: u8) -> redis::RedisResult<()> {
     valkey.set_ex(aq.fullness_key(id), percent, aq.instance_ttl.as_secs().max(1)).await
 }
+
+/// Writes the load an instance reported on a response (see [`Load`]) into
+/// both its records, in place, so the next claim counts it. Skipped when
+/// the instance list this Canalis last read already says the same.
+pub async fn record_load(valkey: &mut Valkey, aq: &Aqueduct, id: &str, load: Load) -> redis::RedisResult<()> {
+    if aq.member_cache.load_of(id).is_some_and(|known| known.overlaid_with(load) == known) {
+        return Ok(());
+    }
+    let arg = |v: Option<i64>| v.map(|v| v.to_string()).unwrap_or_default();
+    let _: () = redis::Script::new(RECORD_LOAD_LUA)
+        .key(aq.instance_key(id))
+        .key(aq.traffic_instance_key(id, Traffic::WebSocket))
+        .arg(arg(load.http_users))
+        .arg(arg(load.http_capacity))
+        .arg(arg(load.ws_sessions))
+        .arg(arg(load.ws_capacity))
+        .invoke_async(valkey)
+        .await?;
+    aq.member_cache.invalidate();
+    Ok(())
+}
+
+// Sets the reported load fields on an instance's record and its WebSocket
+// copy, keeping each one's expiry, and its count of what's in use as
+// `active_users` (HTTP users on the record, sessions on the copy), which
+// is what the claim script reads. An empty argument wasn't reported. A
+// record that has expired stays expired.
+const RECORD_LOAD_LUA: &str = r"
+local fields = { 'http_users', 'http_capacity', 'ws_sessions', 'ws_capacity' }
+local in_use = { ARGV[1], ARGV[3] }
+for k = 1, 2 do
+  local payload = redis.call('GET', KEYS[k])
+  if payload then
+    local ok, member = pcall(cjson.decode, payload)
+    if ok then
+      for i, name in ipairs(fields) do
+        if ARGV[i] ~= '' then member[name] = tonumber(ARGV[i]) end
+      end
+      if in_use[k] ~= '' then member['active_users'] = tonumber(in_use[k]) end
+      redis.call('SET', KEYS[k], cjson.encode(member), 'KEEPTTL')
+    end
+  end
+end
+return 1
+";
 
 /// How many instances are live, and how many of those would take a new
 /// user right now (active and under CANALIS_QUEUE_AT_PERCENT), for
@@ -466,8 +659,11 @@ async fn cached_instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisRes
 /// GET /metrics.
 pub async fn instances(valkey: &mut Valkey, aq: &Aqueduct) -> redis::RedisResult<Vec<(Member, Option<u8>)>> {
     let all = members(valkey, aq).await?;
+    if all.is_empty() {
+        return Ok(Vec::new());
+    }
     let keys: Vec<String> = all.iter().map(|m| aq.fullness_key(&m.id)).collect();
-    let fullness: Vec<Option<u8>> = if keys.is_empty() { Vec::new() } else { valkey.mget(&keys).await? };
+    let fullness: Vec<Option<u8>> = valkey.mget(&keys).await?;
     Ok(all.into_iter().zip(fullness).collect())
 }
 
@@ -511,21 +707,21 @@ pub async fn assign(
     // they may need a different kind of instance, and so are their jobs
     // in each pool.
     let hash = scope_hash(&tenant.scope(traffic));
+    let space = aq.space(traffic);
     // Twice at most: a live assignment to an instance that has since left
     // this pool is dropped, and the claim runs again without it.
     for _ in 0..2 {
         let assign_script = redis::Script::new(ASSIGN_LUA);
         let mut script = assign_script.prepare_invoke();
-        script.key(aq.assignment_key(&hash));
+        script.key(aq.traffic_assignment_key(&hash, traffic));
         script
             .arg(aq.assignment_ttl.as_millis() as u64)
             .arg(&hash)
             .arg(candidates.len())
-            .arg(&aq.prefix);
+            .arg(&space);
         for m in &candidates {
-            script.key(aq.instance_key(&m.id)).key(aq.assignments_key(&m.id));
-            let capacity = if m.capacity > 0 { m.capacity } else { aq.default_capacity };
-            script.arg(&m.id).arg(capacity);
+            script.key(aq.traffic_instance_key(&m.id, traffic)).key(aq.traffic_assignments_key(&m.id, traffic));
+            script.arg(&m.id).arg(m.capacity_for(traffic, aq));
         }
         script.arg("1");
 
@@ -538,7 +734,7 @@ pub async fn assign(
         if member.serves(&tenant.pool) {
             return Ok(AssignOutcome::Assigned(Node { id: member.id, base_url: member.address }));
         }
-        release_scope(valkey, aq, &hash, &member.id).await?;
+        release_scope(valkey, aq, &hash, &member.id, traffic).await?;
     }
     Ok(AssignOutcome::PoolExhausted)
 }
@@ -546,7 +742,7 @@ pub async fn assign(
 /// The instance a tenant is assigned to right now for this kind of
 /// traffic, if any. Doesn't renew it.
 pub async fn current(valkey: &mut Valkey, aq: &Aqueduct, tenant: &Tenant, traffic: Traffic) -> redis::RedisResult<Option<String>> {
-    valkey.get(aq.assignment_key(&scope_hash(&tenant.scope(traffic)))).await
+    valkey.get(aq.traffic_assignment_key(&scope_hash(&tenant.scope(traffic)), traffic)).await
 }
 
 /// Releases a tenant's assignment for this kind of traffic from node_id,
@@ -559,13 +755,13 @@ pub async fn release(
     traffic: Traffic,
     node_id: &str,
 ) -> redis::RedisResult<bool> {
-    release_scope(valkey, aq, &scope_hash(&tenant.scope(traffic)), node_id).await
+    release_scope(valkey, aq, &scope_hash(&tenant.scope(traffic)), node_id, traffic).await
 }
 
-async fn release_scope(valkey: &mut Valkey, aq: &Aqueduct, hash: &str, node_id: &str) -> redis::RedisResult<bool> {
+async fn release_scope(valkey: &mut Valkey, aq: &Aqueduct, hash: &str, node_id: &str, traffic: Traffic) -> redis::RedisResult<bool> {
     let released: i64 = redis::Script::new(RELEASE_LUA)
-        .key(aq.assignment_key(hash))
-        .key(aq.assignments_key(node_id))
+        .key(aq.traffic_assignment_key(hash, traffic))
+        .key(aq.traffic_assignments_key(node_id, traffic))
         .arg(node_id)
         .arg(hash)
         .invoke_async(valkey)
@@ -576,14 +772,17 @@ async fn release_scope(valkey: &mut Valkey, aq: &Aqueduct, hash: &str, node_id: 
 /// Releases every user assigned to node_id -- a drain-mode instance that
 /// just reported itself free, or one that went offline. Returns how many.
 pub async fn release_all(valkey: &mut Valkey, aq: &Aqueduct, node_id: &str) -> redis::RedisResult<usize> {
-    let scopes: Vec<String> = valkey.zrange(aq.assignments_key(node_id), 0, -1).await?;
     let mut released = 0;
-    for hash in &scopes {
-        if release_scope(valkey, aq, hash, node_id).await? {
-            released += 1;
+    for traffic in [Traffic::Http, Traffic::WebSocket] {
+        let key = aq.traffic_assignments_key(node_id, traffic);
+        let scopes: Vec<String> = valkey.zrange(&key, 0, -1).await?;
+        for hash in &scopes {
+            if release_scope(valkey, aq, hash, node_id, traffic).await? {
+                released += 1;
+            }
         }
+        let _: () = valkey.del(&key).await?;
     }
-    let _: () = valkey.del(aq.assignments_key(node_id)).await?;
     Ok(released)
 }
 
@@ -615,6 +814,7 @@ pub(crate) mod tests {
             assignment_ttl: Duration::from_secs(60),
             instance_ttl: Duration::from_secs(60),
             default_capacity: 100,
+            default_ws_capacity: 1000,
             queue_at_percent: 80,
             // Tests read Valkey on every claim, so what they just wrote is
             // what the next claim sees.
@@ -664,7 +864,7 @@ pub(crate) mod tests {
 
         let first = assigned(&mut v, &aq, "acme").await;
         let again = assigned(&mut v, &aq, "acme").await;
-        let stored: Option<String> = v.get(aq.assignment_key(&scope_hash("acme"))).await.unwrap();
+        let stored: Option<String> = v.get(aq.traffic_assignment_key(&scope_hash("acme"), Traffic::Http)).await.unwrap();
         cleanup(&mut v, &aq).await;
 
         assert!(first.is_some());
@@ -686,6 +886,105 @@ pub(crate) mod tests {
         assert_eq!(one.as_deref(), Some("only"));
         assert_eq!(two.as_deref(), Some("only"));
         assert_eq!(three, None, "strict: a full fleet means the line, not an overloaded instance");
+    }
+
+    async fn assigned_ws(valkey: &mut Valkey, aq: &Aqueduct, user: &str) -> Option<String> {
+        match assign(valkey, aq, &Tenant::user(user), Traffic::WebSocket).await.unwrap() {
+            AssignOutcome::Assigned(node) => Some(node.id),
+            AssignOutcome::PoolExhausted => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_sessions_have_their_own_capacity_and_leave_http_users_room() {
+        // The soak's stall: 100 open sessions on an instance taking 100
+        // users left none of the 50 HTTP tenants a place.
+        let mut v = test_valkey().await;
+        let aq = Aqueduct { default_capacity: 2, default_ws_capacity: 3, ..test_aqueduct() };
+        heartbeat(&mut v, &aq, &node("only")).await.unwrap();
+
+        let mut sessions = Vec::new();
+        for i in 0..4 {
+            sessions.push(assigned_ws(&mut v, &aq, &format!("ws-{i}")).await);
+        }
+        let http = [assigned(&mut v, &aq, "u1").await, assigned(&mut v, &aq, "u2").await, assigned(&mut v, &aq, "u3").await];
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(sessions[..3], [Some("only".to_string()), Some("only".to_string()), Some("only".to_string())]);
+        assert_eq!(sessions[3], None, "a fourth session is past the WebSocket capacity");
+        assert_eq!(http, [Some("only".to_string()), Some("only".to_string()), None], "HTTP users get their own 2, sessions or not");
+    }
+
+    #[tokio::test]
+    async fn an_instances_reported_load_sets_its_capacity() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        let load = Load { http_users: Some(0), http_capacity: Some(1), ws_sessions: Some(5), ws_capacity: Some(5) };
+        heartbeat(&mut v, &aq, &Member { load, ..node("only") }).await.unwrap();
+
+        let first = assigned(&mut v, &aq, "u1").await;
+        let second = assigned(&mut v, &aq, "u2").await;
+        let session = assigned_ws(&mut v, &aq, "ws-1").await;
+
+        // A newer reading from a response: room for more of both.
+        record_load(&mut v, &aq, "only", Load { http_capacity: Some(4), ws_sessions: Some(1), ..Load::default() }).await.unwrap();
+        let second_again = assigned(&mut v, &aq, "u2").await;
+        let session_again = assigned_ws(&mut v, &aq, "ws-1").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(first.as_deref(), Some("only"));
+        assert_eq!(second, None, "it said it takes 1 HTTP user");
+        assert_eq!(session, None, "it said its sessions are at capacity");
+        assert_eq!(second_again.as_deref(), Some("only"));
+        assert_eq!(session_again.as_deref(), Some("only"));
+    }
+
+    #[tokio::test]
+    async fn an_instance_only_aquifers_cluster_mode_registered_still_gets_sessions() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        // Written the way Aquifer's own heartbeat writes it: no copy.
+        let record = serde_json::to_string(&Member { capacity: 10, ..node("aquifer-only") }).unwrap();
+        let _: () = v.sadd(aq.instances_key(), "aquifer-only").await.unwrap();
+        let _: () = v.set(aq.instance_key("aquifer-only"), record).await.unwrap();
+
+        let session = assigned_ws(&mut v, &aq, "ws-1").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(session.as_deref(), Some("aquifer-only"));
+    }
+
+    #[tokio::test]
+    async fn a_drain_mode_instance_takes_one_tenant_whatever_capacity_it_reports() {
+        let mut v = test_valkey().await;
+        let aq = test_aqueduct();
+        let load = Load { http_capacity: Some(50), ..Load::default() };
+        heartbeat(&mut v, &aq, &Member { load, drain_state: Some("active".into()), ..node("drain") }).await.unwrap();
+
+        let first = assigned(&mut v, &aq, "u1").await;
+        let second = assigned(&mut v, &aq, "u2").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(first.as_deref(), Some("drain"));
+        assert_eq!(second, None);
+    }
+
+    #[tokio::test]
+    async fn releasing_a_session_frees_its_websocket_place() {
+        let mut v = test_valkey().await;
+        let aq = Aqueduct { default_ws_capacity: 1, ..test_aqueduct() };
+        heartbeat(&mut v, &aq, &node("only")).await.unwrap();
+
+        let first = assigned_ws(&mut v, &aq, "ws-1").await;
+        let blocked = assigned_ws(&mut v, &aq, "ws-2").await;
+        let released = release(&mut v, &aq, &Tenant::user("ws-1"), Traffic::WebSocket, "only").await.unwrap();
+        let after = assigned_ws(&mut v, &aq, "ws-2").await;
+        cleanup(&mut v, &aq).await;
+
+        assert_eq!(first.as_deref(), Some("only"));
+        assert_eq!(blocked, None);
+        assert!(released);
+        assert_eq!(after.as_deref(), Some("only"));
     }
 
     #[tokio::test]
@@ -920,10 +1219,10 @@ pub(crate) mod tests {
     async fn release_never_clobbers_a_newer_assignment() {
         let mut v = test_valkey().await;
         let aq = test_aqueduct();
-        let _: () = v.set(aq.assignment_key(&scope_hash("acme")), "new-node").await.unwrap();
+        let _: () = v.set(aq.traffic_assignment_key(&scope_hash("acme"), Traffic::Http), "new-node").await.unwrap();
 
         let released = release(&mut v, &aq, &Tenant::user("acme"), Traffic::Http, "old-node").await.unwrap();
-        let still: String = v.get(aq.assignment_key(&scope_hash("acme"))).await.unwrap();
+        let still: String = v.get(aq.traffic_assignment_key(&scope_hash("acme"), Traffic::Http)).await.unwrap();
         cleanup(&mut v, &aq).await;
 
         assert!(!released);
