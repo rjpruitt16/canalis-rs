@@ -232,10 +232,13 @@ impl Jwt {
         validation.set_issuer(&[&self.issuer]);
         if self.audience.is_empty() {
             validation.validate_aud = false;
+            validation.set_required_spec_claims(&["exp", "iss"]);
         } else {
             validation.set_audience(&self.audience);
+            // set_audience alone checks aud only when it's present and
+            // parses, so a token without one would pass.
+            validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         }
-        validation.set_required_spec_claims(&["exp", "iss"]);
         validation.leeway = 30;
 
         let mut last_err = None;
@@ -551,6 +554,16 @@ pub(crate) mod tests {
         wrong_azp["azp"] = "https://evil.example".into();
         assert!(matches!(jwt.verify(&key.sign(wrong_aud)).await, Err(Rejection::Invalid(_))));
         assert!(matches!(jwt.verify(&key.sign(wrong_azp)).await, Err(Rejection::Invalid(_))));
+
+        // With an audience configured, a token must carry a valid aud: one
+        // that leaves it out, or gives it the wrong JSON type, would
+        // otherwise skip the audience check (GHSA-h395-gr6q-cpjc).
+        let mut no_aud = good.clone();
+        no_aud.as_object_mut().unwrap().remove("aud");
+        let mut numeric_aud = good.clone();
+        numeric_aud["aud"] = 7.into();
+        assert!(matches!(jwt.verify(&key.sign(no_aud)).await, Err(Rejection::Invalid(_))));
+        assert!(matches!(jwt.verify(&key.sign(numeric_aud)).await, Err(Rejection::Invalid(_))));
     }
 
     #[tokio::test]
