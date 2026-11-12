@@ -1,0 +1,51 @@
+# The 4-day Canalis soak's driver: load through the two Canalis nodes, the
+# misbehaving target API, the job ledger, the failure schedule, and the
+# Valkey the Canalis nodes share (6379, private network only). Only the
+# read-only status pages (8081) are public; posting a report needs
+# SOAK_REPORT_TOKEN (a secret).
+#
+# SOAK_NODES names each Canalis machine by id, known only after deploying
+# (fly secrets set, see README). SOAK_BACKENDS is the Aquifer.
+app = "canalis-soak-driver"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.driver"
+
+[env]
+  SOAK_NAME = "Canalis"
+  SOAK_SELF = "http://canalis-soak-driver.internal:8080"
+  SOAK_DATA = "/data/run-1"
+  SOAK_BACKENDS = "q1=http://canalis-soak-aquifer-1.internal:8080|http://canalis-soak-aquifer-1.internal:9090"
+
+# Arguments to the image's /driver entrypoint.
+# - 300 jobs/s steady, a 1,000/s burst at the top of every hour, and a
+#   daily 04:00 UTC ramp to 2,000/s: past what one Aquifer takes, so the
+#   line fills and drains every day.
+# - WebSocket sessions through the first Canalis node's /websocket.
+# - The target API misbehaves (-chaos); the webhook receiver stays healthy
+#   (-webhook-chaos=false), so every job's webhook is the record of it
+#   finishing. The soak's own random kills are pushed out of the run:
+#   every failure is one from the schedule (scenarios.py).
+[processes]
+  app = "-valkey -rate=300 -burst-rate=1000 -ramp-steps=300,600,900,1200,1500,2000 -ws-sessions=100 -ws-burst-sessions=300 -ws-ramp-steps=100,200,300,400 -webhook-chaos=false -kill-min=10000h -kill-max=10000h -reboot-every=0 -scenarios=120m:kill:b,116m:kill:q1,181m:drain:a,10m:drain:b,113m:valkey:2m,170m:kill:a,118m:freeze:b:20s,121m:hold:a:5m,169m:hold:q1:5m,115m:drain:a,10m:drain:b,140m:hold:a:5m,188m:kill:a,127m:valkey:2m,168m:kill:q1,186m:hold:q1:5m,190m:freeze:b:20s,189m:kill:b,189m:hold:q1:5m,197m:freeze:b:20s,179m:kill:a,185m:drain:a,10m:drain:b,220m:kill:q1,175m:valkey:2m,241m:kill:b,160m:hold:a:5m,234m:valkey:2m,213m:kill:q1,149m:drain:a,10m:drain:b,249m:kill:a,125m:kill:b,168m:hold:q1:5m,217m:hold:a:5m,130m:freeze:b:20s"
+
+[http_service]
+  internal_port = 8081
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+[[mounts]]
+  source = "canalis_soak_driver_data"
+  destination = "/data"
+  initial_size = "5gb"
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "performance-2x"
+  memory = "4gb"

@@ -1,0 +1,33 @@
+# Canalis under Aquifer's soak supervisor, which runs it, restarts it when
+# it exits, and takes the driver's kill / hold / freeze / drain orders on
+# :9090. Build from the repository root:
+#   fly deploy -c bench/soak/fly.canalis.toml --dockerfile bench/soak/Dockerfile.canalis \
+#     --build-arg AQUIFER_REF=<commit> .
+FROM rust:1.99-slim-bookworm AS builder
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
+FROM golang:1.25-bookworm AS supervisor
+ARG AQUIFER_REF=main
+WORKDIR /src
+RUN git clone https://github.com/rjpruitt16/aquifer.git . && git checkout "$AQUIFER_REF" && \
+    CGO_ENABLED=0 go build -o /supervisor ./benchmark/soak/supervisor
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /app/target/release/canalis-rs ./canalis-rs
+COPY --from=supervisor /supervisor ./supervisor
+# The supervisor runs one command with no arguments; this raises the open
+# file limit the way the main image does, then execs Canalis so a kill -9
+# reaches it.
+RUN printf '#!/bin/sh\nulimit -n 1048576 2>/dev/null || ulimit -n 65536\nexec /app/canalis-rs\n' > run-canalis.sh && chmod +x run-canalis.sh
+# The line in its own directory, which the supervisor reports as the
+# store's size and file count.
+ENV CANALIS_LINE_PATH=/data/line/canalis-line.redb \
+    CANALIS_L8_KEY_PATH=/data/.l8-key \
+    CANALIS_PLUGINS_DIR=/plugins
+RUN mkdir -p /data/line /plugins
+CMD ["sh", "-c", "mkdir -p /data/line && exec /app/supervisor -cmd /app/run-canalis.sh -data /data -store line"]
